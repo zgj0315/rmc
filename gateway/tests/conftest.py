@@ -397,6 +397,16 @@ class _TlsRelay:
         async def _close() -> None:
             self._server.close()
             await self._server.wait_closed()
+            # 还在飞的每连接 _handle（以及它内部 gather 出来的 _pump 子任务）
+            # 在这里主动取消并收尾，不然 loop.close() 会把它们晾在「pending」
+            # 状态上，asyncio 在垃圾回收时报 "Task was destroyed but it is
+            # pending!"。return_exceptions=True 把 cancel() 引发的
+            # CancelledError 收进结果列表，不让它从这里再抛出去。
+            current = asyncio.current_task()
+            pending = [t for t in asyncio.all_tasks() if t is not current]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
         asyncio.run_coroutine_threadsafe(_close(), self._loop).result(timeout=10)
         self._loop.call_soon_threadsafe(self._loop.stop)
