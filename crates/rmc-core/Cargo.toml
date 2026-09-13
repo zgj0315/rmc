@@ -18,6 +18,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
 rustls-pemfile = "2"
+# default-features 会拉 aws-lc-rs，其 aws-lc-sys 需要 cmake 做一次数分钟的 C
+# 编译，CI 超时预算扛不住；ring 是纯 Rust 实现，编译快得多。
+russh = { version = "0.63", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

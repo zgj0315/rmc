@@ -7,7 +7,9 @@ pub mod config;
 pub mod error;
 pub mod knownhosts;
 pub mod platform;
+pub mod ssh;
 pub mod transport;
+pub mod tunnel;
 
 pub use addr::HostPort;
 pub use error::{Error, ErrorClass, Result};

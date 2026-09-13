@@ -121,6 +121,25 @@ pub fn fingerprint_sha256(key_blob: &[u8]) -> String {
     format!("SHA256:{body}")
 }
 
+/// R35：Task 7 的 SSH 层要用的入口。`check()` 只收 `&Fingerprint`（见
+/// `Fingerprint` 类型上的说明），如果调用处只有 `fingerprint_sha256()`
+/// 这个裸 `String`，就得自己再包一层
+/// `Fingerprint::new(&fingerprint_sha256(blob)).expect(...)`——这个
+/// round-trip 永远不会失败（`fingerprint_sha256` 产出的形状本来就是
+/// `Fingerprint::new` 认可的那种），但"永远不会失败"不等于"可以在
+/// host key 校验这种安全关键路径上放一个 `expect`"：一旦这两个函数
+/// 未来某一天日期漂移（比如改了 base64 的填充策略），这个 `expect`
+/// 就会在生产环境里，在客户端刚刚验完 Gateway 身份的这一刻，把整个
+/// 进程 panic 掉。
+///
+/// 这里直接在指纹自己的模块内构造 `Fingerprint`，绕开 `new()` 的校验——
+/// 不是少校验，是校验从"运行时判断，可能失败"变成"由这个函数的实现
+/// 保证"：`fingerprint_sha256` 的输出形状是这个模块自己定义、自己保证
+/// 的，不需要再让调用方替它兜底。
+pub fn fingerprint_of(key_blob: &[u8]) -> Fingerprint {
+    Fingerprint(fingerprint_sha256(key_blob))
+}
+
 /// 文件里一条记录的 key：host 与 port 分开记，同一个主机名换个端口就是
 /// 不同的 Gateway 身份（OpenSSH 对待非默认端口就是这样处理的）。恒定加
 /// 中括号，不管 host 本身是不是 IPv6 字面量，读写两边用同一个函数，不会
@@ -541,6 +560,16 @@ mod tests {
         let body = &fp["SHA256:".len()..];
         assert_eq!(body.len(), 43, "{fp}");
         assert!(!body.contains('='), "{fp}");
+    }
+
+    #[test]
+    fn fingerprint_of_matches_fingerprint_sha256_then_new() {
+        // R35：fingerprint_of 是 fingerprint_sha256() 之后再 Fingerprint::new()
+        // 的替代品，两条路径必须产出完全相同的值——差异只在于 fingerprint_of
+        // 不会在调用处放一个本该走不到、却仍然存在的 `expect`。
+        let blob = b"another test key blob";
+        let via_new = Fingerprint::new(&fingerprint_sha256(blob)).unwrap();
+        assert_eq!(fingerprint_of(blob), via_new);
     }
 
     // --- 以下是本任务补的用例 ---

@@ -15,9 +15,6 @@ pub enum ErrorClass {
     ApplianceUnreachable,
 }
 
-// Task 7 会给 SSH 层引入 russh 依赖；`client::Handler` trait 要求
-// `Self::Error: From<russh::Error>`，届时在此补 `impl From<russh::Error> for Error`
-// （连同 `SshTransport` 之类的落点），这里先留一句话，免得到时候重新踩这个坑。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Gateway host key 与已记录的不一致，已拒绝连接（记录 {expected}，本次 {actual}）")]
@@ -111,6 +108,33 @@ impl Error {
             | Error::SshTransport(_)
             | Error::Io(_) => ErrorClass::Network,
             Error::ApplianceUnreachable(_) => ErrorClass::ApplianceUnreachable,
+        }
+    }
+}
+
+/// `russh::client::Handler` 要求 `Self::Error: From<russh::Error>`——这是
+/// trait 定义本身的约束，不是我们能绕开的可选项。
+///
+/// 这里只做兜底：`Keys`/`NoAuthMethod` 说明这条连接压根没能力完成认证
+/// （密钥格式不对、没有可用的认证方法），落 Auth 类不落 Network——
+/// 重试同一条网络路径不会让"这把密钥"或"这种认证方法"变得可用。其余
+/// 一切 russh 内部错误（KEX 失败、连接被对端挂断、协议不一致……）落
+/// `SshTransport`，也就是 Network 类。
+///
+/// 这条 `From` 只是满足 trait bound、兜住 russh 内部隐式产生的转换
+/// （例如 `connect_stream` 在密钥交换失败时会自己调
+/// `H::Error::from(crate::Error::Disconnect)`）——它不是本模块处理
+/// russh 错误的唯一路径：`ssh::mod` 里 `tcpip_forward` 的失败需要把
+/// `RequestDenied` 单独分去 `PortBusy`，这条更细的判断必须写在调用
+/// 处自己的 `match` 里，不能指望这条笼统的 `From` replace 它——见 R9，
+/// 一旦所有 russh 错误都经这一条笼统路径改判，`RequestDenied` 与
+/// 会话中途断线的 `Disconnect`/`SendError` 就会被强行归成同一类，
+/// 该退避重连的场景被误判成"端口占用，5 秒后重试"。
+impl From<russh::Error> for Error {
+    fn from(e: russh::Error) -> Self {
+        match e {
+            russh::Error::Keys(_) | russh::Error::NoAuthMethod => Error::AuthRejected,
+            other => Error::SshTransport(other.to_string()),
         }
     }
 }
@@ -220,6 +244,26 @@ mod tests {
         let e = Error::AuthRejected;
         assert!(!e.to_string().contains("password"));
         assert_eq!(e.to_string(), "账号或口令不正确");
+    }
+
+    #[test]
+    fn russh_keys_and_no_auth_method_errors_become_auth_class() {
+        // Handler trait 要求的 From<russh::Error>：这两个变体说明这条连接
+        // 压根没有能力完成认证，落 Auth 而不是 Network——退避重连解决不了
+        // "密钥格式不对"或"没有可用认证方法"。
+        assert_eq!(
+            Error::from(russh::Error::NoAuthMethod).class(),
+            ErrorClass::Auth
+        );
+    }
+
+    #[test]
+    fn other_russh_errors_become_network_class() {
+        // 其余 russh 内部错误统一落 SshTransport/Network——一次 KEX 失败或
+        // 中途断线应该走退避重连，不该被判死。
+        let e = Error::from(russh::Error::Disconnect);
+        assert_eq!(e.class(), ErrorClass::Network);
+        assert!(matches!(e, Error::SshTransport(_)));
     }
 
     #[test]
