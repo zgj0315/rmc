@@ -34,6 +34,14 @@ case "$rc" in
         printf 'sshd-tunnel 配置已更新并 reload。\n'
         ;;
     2)
+        # 无条件 reload，不能省：rewrite_match_block 写文件、返回 0 之后
+        # reload 才可能失败，这时文件已经落盘、脚本却因 reload 失败而以
+        # 非零退出。若这里只打印"无变化"不 reload，下一次重跑 enroll 会看到
+        # 文件已经和目标一致、返回 2，永远不会再触发 reload——运行中的 sshd
+        # 从未真的加载过这个 Match 块，现场人员看到的是 "remote port
+        # forwarding failed"，文件和这条打印却都在说"一切正常"。reload 本身
+        # 是幂等操作，在这条正常也是这条异常恢复路径上多跑一次没有代价。
+        reload_sshd
         printf 'sshd-tunnel 配置无变化。\n'
         ;;
     *)

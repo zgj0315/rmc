@@ -118,9 +118,17 @@ rewrite_match_block() {
                 die "读取账号 $u 的端口失败，配置未改动：$get_out" 4
             fi
             port="$(printf '%s\n' "$get_out" | cut -f3)"
-            # PermitListen 写不带地址的裸端口形式。GatewayPorts yes 要把反向端口
-            # 绑到通配地址上，而带地址的 PermitListen 会在 GatewayPorts 被读到
-            # 之前先一层把通配绑定拒掉。端口仍逐账号只放行一个，只有地址不限。
+            # PermitListen 必须写成不带地址的裸端口形式。两条理由都在这套 OpenSSH
+            # （9.2p1）上实测过，见 sshd_tunnel_config:58-69 与方案 4.2：
+            # 一、带地址的形式（<地址>:<端口>）只认客户端请求里的那个字面地址，不做
+            #    解析也不做模式匹配。现场的命令 `ssh -R 22001:127.0.0.1:61001 ...`
+            #    不写监听地址，客户端据此请求的监听地址是 "localhost"，与放行项
+            #    `127.0.0.1:22001` 字面不相等，服务端直接拒掉。
+            # 二、GatewayPorts yes 之下实际绑在哪个地址上完全由服务端决定（恒为
+            #    通配），客户端请求里的地址不影响绑定结果——带地址的放行项配上
+            #    `-R 127.0.0.1:22001:...` 也照样绑到 0.0.0.0/[::]。在 PermitListen
+            #    里限制地址一分安全都不买，只会挡掉合法客户端。
+            # 地址因此不受限制，端口仍然逐账号只放行一个。
             printf 'Match User %s\n    PermitListen %s\n' "$u" "$port"
         done <<< "$usernames"
         printf '%s\n' "$END_MARK"

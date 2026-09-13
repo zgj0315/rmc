@@ -8,7 +8,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
-useradd --system --shell /usr/sbin/nologin --no-create-home tunnel-zhang
+# useradd 不是幂等的：账号已存在时会以非零退出，在 set -e 之下直接终止整个
+# entrypoint。`docker compose restart gateway` 复用的是同一个容器（账号建过
+# 一次，留在同一层可写文件系统里），不带这行守卫，重启就会变成一个起不来的
+# 死容器，而报错信息只字不提"账号已存在"，排查起来很容易被当成别的故障。
+id -u tunnel-zhang > /dev/null 2>&1 || \
+    useradd --system --shell /usr/sbin/nologin --no-create-home tunnel-zhang
 echo 'tunnel-zhang:tunnel-init-pw' | chpasswd
 
 # -D -e：不 daemonize，日志写 stderr。镜像里没有 syslog 守护进程，少了 -e

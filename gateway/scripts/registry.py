@@ -23,6 +23,8 @@ except ModuleNotFoundError:  # python 3.11 之前标准库没有 tomllib，回�
 
 PORT_MIN = 22000
 PORT_MAX = 22999
+# 必须与 lib.sh 里的 TUNNEL_PREFIX 保持一致——两边各自校验同一条规则，任何
+# 一边漏掉都可能让非隧道账号混进受管流程。
 USERNAME_PREFIX = "tunnel-"
 
 

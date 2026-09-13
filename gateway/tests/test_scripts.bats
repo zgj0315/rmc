@@ -1,8 +1,21 @@
 #!/usr/bin/env bats
 # 在 gateway 容器内运行：
 #   docker compose exec -T gateway bats /gateway/tests/test_scripts.bats
+#
+# 下面两条用例直接拷贝仓库里真实的 gateway/registry.toml 与
+# gateway/sshd_tunnel_config 做字节级断言（"在已经登记过的真实配置上重跑，
+# 是纯粹的空操作"、"在真实的 gateway/sshd_tunnel_config 上添加新账号…"）：
+# 运维如果照运维手册的说明往 registry.toml 里加了自己的账号、或者受管区段之外
+# 的内容跟这两条用例写死的假设不再一致，这两条会因为登记表/配置内容变了而
+# 变红，不是因为脚本本身出了 bug——变红时先看是不是这个原因，不要直接怀疑
+# enroll-account.sh。
 
 setup() {
+    # 本套件只该在 gateway 容器内跑：往下会真的 useradd/passwd -l/pkill，
+    # 一旦 tunnel- 前缀守卫失灵，在宿主上以 root 跑这个文件就是拿宿主账号
+    # 和进程当靶子。之前只靠文件头的注释提醒，没有任何东西真正拦住——这一行
+    # 把"只在容器里跑"从约定变成断言，守卫一旦失灵也只会 skip，不会去动宿主。
+    [ -f /.dockerenv ] || skip "只在 gateway 容器内运行"
     export RMC_REGISTRY=/tmp/registry.toml
     export RMC_SSHD_CONFIG=/tmp/sshd_tunnel_config
     export RMC_RELOAD_CMD=true
@@ -91,8 +104,11 @@ teardown() {
 }
 
 @test "enroll 生成的 PermitListen 是不带地址的裸端口形式" {
-    # 带地址的 PermitListen 会在 GatewayPorts 之前一层把通配绑定拒掉，
-    # 反向端口就绑不到 0.0.0.0 上，工程师也就连不进来。见全局约束第一条。
+    # 带地址的 PermitListen（如 127.0.0.1:22001）只认客户端请求里的字面地址，
+    # 现场命令 `ssh -R 22001:...` 请求的监听地址是 "localhost"，字面对不上会
+    # 被直接拒掉；而 GatewayPorts yes 之下实际绑的地址又恒为通配，跟请求里
+    # 写不写地址无关——两条理由都已实测过，见 sshd_tunnel_config:58-69 与
+    # 方案 4.2，在 PermitListen 里限制地址一分安全都不买，只会挡掉合法客户端。
     run /gateway/scripts/enroll-account.sh tunnel-new
     [ "$status" -eq 0 ]
     ! grep -q "PermitListen .*:" "$RMC_SSHD_CONFIG"
@@ -151,6 +167,38 @@ teardown() {
     /gateway/scripts/enroll-account.sh tunnel-new
     after=$(md5sum "$RMC_SSHD_CONFIG" | cut -d' ' -f1)
     [ "$before" = "$after" ]
+}
+
+@test "enroll 首次 reload 失败后重跑，配置无变化分支也必须重新 reload" {
+    # rewrite_match_block 写文件、返回 0 之后 reload_sshd 才失败——这时文件
+    # 已经落盘，脚本却因为 reload 失败（set -e）而以非零退出。原来的代码在
+    # 这之后重跑 enroll：cmp 发现文件已经和目标一致，rewrite_match_block
+    # 返回 2，脚本打印"配置无变化"、退出 0，却完全不再 reload——运行中的
+    # sshd 从未真的加载过这个 Match 块，现场人员会看到 "remote port
+    # forwarding failed"，文件和脚本的输出却都在说"一切正常"。修法是 2 分支
+    # 也无条件 reload——reload 本身是幂等操作，多跑一次没有代价。
+    counter=/tmp/reload-count
+    rm -f "$counter"
+    cat > /tmp/fake-reload.sh <<'SH'
+#!/bin/bash
+n=$(( $(cat /tmp/reload-count 2>/dev/null || echo 0) + 1 ))
+echo "$n" > /tmp/reload-count
+if [ "$n" -eq 1 ]; then
+    echo "模拟 reload 失败" >&2
+    exit 1
+fi
+exit 0
+SH
+    chmod +x /tmp/fake-reload.sh
+    export RMC_RELOAD_CMD=/tmp/fake-reload.sh
+
+    run /gateway/scripts/enroll-account.sh tunnel-new
+    [ "$status" -ne 0 ]
+
+    run /gateway/scripts/enroll-account.sh tunnel-new
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"配置无变化"* ]]
+    [ "$(cat "$counter")" -eq 2 ]
 }
 
 @test "revoke 拒绝不是 tunnel-* 的用户名" {
@@ -251,6 +299,21 @@ teardown() {
     run /gateway/scripts/tunnel-status.sh
     [ "$status" -eq 0 ]
     [[ "$output" == *"tunnel-zhang 22001 offline -"* ]]
+}
+
+@test "登记表损坏时 status 响亮失败，不能报成空列表" {
+    # tunnel-status.sh 原来靠 `done < <(python3 ... list-usernames)` 这种进程
+    # 替换喂 while 循环——跟 lib.sh 里 rewrite_match_block 上面那段注释记录的
+    # 是同一个坑：进程替换的退出码在 bash 里查不到，登记表损坏时
+    # list-usernames 直接失败、不产出任何用户名，循环读到空输入、一次也不
+    # 循环，脚本打印一张空表后正常退出 0。运维深夜看到的是"没有账号在线"，
+    # 实际情况是登记表被半途编辑坏了、每一个账号都看不见——这条用例要盯住
+    # 的正是"响亮失败"而不是"安静地报出一张空表"。
+    printf 'this is not valid toml [[[' > "$RMC_REGISTRY"
+    run /gateway/scripts/tunnel-status.sh
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"登记表"* ]]
+    [[ "$output" != *"tunnel-zhang"* ]]
 }
 
 @test "非 root 运行立即退出" {
