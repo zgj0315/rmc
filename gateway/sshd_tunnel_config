@@ -14,6 +14,18 @@ PubkeyAuthentication no
 PermitRootLogin no
 AllowUsers tunnel-*
 
+# 实测（见 gateway/tests/test_zombie_port.py 与 Task 6 报告）：这两行让 sshd
+# 放弃一个静默失联的客户端、回收其反向端口，实际耗时约 80 秒，不是按
+# ClientAliveInterval × ClientAliveCountMax = 30 秒算出来的那个数——机制细节与
+# 测量方法见 docs/方案设计.md §4.2，这里只记为什么两个数值保持不变。
+#
+# 把 ClientAliveInterval 调小到 4 左右能把回收时间压到接近 30 秒，但代价是
+# sshd 也会在约 32 秒的静默后就判定客户端已死并断开隧道——而客户端的静默不一定
+# 是掉线：现场网络里 AP 漫游、VPN 重新协商、上行拥塞都会让链路安静几十秒，
+# 期间远程工程师可能正通过这条隧道操作一体机。断开隧道会中断这次维护会话，
+# 这比让现场人员在笔记本唤醒后多等几十秒更糟：多等是不便，维护中途被打断是
+# 客服工单。因此不调这两个值；由此产生的约 80 秒回收时间，靠加大
+# RECLAIM_BUDGET（见 test_zombie_port.py）来适配，而不是反过来压缩这两行。
 ClientAliveInterval 10
 ClientAliveCountMax 3
 LoginGraceTime 20
