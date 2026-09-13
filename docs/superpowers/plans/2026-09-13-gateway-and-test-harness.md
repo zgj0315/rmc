@@ -4,9 +4,9 @@
 
 **Goal:** 搭出一台 Gateway，让隧道账号用口令经 TLS:443 登录并注册 loopback 反向端口，工程师从 22 端口跳转即可到达一体机；同时给出一套 docker compose 测试环境，供 CI 与后续客户端开发复用。
 
-**Architecture:** 不写服务端程序。Gateway 由 haproxy 做 443 的 TLS 终止，转给只监听 loopback 的 `sshd-tunnel` 实例；另一个 `sshd-engineer` 实例守 22 端口，工程师无 shell 只能 ProxyJump。账号与端口的唯一事实来源是 `gateway/registry.toml`，由 `registry.py` 解析、三个 shell 脚本消费。测试环境用 docker compose 起 gateway 与 appliance 两个容器，本计划阶段用 `ssh` 与 `socat` 充当客户端，因此 Gateway 的正确性不依赖 Rust 代码。
+**Architecture:** 不写服务端程序。Gateway 由 haproxy 做 443 的 TLS 终止，转给只监听 loopback 的 `sshd-tunnel` 实例；另一个 `sshd-engineer` 实例守 22 端口，工程师无 shell 只能 ProxyJump。账号与端口的唯一事实来源是 `gateway/registry.toml`，由 `registry.py` 解析、三个 shell 脚本消费。测试环境用 docker compose 起 gateway 与 appliance 两个容器，本计划阶段用 `ssh` 与一段 python 写的 TLS 中继充当客户端，因此 Gateway 的正确性不依赖 Rust 代码。
 
-**Tech Stack:** Debian 12、OpenSSH 9.2p1、haproxy 2.6、python3 3.11（tomllib 为标准库）、pytest、bats-core、docker compose v2、socat
+**Tech Stack:** Debian 12、OpenSSH 9.2p1、haproxy 2.6、python3 3.11（tomllib 为标准库，宿主低于 3.11 时回退到 tomli）、pytest、bats-core、docker compose v2、socat（仅 gateway 容器内使用）
 
 **Spec:** `docs/方案设计.md`，本计划实现第 4 章全部、第 6 章的登记与吊销流程、第 8 章中与 Gateway 相关的用例。
 
@@ -31,6 +31,8 @@
 **Files:**
 - Create: `gateway/registry.toml`
 - Create: `gateway/scripts/registry.py`
+- Create: `gateway/tests/requirements.txt`
+- Modify: `.gitignore`
 - Test: `gateway/tests/test_registry.py`
 
 **Interfaces:**
@@ -150,8 +152,13 @@ def test_cli_get_unknown_username_exits_3(tmp_path):
 
 - [ ] **Step 2: 运行测试确认失败**
 
+宿主 python 不带 pytest，先建一个只给测试用的 venv（正式依赖清单在 Step 3 落盘）：
+
 ```bash
-cd gateway && python3 -m pytest tests/test_registry.py -v
+cd gateway
+python3 -m venv .venv
+.venv/bin/pip install -q pytest==8.3.4
+.venv/bin/python -m pytest tests/test_registry.py -v
 ```
 
 预期：collection error，`ModuleNotFoundError: No module named 'registry'`。
@@ -190,9 +197,13 @@ from __future__ import annotations
 
 import os
 import sys
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # python 3.11 之前标准库没有 tomllib，回退到 tomli
+    import tomli as tomllib  # type: ignore[no-redef]
 
 PORT_MIN = 22000
 PORT_MAX = 22999
@@ -301,18 +312,36 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv))
 ```
 
+创建 `gateway/tests/requirements.txt`。`tomli` 只在低于 3.11 的解释器上安装，部署目标 Debian 12 是 python3.11，用标准库的 tomllib：
+
+```
+pytest==8.3.4
+tomli; python_version < "3.11"
+```
+
+把测试用的 venv 目录加进仓库根的 `.gitignore`：
+
+```bash
+cd "$(git rev-parse --show-toplevel)" && printf 'gateway/.venv/\n' >> .gitignore
+```
+
 - [ ] **Step 4: 运行测试确认通过**
 
 ```bash
-cd gateway && chmod +x scripts/registry.py && python3 -m pytest tests/test_registry.py -v
+cd gateway
+python3 -m venv .venv
+.venv/bin/pip install -q -r tests/requirements.txt
+chmod +x scripts/registry.py
+.venv/bin/python -m pytest tests/test_registry.py -v
 ```
 
-预期：9 passed。
+预期：9 passed。此后各任务一律用 `.venv/bin/python -m pytest` 跑测试。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add gateway/registry.toml gateway/scripts/registry.py gateway/tests/test_registry.py
+git add .gitignore gateway/registry.toml gateway/scripts/registry.py \
+        gateway/tests/requirements.txt gateway/tests/test_registry.py
 git commit -m "feat(gateway): registry.toml 解析与校验"
 ```
 
@@ -324,20 +353,27 @@ git commit -m "feat(gateway): registry.toml 解析与校验"
 
 **Files:**
 - Create: `gateway/sshd_tunnel_config`
+- Create: `gateway/sshd_engineer.conf`（占位，Task 5 替换内容）
+- Create: `gateway/haproxy.cfg`（占位，Task 4 替换内容）
 - Create: `gateway/systemd/sshd-tunnel.service`
 - Create: `gateway/test-env/docker-compose.yml`
 - Create: `gateway/test-env/gateway/Dockerfile`
 - Create: `gateway/test-env/gateway/entrypoint.sh`
 - Create: `gateway/test-env/appliance/Dockerfile`
+- Create: `gateway/test-env/.gitignore`
 - Create: `gateway/tests/conftest.py`
 - Test: `gateway/tests/test_tunnel.py`
 
 **Interfaces:**
-- Consumes: Task 1 的 `registry.py`
+- Consumes: 无。本任务不依赖 Task 1 的任何产物：entrypoint 直接用 `useradd` 建账号，不读登记表。
 - Produces:
-  - compose 服务 `gateway`，宿主端口 `127.0.0.1:2422` → 容器内 `sshd-tunnel`（`127.0.0.1:2222` 经容器内 socat 暴露），`127.0.0.1:2022` → `sshd-engineer`，`127.0.0.1:8443` → haproxy（Task 4 接上）
+  - compose 服务 `gateway`，宿主端口 `127.0.0.1:2422` → 容器内 socat 的 `2223`（再转给只监听 loopback 的 `sshd-tunnel` `127.0.0.1:2222`），`127.0.0.1:2022` → `sshd-engineer`，`127.0.0.1:8443` → haproxy（Task 4 接上）
   - compose 服务 `appliance`，宿主端口 `127.0.0.1:2322` → 容器内 sshd:22，账号 `root`，口令 `appliance-dynamic-pw`
-  - 测试固件 `harness`（session 作用域）：拉起 compose、等待就绪、结束时销毁
+  - `gateway/tests/conftest.py` 是全部测试模块唯一的共享层，测试模块之间不互相 import。它提供：
+    - 常量 `ENV_DIR`、`HOST`、`TUNNEL_SSHD`、`ENGINEER_SSHD`、`HAPROXY`、`APPLIANCE_SSHD`、`TUNNEL_USER`、`TUNNEL_PW`、`TUNNEL_PORT`、`APPLIANCE_PW`、`ENG_KEY`、`SSH_COMMON`、`ENG_COMMON`，每个只在这里定义一次
+    - 辅助函数 `compose()`、`wait_port()`、`port_listening_in_gateway()`、`engineer_proxy_option()`
+    - 口令认证辅助 `askpass_env()`、`run_ssh_password()`、`popen_ssh_password()`、`run_sftp_password()`：口令经 OpenSSH 自带的 `SSH_ASKPASS` 机制传入，不依赖宿主装第三方工具
+    - 固件 `harness`（session 作用域，拉起 compose、等待就绪、结束时销毁）与 `tunnel`
   - 测试常量：`TUNNEL_USER = "tunnel-zhang"`、`TUNNEL_PW = "tunnel-init-pw"`、`TUNNEL_PORT = 22001`
 
 **说明：** 方案 4.2 的配置片段没有列出 `HostKey`、`PidFile` 与 `Subsystem`。第二个 sshd 实例必须有独立的 host key 与 pid 文件，本任务补上这三行；实现完成后把它们补进方案 4.2。
@@ -347,9 +383,14 @@ git commit -m "feat(gateway): registry.toml 解析与校验"
 创建 `gateway/tests/conftest.py`：
 
 ```python
+from __future__ import annotations
+
+import hashlib
 import os
+import shlex
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -367,6 +408,88 @@ TUNNEL_SSHD = 2422
 ENGINEER_SSHD = 2022
 HAPROXY = 8443
 APPLIANCE_SSHD = 2322
+
+ENG_KEY = ENV_DIR / "engineer-keys" / "eng_ed25519"
+
+# 口令认证用的公共选项。限定 password 一种认证方式、只允许一次口令提示，
+# 免得失败时 ssh 反复重试或退回其他方式，让断言的含义变模糊。
+SSH_COMMON = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "PreferredAuthentications=password",
+    "-o", "NumberOfPasswordPrompts=1",
+    "-o", "ConnectTimeout=10",
+]
+
+# 工程师入口用公钥认证。
+ENG_COMMON = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "IdentitiesOnly=yes",
+    "-i", str(ENG_KEY),
+    "-o", "ConnectTimeout=10",
+]
+
+_ASKPASS_DIR = Path(tempfile.gettempdir()) / f"rmc-askpass-{os.getuid()}"
+
+
+def askpass_env(password: str) -> dict[str, str]:
+    """生成一个只打印口令的脚本，并通过 SSH_ASKPASS 交给 ssh。
+
+    OpenSSH 8.4+ 支持 SSH_ASKPASS_REQUIRE=force：不管有没有 tty 与 DISPLAY，
+    都从该脚本读口令。宿主与 CI 用的 OpenSSH 都满足，因此不需要 sshpass 一类
+    的第三方工具。调用方必须把 ssh 的 stdin 关掉（stdin=DEVNULL），否则 ssh
+    会先向终端要口令。
+    """
+    _ASKPASS_DIR.mkdir(mode=0o700, exist_ok=True)
+    script = _ASKPASS_DIR / f"{hashlib.sha256(password.encode()).hexdigest()[:16]}.sh"
+    if not script.exists():
+        script.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(password)}\n", encoding="utf-8"
+        )
+        script.chmod(0o700)
+    env = dict(os.environ)
+    env["SSH_ASKPASS"] = str(script)
+    env["SSH_ASKPASS_REQUIRE"] = "force"
+    env.pop("SSH_AUTH_SOCK", None)
+    return env
+
+
+def run_ssh_password(password: str, *args: str, timeout: int = 25) -> subprocess.CompletedProcess:
+    """跑一条口令认证的 ssh 并等它结束。"""
+    return subprocess.run(
+        ["ssh", *SSH_COMMON, *args],
+        env=askpass_env(password), stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def popen_ssh_password(password: str, *args: str) -> subprocess.Popen:
+    """起一条常驻的口令认证 ssh（例如 -N -T 的隧道），收尾由调用方负责。"""
+    return subprocess.Popen(
+        ["ssh", *SSH_COMMON, *args],
+        env=askpass_env(password), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def run_sftp_password(password: str, *args: str, timeout: int = 25) -> subprocess.CompletedProcess:
+    """口令认证的 sftp，用来断言 sftp 子系统不可用。"""
+    return subprocess.run(
+        ["sftp", *SSH_COMMON, *args],
+        env=askpass_env(password), stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def engineer_proxy_option() -> list[str]:
+    """经工程师入口跳到 Gateway loopback 的 ProxyCommand。
+
+    ssh 的 -J 不会把命令行上的 -i 传给跳板那一跳，所以这里显式写 ProxyCommand，
+    让跳板连接用 test-env/engineer-keys 里的私钥做公钥认证。
+    """
+    return ["-o", "ProxyCommand=ssh {} -W %h:%p -p {} eng@{}".format(
+        " ".join(ENG_COMMON), ENGINEER_SSHD, HOST)]
 
 
 def wait_port(port: int, timeout: float = 60.0) -> None:
@@ -389,6 +512,11 @@ def compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
+def port_listening_in_gateway(port: int) -> bool:
+    out = compose("exec", "-T", "gateway", "ss", "-ltn", check=False)
+    return f"127.0.0.1:{port}" in out.stdout
+
+
 @pytest.fixture(scope="session")
 def harness():
     compose("down", "-v", check=False)
@@ -401,48 +529,20 @@ def harness():
     finally:
         if os.environ.get("RMC_KEEP_ENV") != "1":
             compose("down", "-v", check=False)
-```
-
-创建 `gateway/tests/test_tunnel.py`：
-
-```python
-import socket
-import subprocess
-import time
-
-import pytest
-
-from conftest import (
-    APPLIANCE_PW, APPLIANCE_SSHD, ENGINEER_SSHD, HOST,
-    TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
-)
-
-SSH_COMMON = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "PreferredAuthentications=password",
-    "-o", "NumberOfPasswordPrompts=1",
-    "-o", "ConnectTimeout=10",
-]
-
-
-def sshpass(password: str, *args: str) -> list[str]:
-    return ["sshpass", "-p", password, "ssh", *SSH_COMMON, *args]
 
 
 @pytest.fixture
 def tunnel(harness):
     """以 tunnel-zhang 建立反向端口，yield 期间隧道在线。"""
-    proc = subprocess.Popen(
-        sshpass(
-            TUNNEL_PW,
-            "-N", "-T",
-            "-p", str(TUNNEL_SSHD),
-            "-o", "ExitOnForwardFailure=yes",
-            "-R", f"127.0.0.1:{TUNNEL_PORT}:appliance:22",
-            f"{TUNNEL_USER}@{HOST}",
-        ),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    proc = popen_ssh_password(
+        TUNNEL_PW,
+        "-N", "-T",
+        "-p", str(TUNNEL_SSHD),
+        "-o", "ExitOnForwardFailure=yes",
+        # -R 的目标地址由跑在宿主上的 ssh 客户端解析，宿主不在 compose 网络里，
+        # 所以这里只能写一体机已发布到宿主的端口，不能写 compose 服务名。
+        "-R", f"127.0.0.1:{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}",
+        f"{TUNNEL_USER}@{HOST}",
     )
     try:
         deadline = time.time() + 20
@@ -458,31 +558,32 @@ def tunnel(harness):
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+```
 
+创建 `gateway/tests/test_tunnel.py`：
 
-def port_listening_in_gateway(port: int) -> bool:
-    out = subprocess.run(
-        ["docker", "compose", "exec", "-T", "gateway", "ss", "-ltn"],
-        cwd=__import__("conftest").ENV_DIR, capture_output=True, text=True,
-    )
-    return f"127.0.0.1:{port}" in out.stdout
+```python
+import socket
+
+import pytest
+
+from conftest import (
+    APPLIANCE_PW, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
+    engineer_proxy_option, port_listening_in_gateway, run_ssh_password,
+)
 
 
 def test_tunnel_account_authenticates_with_password(harness):
-    out = subprocess.run(
-        sshpass(TUNNEL_PW, "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}", "true"),
-        capture_output=True, text=True,
-    )
+    out = run_ssh_password(
+        TUNNEL_PW, "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}", "true")
     # ForceCommand /bin/false 会让命令失败，但认证必须通过。
     assert "Permission denied" not in out.stderr
     assert "Authentication failed" not in out.stderr
 
 
 def test_wrong_password_is_rejected(harness):
-    out = subprocess.run(
-        sshpass("wrong-pw", "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}", "true"),
-        capture_output=True, text=True,
-    )
+    out = run_ssh_password(
+        "wrong-pw", "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}", "true")
     assert out.returncode != 0
     assert "Permission denied" in out.stderr
 
@@ -499,12 +600,12 @@ def test_reverse_port_is_not_bound_on_external_interface(tunnel):
 
 
 def test_engineer_reaches_appliance_through_reverse_port(tunnel):
-    out = subprocess.run(
-        ["sshpass", "-p", APPLIANCE_PW, "ssh", *SSH_COMMON,
-         "-J", f"eng@{HOST}:{ENGINEER_SSHD}",
-         "-p", str(TUNNEL_PORT),
-         "root@127.0.0.1", "cat /etc/appliance-id"],
-        capture_output=True, text=True,
+    out = run_ssh_password(
+        APPLIANCE_PW,
+        *engineer_proxy_option(),
+        "-o", "HostKeyAlias=c0001-a1",
+        "-p", str(TUNNEL_PORT), "root@127.0.0.1", "cat /etc/appliance-id",
+        timeout=40,
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "c0001-a1"
@@ -515,7 +616,7 @@ def test_engineer_reaches_appliance_through_reverse_port(tunnel):
 - [ ] **Step 2: 运行测试确认失败**
 
 ```bash
-cd gateway && python3 -m pytest tests/test_tunnel.py -v
+cd gateway && .venv/bin/python -m pytest tests/test_tunnel.py -v
 ```
 
 预期：`harness` 固件失败，`docker compose up` 报找不到 `test-env/docker-compose.yml`。
@@ -610,17 +711,19 @@ RUN apt-get update \
       openssh-server haproxy socat iproute2 procps openssl python3 \
  && rm -rf /var/lib/apt/lists/*
 
+# 构建上下文是 gateway/（见 compose 的 context: ..），以下路径都相对它书写。
+# sshd_tunnel_config 等直接取仓库里的那一份，生产与测试共用同一个配置文件。
 COPY sshd_tunnel_config /etc/ssh/sshd_tunnel_config
 COPY sshd_engineer.conf /etc/ssh/sshd_config.d/engineer.conf
 COPY haproxy.cfg /etc/haproxy/haproxy.cfg
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY test-env/gateway/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN mkdir -p /run/sshd \
  && ssh-keygen -A \
  && ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/tunnel_host_ed25519_key \
  && chmod +x /usr/local/bin/entrypoint.sh
 
-EXPOSE 22 443 2222
+EXPOSE 22 443 2223
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
 
@@ -629,7 +732,7 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```bash
 #!/bin/bash
 # 测试环境入口：建账号、起两个 sshd 与 haproxy，并把 loopback 上的
-# sshd-tunnel 通过 socat 暴露到容器网卡，使宿主的测试能直连它。
+# sshd-tunnel 通过 socat 暴露到容器网卡的 2223，使宿主的测试能直连它。
 set -euo pipefail
 
 useradd --system --shell /usr/sbin/nologin --no-create-home tunnel-zhang
@@ -648,8 +751,10 @@ chmod 600 /home/eng/.ssh/authorized_keys
 /usr/sbin/sshd -t
 /usr/sbin/sshd
 
-# 测试用旁路：把容器网卡 2222 转到 loopback 2222。生产环境没有这一条。
-socat TCP-LISTEN:2222,reuseaddr,fork TCP:127.0.0.1:2222 &
+# 测试用旁路：把容器网卡 2223 转到 loopback 2222。监听端口必须与 sshd-tunnel
+# 的 127.0.0.1:2222 不同，否则 socat 绑 0.0.0.0:2222 会撞上 EADDRINUSE。
+# 生产环境没有这一条。
+socat TCP-LISTEN:2223,reuseaddr,fork TCP:127.0.0.1:2222 &
 
 exec haproxy -W -db -f /etc/haproxy/haproxy.cfg
 ```
@@ -698,12 +803,10 @@ services:
     volumes:
       - ./engineer-keys:/engineer-keys:ro
     ports:
-      - "127.0.0.1:2422:2222"
+      - "127.0.0.1:2422:2223"
       - "127.0.0.1:2022:22"
       - "127.0.0.1:8443:443"
 ```
-
-`gateway/test-env/gateway/Dockerfile` 的 build context 是 `gateway/`，所以 `COPY sshd_tunnel_config` 取的是仓库里的那一份，生产与测试共用同一个配置文件。把 Dockerfile 中的 `COPY entrypoint.sh` 改为 `COPY test-env/gateway/entrypoint.sh`，其余 `COPY` 改为对应的仓库相对路径。
 
 生成工程师测试密钥：
 
@@ -717,7 +820,7 @@ printf 'engineer-keys/eng_ed25519\n' > gateway/test-env/.gitignore
 - [ ] **Step 4: 运行测试确认通过**
 
 ```bash
-cd gateway && python3 -m pytest tests/test_tunnel.py -v
+cd gateway && .venv/bin/python -m pytest tests/test_tunnel.py -v
 ```
 
 预期：前四个用例通过；`test_engineer_reaches_appliance_through_reverse_port` 仍失败，工程师入口在 Task 5 完成。先用 `-k "not engineer"` 确认其余全绿。
@@ -741,7 +844,7 @@ git commit -m "test(gateway): docker 测试环境与 sshd-tunnel 口令认证连
 - Test: `gateway/tests/test_tunnel_restrictions.py`
 
 **Interfaces:**
-- Consumes: Task 2 的 `harness`、`tunnel` 固件与 `sshpass` 辅助函数
+- Consumes: Task 2 的 `conftest.py`：`harness` 固件与口令 ssh 辅助函数 `run_ssh_password()` / `run_sftp_password()`
 - Produces: 无新接口
 
 - [ ] **Step 1: 写下失败的测试**
@@ -751,75 +854,80 @@ git commit -m "test(gateway): docker 测试环境与 sshd-tunnel 口令认证连
 ```python
 import subprocess
 
-from conftest import HOST, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER
-from test_tunnel import SSH_COMMON, sshpass
-
-
-def run(*args: str, timeout: int = 25) -> subprocess.CompletedProcess:
-    return subprocess.run(list(args), capture_output=True, text=True, timeout=timeout)
+from conftest import (
+    APPLIANCE_SSHD, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
+    run_sftp_password, run_ssh_password,
+)
 
 
 def test_no_shell_and_no_command_execution(harness):
-    out = run(*sshpass(TUNNEL_PW, "-p", str(TUNNEL_SSHD),
-                       f"{TUNNEL_USER}@{HOST}", "id"))
+    out = run_ssh_password(TUNNEL_PW, "-p", str(TUNNEL_SSHD),
+                           f"{TUNNEL_USER}@{HOST}", "id")
     assert out.returncode != 0
     assert "uid=" not in out.stdout
 
 
 def test_no_pty(harness):
-    out = run(*sshpass(TUNNEL_PW, "-tt", "-p", str(TUNNEL_SSHD),
-                       f"{TUNNEL_USER}@{HOST}"))
+    out = run_ssh_password(TUNNEL_PW, "-tt", "-p", str(TUNNEL_SSHD),
+                           f"{TUNNEL_USER}@{HOST}")
     assert out.returncode != 0
     assert "PTY allocation request failed" in out.stderr
 
 
 def test_local_forwarding_is_refused(harness):
     """AllowTcpForwarding remote 必须禁掉 -L。"""
-    out = run(*sshpass(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
-                       "-o", "ExitOnForwardFailure=yes",
-                       "-L", "127.0.0.1:19099:appliance:22",
-                       f"{TUNNEL_USER}@{HOST}"))
+    # -L 的目标由服务端解析，gateway 容器在 compose 网络里，写服务名是对的。
+    out = run_ssh_password(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
+                           "-o", "ExitOnForwardFailure=yes",
+                           "-L", "127.0.0.1:19099:appliance:22",
+                           f"{TUNNEL_USER}@{HOST}")
     assert out.returncode != 0
     assert "administratively prohibited" in out.stderr
 
 
 def test_reverse_port_outside_permitlisten_is_refused(harness):
     """PermitListen 只放行 22001，别的端口必须被拒。"""
-    out = run(*sshpass(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
-                       "-o", "ExitOnForwardFailure=yes",
-                       "-R", "127.0.0.1:22002:appliance:22",
-                       f"{TUNNEL_USER}@{HOST}"))
+    # -R 的目标地址由跑在宿主上的 ssh 客户端解析，宿主不在 compose 网络里，
+    # 所以只能写一体机已发布到宿主的端口，不能写 compose 服务名。
+    out = run_ssh_password(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
+                           "-o", "ExitOnForwardFailure=yes",
+                           "-R", f"127.0.0.1:22002:{HOST}:{APPLIANCE_SSHD}",
+                           f"{TUNNEL_USER}@{HOST}")
     assert out.returncode != 0
     assert "remote port forwarding failed" in out.stderr.lower()
 
 
 def test_reverse_port_on_wildcard_address_is_refused(harness):
     """客户端传 0.0.0.0 时，PermitListen 与 GatewayPorts no 都应拦住。"""
-    out = run(*sshpass(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
-                       "-o", "ExitOnForwardFailure=yes",
-                       "-R", "0.0.0.0:22001:appliance:22",
-                       f"{TUNNEL_USER}@{HOST}"))
+    # 同上：-R 的目标地址由宿主的 ssh 客户端解析，不能写 compose 服务名。
+    out = run_ssh_password(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
+                           "-o", "ExitOnForwardFailure=yes",
+                           "-R", f"0.0.0.0:{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}",
+                           f"{TUNNEL_USER}@{HOST}")
     assert out.returncode != 0
 
 
 def test_sftp_subsystem_is_unavailable(harness):
-    out = run("sshpass", "-p", TUNNEL_PW, "sftp", *SSH_COMMON,
-              "-P", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}")
+    out = run_sftp_password(TUNNEL_PW, "-P", str(TUNNEL_SSHD),
+                            f"{TUNNEL_USER}@{HOST}")
     assert out.returncode != 0
 
 
 def test_agent_forwarding_is_refused(harness):
-    out = run(*sshpass(TUNNEL_PW, "-A", "-N", "-T", "-p", str(TUNNEL_SSHD),
-                       f"{TUNNEL_USER}@{HOST}"))
+    out = run_ssh_password(TUNNEL_PW, "-A", "-N", "-T", "-p", str(TUNNEL_SSHD),
+                           f"{TUNNEL_USER}@{HOST}")
     assert out.returncode != 0
 
 
 def test_pubkey_auth_is_disabled(harness):
-    out = run("ssh", "-o", "StrictHostKeyChecking=no",
-              "-o", "UserKnownHostsFile=/dev/null",
-              "-o", "PreferredAuthentications=publickey",
-              "-o", "ConnectTimeout=10",
-              "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}")
+    out = subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=no",
+         "-o", "UserKnownHostsFile=/dev/null",
+         "-o", "PreferredAuthentications=publickey",
+         "-o", "ConnectTimeout=10",
+         "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25,
+    )
     assert out.returncode != 0
     assert "Permission denied" in out.stderr
 ```
@@ -827,7 +935,7 @@ def test_pubkey_auth_is_disabled(harness):
 - [ ] **Step 2: 运行测试确认失败**
 
 ```bash
-cd gateway && python3 -m pytest tests/test_tunnel_restrictions.py -v
+cd gateway && .venv/bin/python -m pytest tests/test_tunnel_restrictions.py -v
 ```
 
 预期：至少 `test_sftp_subsystem_is_unavailable` 与 `test_no_pty` 的报错文本与断言不符，逐条对照 sshd 实际输出修正断言或补配置。
@@ -848,7 +956,7 @@ cd gateway/test-env && docker compose up -d --build gateway
 - [ ] **Step 4: 运行测试确认通过**
 
 ```bash
-cd gateway && python3 -m pytest tests/test_tunnel_restrictions.py -v
+cd gateway && .venv/bin/python -m pytest tests/test_tunnel_restrictions.py -v
 ```
 
 预期：8 passed。
@@ -869,28 +977,105 @@ git commit -m "test(gateway): 隧道账号权限边界的负向测试"
 **Files:**
 - Modify: `gateway/haproxy.cfg`
 - Modify: `gateway/test-env/gateway/Dockerfile`（生成自签证书）
+- Modify: `gateway/tests/conftest.py`（追加 TLS 中继固件）
 - Test: `gateway/tests/test_tls_frontend.py`
 
 **Interfaces:**
-- Consumes: Task 2 的 `harness`
+- Consumes: Task 2 的 `conftest.py`：`harness` 固件与口令 ssh 辅助函数
 - Produces:
   - 宿主 `127.0.0.1:8443` 提供 TLS，SNI 与证书 CN 均为 `gateway.test`
-  - 测试固件 `tls_wrap`：用 socat 在宿主起一个明文端口，把字节裹进 TLS 送到 8443，返回该端口号
+  - `conftest.py` 中的测试固件 `tls_wrap`：用 python asyncio 在宿主起一个明文端口，把字节裹进 TLS 送到 8443，yield 该端口号。不依赖宿主装 socat
 
 - [ ] **Step 1: 写下失败的测试**
+
+先在 `gateway/tests/conftest.py` 的 import 段补上 `import asyncio`、`import contextlib`、`import ssl`、`import threading`，再在文件末尾追加 TLS 中继与 `tls_wrap` 固件：
+
+```python
+async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+    except (OSError, ssl.SSLError):
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            writer.close()
+
+
+class _TlsRelay:
+    """把宿主上的明文 TCP 连接裹进 TLS 转给 haproxy 的 443。
+
+    只用标准库，宿主不需要装 socat。SNI 固定为 gateway.test，证书是自签的
+    所以不校验证书链，与原先 socat 的 verify=0,snihost=gateway.test 等价。
+    """
+
+    def __init__(self, host: str, port: int, sni: str) -> None:
+        self._target = (host, port)
+        self._sni = sni
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self._ctx.check_hostname = False
+        self._ctx.verify_mode = ssl.CERT_NONE
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._server = None
+
+    def start(self) -> int:
+        """起监听，返回实际分配到的本地明文端口。"""
+        self._thread.start()
+        self._server = asyncio.run_coroutine_threadsafe(
+            asyncio.start_server(self._handle, HOST, 0), self._loop
+        ).result(timeout=10)
+        return self._server.sockets[0].getsockname()[1]
+
+    async def _handle(self, reader, writer) -> None:
+        try:
+            up_r, up_w = await asyncio.open_connection(
+                *self._target, ssl=self._ctx, server_hostname=self._sni
+            )
+        except OSError:
+            writer.close()
+            return
+        await asyncio.gather(_pump(reader, up_w), _pump(up_r, writer))
+
+    def stop(self) -> None:
+        async def _close() -> None:
+            self._server.close()
+            await self._server.wait_closed()
+
+        asyncio.run_coroutine_threadsafe(_close(), self._loop).result(timeout=10)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=10)
+        self._loop.close()
+
+
+@pytest.fixture
+def tls_wrap(harness):
+    """yield 宿主上的一个明文端口，写进去的字节会裹进 TLS 送到 haproxy 的 443。"""
+    relay = _TlsRelay(HOST, HAPROXY, "gateway.test")
+    port = relay.start()
+    try:
+        yield port
+    finally:
+        relay.stop()
+```
 
 创建 `gateway/tests/test_tls_frontend.py`：
 
 ```python
 import socket
 import ssl
-import subprocess
 import time
 
 import pytest
 
-from conftest import HAPROXY, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_USER
-from test_tunnel import port_listening_in_gateway, sshpass
+from conftest import (
+    APPLIANCE_SSHD, HAPROXY, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_USER,
+    popen_ssh_password, port_listening_in_gateway,
+)
 
 
 def test_tls_handshake_succeeds_and_presents_gateway_test_cert(harness):
@@ -915,29 +1100,14 @@ def test_ssh_banner_arrives_through_tls(harness):
             assert tls.recv(64).startswith(b"SSH-2.0-")
 
 
-@pytest.fixture
-def tls_wrap(harness):
-    port = 19443
-    proc = subprocess.Popen(
-        ["socat", f"TCP-LISTEN:{port},reuseaddr,fork,bind=127.0.0.1",
-         f"OPENSSL:{HOST}:{HAPROXY},verify=0,snihost=gateway.test"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-    )
-    time.sleep(1)
-    try:
-        yield port
-    finally:
-        proc.terminate()
-        proc.wait(timeout=10)
-
-
 def test_reverse_tunnel_works_over_tls(tls_wrap):
-    proc = subprocess.Popen(
-        sshpass(TUNNEL_PW, "-N", "-T", "-p", str(tls_wrap),
-                "-o", "ExitOnForwardFailure=yes",
-                "-R", f"127.0.0.1:{TUNNEL_PORT}:appliance:22",
-                f"{TUNNEL_USER}@{HOST}"),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    proc = popen_ssh_password(
+        TUNNEL_PW, "-N", "-T", "-p", str(tls_wrap),
+        "-o", "ExitOnForwardFailure=yes",
+        # -R 的目标地址由跑在宿主上的 ssh 客户端解析，宿主不在 compose 网络里，
+        # 所以只能写一体机已发布到宿主的端口，不能写 compose 服务名。
+        "-R", f"127.0.0.1:{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}",
+        f"{TUNNEL_USER}@{HOST}",
     )
     try:
         deadline = time.time() + 20
@@ -955,7 +1125,7 @@ def test_reverse_tunnel_works_over_tls(tls_wrap):
 - [ ] **Step 2: 运行测试确认失败**
 
 ```bash
-cd gateway && python3 -m pytest tests/test_tls_frontend.py -v
+cd gateway && .venv/bin/python -m pytest tests/test_tls_frontend.py -v
 ```
 
 预期：TLS 握手失败，8443 上没有 TLS 服务。
@@ -1010,15 +1180,16 @@ RUN mkdir -p /etc/haproxy/certs \
 
 ```bash
 cd gateway/test-env && docker compose up -d --build gateway
-cd .. && python3 -m pytest tests/test_tls_frontend.py -v
+cd .. && .venv/bin/python -m pytest tests/test_tls_frontend.py -v
 ```
 
-预期：4 passed。
+预期：3 passed。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add gateway/haproxy.cfg gateway/test-env/gateway/Dockerfile gateway/tests/test_tls_frontend.py
+git add gateway/haproxy.cfg gateway/test-env/gateway/Dockerfile \
+        gateway/tests/conftest.py gateway/tests/test_tls_frontend.py
 git commit -m "feat(gateway): haproxy 在 443 终止 TLS 并转给 sshd-tunnel"
 ```
 
@@ -1033,7 +1204,7 @@ git commit -m "feat(gateway): haproxy 在 443 终止 TLS 并转给 sshd-tunnel"
 - Test: `gateway/tests/test_engineer_entry.py`
 
 **Interfaces:**
-- Consumes: Task 2 的 `harness` 与 `tunnel` 固件，`test-env/engineer-keys/eng_ed25519`
+- Consumes: Task 2 的 `conftest.py`：`harness`、`tunnel` 固件，常量 `ENG_KEY` / `ENG_COMMON` 与 `engineer_proxy_option()`，以及 `test-env/engineer-keys/eng_ed25519`
 - Produces: 宿主 `127.0.0.1:2022` 为工程师入口，账号 `eng`，公钥认证
 
 - [ ] **Step 1: 写下失败的测试**
@@ -1042,39 +1213,30 @@ git commit -m "feat(gateway): haproxy 在 443 终止 TLS 并转给 sshd-tunnel"
 
 ```python
 import subprocess
-from pathlib import Path
 
 from conftest import (
-    APPLIANCE_PW, ENGINEER_SSHD, ENV_DIR, HOST, TUNNEL_PORT,
+    APPLIANCE_PW, ENG_COMMON, ENGINEER_SSHD, HOST, TUNNEL_PORT,
+    engineer_proxy_option, run_ssh_password,
 )
-from test_tunnel import SSH_COMMON, tunnel  # noqa: F401  固件
-
-KEY = ENV_DIR / "engineer-keys" / "eng_ed25519"
-
-ENG_COMMON = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "IdentitiesOnly=yes",
-    "-i", str(KEY),
-    "-o", "ConnectTimeout=10",
-]
 
 
 def test_engineer_cannot_get_a_shell(harness):
     out = subprocess.run(
         ["ssh", *ENG_COMMON, "-p", str(ENGINEER_SSHD), f"eng@{HOST}", "id"],
-        capture_output=True, text=True, timeout=25,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25,
     )
     assert out.returncode != 0
     assert "uid=" not in out.stdout
 
 
 def test_engineer_cannot_forward_to_non_loopback(harness):
+    # -L 的目标由服务端解析，gateway 容器在 compose 网络里，写服务名是对的；
+    # PermitOpen 127.0.0.1:* 必须把这种非 loopback 目标拦住。
     out = subprocess.run(
         ["ssh", *ENG_COMMON, "-N", "-T", "-p", str(ENGINEER_SSHD),
          "-o", "ExitOnForwardFailure=yes",
          "-L", "127.0.0.1:19098:appliance:22", f"eng@{HOST}"],
-        capture_output=True, text=True, timeout=25,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25,
     )
     assert out.returncode != 0
     assert "administratively prohibited" in out.stderr
@@ -1087,19 +1249,19 @@ def test_engineer_password_auth_is_disabled(harness):
          "-o", "PreferredAuthentications=password",
          "-o", "ConnectTimeout=10",
          "-p", str(ENGINEER_SSHD), f"eng@{HOST}"],
-        capture_output=True, text=True, timeout=25,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25,
     )
     assert out.returncode != 0
 
 
-def test_engineer_jumps_to_appliance_and_runs_command(tunnel):  # noqa: F811
-    out = subprocess.run(
-        ["sshpass", "-p", APPLIANCE_PW, "ssh", *SSH_COMMON,
-         "-o", f"ProxyCommand=ssh {' '.join(ENG_COMMON)} -W %h:%p -p {ENGINEER_SSHD} eng@{HOST}",
-         "-o", "HostKeyAlias=c0001-a1",
-         "-p", str(TUNNEL_PORT), "root@127.0.0.1",
-         "cat /etc/appliance-id"],
-        capture_output=True, text=True, timeout=40,
+def test_engineer_jumps_to_appliance_and_runs_command(tunnel):
+    out = run_ssh_password(
+        APPLIANCE_PW,
+        *engineer_proxy_option(),
+        "-o", "HostKeyAlias=c0001-a1",
+        "-p", str(TUNNEL_PORT), "root@127.0.0.1",
+        "cat /etc/appliance-id",
+        timeout=40,
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "c0001-a1"
@@ -1108,7 +1270,7 @@ def test_engineer_jumps_to_appliance_and_runs_command(tunnel):  # noqa: F811
 - [ ] **Step 2: 运行测试确认失败**
 
 ```bash
-cd gateway && python3 -m pytest tests/test_engineer_entry.py -v
+cd gateway && .venv/bin/python -m pytest tests/test_engineer_entry.py -v
 ```
 
 预期：`test_engineer_cannot_get_a_shell` 失败，占位配置没有限制 shell。
@@ -1141,7 +1303,7 @@ Match Group engineers
 
 ```bash
 cd gateway/test-env && docker compose up -d --build gateway
-cd .. && python3 -m pytest tests/test_engineer_entry.py tests/test_tunnel.py -v
+cd .. && .venv/bin/python -m pytest tests/test_engineer_entry.py tests/test_tunnel.py -v
 ```
 
 预期：全部通过，含 Task 2 里先前失败的 `test_engineer_reaches_appliance_through_reverse_port`。
@@ -1160,10 +1322,11 @@ git commit -m "feat(gateway): 工程师入口仅允许跳转到 loopback 隧道�
 客户端在 Wi-Fi 切换或休眠时会静默断开，Gateway 若不及时回收端口，客户端重连会一直撞在端口占用上。这是现场最常见的故障，必须有测试守住。
 
 **Files:**
+- Modify: `gateway/sshd_tunnel_config`（补预算注释）
 - Test: `gateway/tests/test_zombie_port.py`
 
 **Interfaces:**
-- Consumes: Task 2 的 `harness`、`port_listening_in_gateway`
+- Consumes: Task 2 的 `conftest.py`：`harness` 固件、`port_listening_in_gateway()` 与 `popen_ssh_password()`
 - Produces: 无新接口
 
 - [ ] **Step 1: 写下失败的测试**
@@ -1177,20 +1340,23 @@ import time
 
 import pytest
 
-from conftest import HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_USER, TUNNEL_SSHD
-from test_tunnel import port_listening_in_gateway, sshpass
+from conftest import (
+    APPLIANCE_SSHD, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
+    popen_ssh_password, port_listening_in_gateway,
+)
 
 RECLAIM_BUDGET = 45  # ClientAliveInterval 10 × CountMax 3 再留余量
 
 
 def start_tunnel() -> subprocess.Popen:
-    proc = subprocess.Popen(
-        sshpass(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
-                "-o", "ExitOnForwardFailure=yes",
-                "-o", "ServerAliveInterval=0",
-                "-R", f"127.0.0.1:{TUNNEL_PORT}:appliance:22",
-                f"{TUNNEL_USER}@{HOST}"),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    proc = popen_ssh_password(
+        TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=0",
+        # -R 的目标地址由跑在宿主上的 ssh 客户端解析，宿主不在 compose 网络里，
+        # 所以只能写一体机已发布到宿主的端口，不能写 compose 服务名。
+        "-R", f"127.0.0.1:{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}",
+        f"{TUNNEL_USER}@{HOST}",
     )
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -1239,7 +1405,7 @@ def test_port_can_be_rebound_after_reclaim(harness):
 - [ ] **Step 2: 运行测试确认失败或通过**
 
 ```bash
-cd gateway && python3 -m pytest tests/test_zombie_port.py -v
+cd gateway && .venv/bin/python -m pytest tests/test_zombie_port.py -v
 ```
 
 若 Task 2 的 `ClientAliveInterval 10` / `ClientAliveCountMax 3` 已生效，这两个用例应当直接通过。把 `gateway/sshd_tunnel_config` 里两行临时改成 `ClientAliveInterval 0` 重新 build，确认测试会失败，再改回来，以此证明测试确实在守这两个参数。
@@ -1257,7 +1423,7 @@ cd gateway && python3 -m pytest tests/test_zombie_port.py -v
 
 ```bash
 cd gateway/test-env && docker compose up -d --build gateway
-cd .. && python3 -m pytest tests/test_zombie_port.py -v
+cd .. && .venv/bin/python -m pytest tests/test_zombie_port.py -v
 ```
 
 预期：2 passed，单个用例耗时约 40 秒。
@@ -1584,7 +1750,6 @@ git commit -m "feat(gateway): enroll/revoke/status 运维脚本"
 **Files:**
 - Create: `.github/workflows/gateway.yml`
 - Create: `gateway/README.md`
-- Create: `gateway/tests/requirements.txt`
 - Modify: `docs/方案设计.md`（补 4.2 的三行）
 
 **Interfaces:**
@@ -1593,11 +1758,7 @@ git commit -m "feat(gateway): enroll/revoke/status 运维脚本"
 
 - [ ] **Step 1: 写下失败的检查**
 
-创建 `gateway/tests/requirements.txt`：
-
-```
-pytest==8.3.4
-```
+`gateway/tests/requirements.txt` 已在 Task 1 Step 3 创建，这里只引用它。
 
 创建 `.github/workflows/gateway.yml`：
 
@@ -1620,8 +1781,9 @@ jobs:
       - name: 安装测试依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y sshpass socat openssh-client
-          python3 -m pip install -r gateway/tests/requirements.txt
+          sudo apt-get install -y openssh-client
+          python3 -m venv gateway/.venv
+          gateway/.venv/bin/pip install -r gateway/tests/requirements.txt
 
       - name: 生成工程师测试密钥
         run: |
@@ -1631,10 +1793,10 @@ jobs:
              gateway/test-env/engineer-keys/authorized_keys
 
       - name: 单元测试
-        run: cd gateway && python3 -m pytest tests/test_registry.py -v
+        run: cd gateway && .venv/bin/python -m pytest tests/test_registry.py -v
 
       - name: 集成测试
-        run: cd gateway && python3 -m pytest tests -v -x --ignore=tests/test_registry.py
+        run: cd gateway && .venv/bin/python -m pytest tests -v -x --ignore=tests/test_registry.py
 
       - name: 脚本测试
         run: |
@@ -1649,7 +1811,7 @@ jobs:
 - [ ] **Step 2: 在本地跑一遍 CI 的全部步骤**
 
 ```bash
-cd gateway && python3 -m pytest tests -v
+cd gateway && .venv/bin/python -m pytest tests -v
 ```
 
 预期：全部通过。若 `test_zombie_port.py` 超时，把 CI 的 `timeout-minutes` 调到 30。
@@ -1729,8 +1891,9 @@ ssh -J eng@gateway.company.com -p 22001 \
 ## 本地测试
 
 ```bash
+python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 cd test-env && docker compose up -d --build
-cd .. && python3 -m pytest tests -v
+cd .. && .venv/bin/python -m pytest tests -v
 ```
 ```
 
@@ -1747,7 +1910,7 @@ Subsystem sftp /bin/false
 - [ ] **Step 4: 确认全绿并推分支验证 CI**
 
 ```bash
-cd gateway && python3 -m pytest tests -v
+cd gateway && .venv/bin/python -m pytest tests -v
 git push -u origin HEAD
 gh run watch
 ```
@@ -1757,7 +1920,7 @@ gh run watch
 - [ ] **Step 5: 提交**
 
 ```bash
-git add .github/workflows/gateway.yml gateway/README.md gateway/tests/requirements.txt docs/方案设计.md
+git add .github/workflows/gateway.yml gateway/README.md docs/方案设计.md
 git commit -m "ci(gateway): Gateway 测试工作流与运维手册"
 ```
 
