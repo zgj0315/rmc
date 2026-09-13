@@ -213,11 +213,29 @@ async fn gives_up_when_authenticator_returns_none() {
     assert!(matches!(err, Error::ProxyAuthFailed(_)));
 }
 
+/// R36：brief 原文只断言了"报的是 ProxyAuthFailed"，从不 join 假代理的
+/// handle、从不看它实际应了几轮——`MAX_ROUNDS` 改成 1 之后这条测试原样全绿
+/// （第一轮就被拒、协商器的 token 从没被接受，同样是 ProxyAuthFailed），
+/// 名字里写的 five 从来没被真正钉住。改成 1000 才会红，但红的原因是假代理
+/// 那 8 条脚本回复用光、socket 被关闭，读到的是 Tcp/Network 错误，不是
+/// "存在上限"本身的证据。
+///
+/// 这里改成断言假代理实际看到的轮数（`seen.len()`）恰好等于 5：假代理只
+/// 准备 5 条应答（不多不少），并在拿到 `http_connect` 的错误之后立刻
+/// `drop` 客户端这一侧的 socket——这样无论真实上限被改成几，都不会卡死：
+/// - 上限被收紧（比如改成 2）：客户端只发 2 轮就放弃，`drop(s)`
+///   之后假代理的第 3 次 `read` 收到 EOF 提前退出循环，`seen.len() == 2`，
+///   跟这里断言的 5 对不上，变红。
+/// - 上限被放宽（比如改成 1000）：假代理的 5 条脚本回复用完之后
+///   自然退出循环并返回，连接随之关闭；客户端发第 6 轮请求时读不到响应，
+///   拿到的是 `Error::Tcp`，不是 `Error::ProxyAuthFailed`，
+///   `assert!(matches!(err, Error::ProxyAuthFailed(_)))` 这一行先变红。
+/// - 上限恰好是 5：5 条应答自然发完，`seen.len() == 5`，两条断言都过。
 #[tokio::test]
 async fn stops_after_five_rounds() {
     let replies = vec![
         "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Negotiate\r\n\r\n";
-        8
+        5
     ];
     struct Endless;
     #[async_trait::async_trait]
@@ -226,10 +244,19 @@ async fn stops_after_five_rounds() {
             Some("AAAA".into())
         }
     }
-    let (port, _srv) = fake_proxy(replies).await;
+    let (port, srv) = fake_proxy(replies).await;
     let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let err = http_connect(&mut s, &target(), &Endless).await.unwrap_err();
     assert!(matches!(err, Error::ProxyAuthFailed(_)), "{err}");
+    drop(s);
+
+    let seen = srv.await.unwrap();
+    assert_eq!(
+        seen.len(),
+        5,
+        "假代理实际看到的轮数应恰好等于上限 5；如果这个数字对不上，\
+         要么上限被悄悄改动了，要么根本没有生效"
+    );
 }
 
 #[tokio::test]
