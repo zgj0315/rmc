@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import os
 import shlex
 import socket
+import ssl
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -337,3 +341,108 @@ def tunnel(harness):
             _stop_tunnel(proc)
         finally:
             log.close()
+
+
+async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+    except (OSError, ssl.SSLError):
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            writer.close()
+
+
+class _TlsRelay:
+    """把宿主上的明文 TCP 连接裹进 TLS 转给 haproxy 的 443。
+
+    只用标准库，宿主不需要装 socat。SNI 固定为 gateway.test，证书是自签的
+    所以不校验证书链，与原先 socat 的 verify=0,snihost=gateway.test 等价。
+    """
+
+    def __init__(self, host: str, port: int, sni: str) -> None:
+        self._target = (host, port)
+        self._sni = sni
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self._ctx.check_hostname = False
+        self._ctx.verify_mode = ssl.CERT_NONE
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._server = None
+
+    def start(self) -> int:
+        """起监听，返回实际分配到的本地明文端口。"""
+        self._thread.start()
+        self._server = asyncio.run_coroutine_threadsafe(
+            asyncio.start_server(self._handle, HOST, 0), self._loop
+        ).result(timeout=10)
+        return self._server.sockets[0].getsockname()[1]
+
+    async def _handle(self, reader, writer) -> None:
+        try:
+            up_r, up_w = await asyncio.open_connection(
+                *self._target, ssl=self._ctx, server_hostname=self._sni
+            )
+        except OSError:
+            writer.close()
+            return
+        await asyncio.gather(_pump(reader, up_w), _pump(up_r, writer))
+
+    def stop(self) -> None:
+        async def _close() -> None:
+            self._server.close()
+            await self._server.wait_closed()
+
+        asyncio.run_coroutine_threadsafe(_close(), self._loop).result(timeout=10)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=10)
+        self._loop.close()
+
+
+@pytest.fixture
+def tls_wrap(harness):
+    """yield 宿主上的一个明文端口，写进去的字节会裹进 TLS 送到 haproxy 的 443。"""
+    relay = _TlsRelay(HOST, HAPROXY, "gateway.test")
+    port = relay.start()
+    try:
+        yield port
+    finally:
+        relay.stop()
+
+
+# `openssl x509` 是秒回的命令，与取监听表的超时给同一个量级。
+_CERT_FETCH_TIMEOUT = 20.0
+
+
+@pytest.fixture(scope="session")
+def gateway_tls_cert_pem(harness) -> str:
+    """Gateway 自签证书的 PEM 文本（不含私钥），现取自正在跑的容器。
+
+    证书是自签的，正好拿它自己当信任锚去做一次真正校验的握手：
+    `/etc/haproxy/certs/gateway.pem` 是证书和私钥拼在一起的一份文件，
+    `openssl x509 -in` 只认 `-----BEGIN CERTIFICATE-----` 那一段，
+    私钥不会被读出来、更不会流出容器。
+
+    session 作用域：每次跑测试只问容器要一次。镜像重建会重新生成证书，
+    这里现取而不是把证书内容抄进代码里，测试就不会钉死在某个指纹上。
+    """
+    cmd = ("exec", "-T", "gateway", "openssl", "x509",
+           "-in", "/etc/haproxy/certs/gateway.pem")
+    try:
+        out = compose(*cmd, check=False, timeout=_CERT_FETCH_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"取 gateway 证书超时：docker compose {' '.join(cmd)} "
+            f"超过 {_CERT_FETCH_TIMEOUT} 秒没有返回"
+        ) from exc
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"取 gateway 证书失败，docker compose exec 退出码 {out.returncode}\n"
+            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
+        )
+    return out.stdout

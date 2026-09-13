@@ -16,5 +16,15 @@ RUN mkdir -p /run/sshd \
  && ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/tunnel_host_ed25519_key \
  && chmod +x /usr/local/bin/entrypoint.sh
 
+# 自签证书，仅测试环境用。生产环境用公共 CA 签发的证书，放在同一路径，不使用自签。
+RUN mkdir -p /etc/haproxy/certs \
+ && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -subj "/CN=gateway.test" \
+      -addext "subjectAltName=DNS:gateway.test" \
+      -keyout /tmp/k.pem -out /tmp/c.pem 2>/dev/null \
+ && cat /tmp/c.pem /tmp/k.pem > /etc/haproxy/certs/gateway.pem \
+ && rm /tmp/k.pem /tmp/c.pem \
+ && chmod 600 /etc/haproxy/certs/gateway.pem
+
 EXPOSE 22 443 2223
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

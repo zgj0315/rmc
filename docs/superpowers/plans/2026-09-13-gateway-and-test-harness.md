@@ -1242,6 +1242,39 @@ def tls_wrap(harness):
         yield port
     finally:
         relay.stop()
+
+
+# `openssl x509` 是秒回的命令，与取监听表的超时给同一个量级。
+_CERT_FETCH_TIMEOUT = 20.0
+
+
+@pytest.fixture(scope="session")
+def gateway_tls_cert_pem(harness) -> str:
+    """Gateway 自签证书的 PEM 文本（不含私钥），现取自正在跑的容器。
+
+    证书是自签的，正好拿它自己当信任锚去做一次真正校验的握手：
+    `/etc/haproxy/certs/gateway.pem` 是证书和私钥拼在一起的一份文件，
+    `openssl x509 -in` 只认 `-----BEGIN CERTIFICATE-----` 那一段，
+    私钥不会被读出来、更不会流出容器。
+
+    session 作用域：每次跑测试只问容器要一次。镜像重建会重新生成证书，
+    这里现取而不是把证书内容抄进代码里，测试就不会钉死在某个指纹上。
+    """
+    cmd = ("exec", "-T", "gateway", "openssl", "x509",
+           "-in", "/etc/haproxy/certs/gateway.pem")
+    try:
+        out = compose(*cmd, check=False, timeout=_CERT_FETCH_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"取 gateway 证书超时：docker compose {' '.join(cmd)} "
+            f"超过 {_CERT_FETCH_TIMEOUT} 秒没有返回"
+        ) from exc
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"取 gateway 证书失败，docker compose exec 退出码 {out.returncode}\n"
+            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
+        )
+    return out.stdout
 ```
 
 创建 `gateway/tests/test_tls_frontend.py`：
@@ -1259,13 +1292,24 @@ from conftest import (
 )
 
 
-def test_tls_handshake_succeeds_and_presents_gateway_test_cert(harness):
+def test_tls_handshake_succeeds_and_presents_gateway_test_cert(harness, gateway_tls_cert_pem):
+    """握手必须真正校验证书链与主机名，不能只是探测到 443 上有 TLS 在应答。
+
+    证书自签，正好拿它自己当信任锚：`load_verify_locations` 之后打开
+    `CERT_REQUIRED` 与 `check_hostname`，握手会真的核验对方出示的证书链是否
+    到这张证书为止、以及证书上的名字是否等于 `server_hostname="gateway.test"`。
+    验证打开之后 `getpeercert()` 才会被填充，`["subject"]` 才读得出来。
+
+    version 只认 TLSv1.2/TLSv1.3：haproxy.cfg 用 `ssl-min-ver TLSv1.2` 关掉了
+    更低版本，这条断言要卡在同一条线上，否则比配置本身还宽松。
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_verify_locations(cadata=gateway_tls_cert_pem)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
     with socket.create_connection((HOST, HAPROXY), timeout=10) as raw:
         with ctx.wrap_socket(raw, server_hostname="gateway.test") as tls:
-            assert tls.version().startswith("TLSv1.")
+            assert tls.version() in ("TLSv1.2", "TLSv1.3")
             cn = dict(x[0] for x in tls.getpeercert(binary_form=False)["subject"])
             assert cn["commonName"] == "gateway.test"
 
