@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 搭出一台 Gateway，让隧道账号用口令经 TLS:443 登录并注册 loopback 反向端口，工程师从 22 端口跳转即可到达一体机；同时给出一套 docker compose 测试环境，供 CI 与后续客户端开发复用。
+**Goal:** 搭出一台 Gateway，让隧道账号用口令经 TLS:443 登录并注册一个绑 `0.0.0.0` 的反向端口，工程师用一条 `ssh -p 22001 root@gateway.company.com` 直连一体机；同时给出一套 docker compose 测试环境，供 CI 与后续客户端开发复用。
 
-**Architecture:** 不写服务端程序。Gateway 由 haproxy 做 443 的 TLS 终止，转给只监听 loopback 的 `sshd-tunnel` 实例；另一个 `sshd-engineer` 实例守 22 端口，工程师无 shell 只能 ProxyJump。账号与端口的唯一事实来源是 `gateway/registry.toml`，由 `registry.py` 解析、三个 shell 脚本消费。测试环境用 docker compose 起 gateway 与 appliance 两个容器，本计划阶段用 `ssh` 与一段 python 写的 TLS 中继充当客户端，因此 Gateway 的正确性不依赖 Rust 代码。
+**Architecture:** 不写服务端程序。Gateway 由 haproxy 做 443 的 TLS 终止，转给只监听 loopback 的 `sshd-tunnel` 实例；`sshd-tunnel` 以 `GatewayPorts yes` 把反向端口绑到 `0.0.0.0`，工程师直连该端口，不在 Gateway 上登录、也不需要 Gateway 账号。账号与端口的唯一事实来源是 `gateway/registry.toml`，由 `registry.py` 解析、三个 shell 脚本消费。测试环境用 docker compose 起 gateway 与 appliance 两个容器，本计划阶段用 `ssh` 与一段 python 写的 TLS 中继充当客户端，因此 Gateway 的正确性不依赖 Rust 代码。
 
 **Tech Stack:** Debian 12、OpenSSH 9.2p1、haproxy 2.6、python3 3.11（tomllib 为标准库，宿主低于 3.11 时回退到 tomli）、pytest、bats-core、docker compose v2、socat（仅 gateway 容器内使用）
 
@@ -12,14 +12,13 @@
 
 ## Global Constraints
 
-- 反向端口只允许绑定 loopback，由服务端 `GatewayPorts no` 强制，不信任客户端传入的地址。
+- 反向端口绑 `0.0.0.0`，公网可达：绑定地址由服务端的 `GatewayPorts yes` 决定，客户端传什么地址都不影响结果。端口仍逐账号只放行一个，由 `Match User` 块中**裸端口形式**的 `PermitListen`（`PermitListen 22001`，不带地址）限定；带地址的形式不能用，通配绑定会在 `GatewayPorts` 被读到之前先一层被拒。把端口收回内网网卡或限定来源网段，是方案 7.3 明确推后的事项，本计划不做。
 - 隧道账号用户名必须匹配 `tunnel-*`，shell 为 `/usr/sbin/nologin`，`ForceCommand /bin/false`。
 - 隧道账号只允许 remote forwarding，端口由 `Match User` 块的 `PermitListen` 逐账号限定。
 - `ClientAliveInterval 10` 与 `ClientAliveCountMax 3`，异常断线后 30 秒内回收反向端口。
 - `LoginGraceTime 20`、`MaxAuthTries 3`。
-- 工程师账号在 `sshd-engineer` 上只允许 local forwarding 到 `127.0.0.1:*`，`PermitTTY no`，`ForceCommand /bin/false`。
 - V1 不做 pam_faillock 与 haproxy 按来源 IP 限速，见方案 7.3。
-- 两个 sshd 实例的配置文件、host key、pid 文件必须完全独立。
+- `sshd-tunnel` 的配置文件、host key、pid 文件必须与系统自带的 sshd 完全独立。
 - 所有脚本以 `set -euo pipefail` 开头，非 root 运行时立即退出。
 
 ---
@@ -1026,7 +1025,7 @@ git commit -m "test(gateway): docker 测试环境与 sshd-tunnel 口令认证连
 import subprocess
 
 from conftest import (
-    APPLIANCE_SSHD, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
+    APPLIANCE_SSHD, HOST, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
     run_sftp_password, run_ssh_password,
 )
 
@@ -1048,16 +1047,21 @@ def test_no_pty(harness):
 def test_local_forwarding_is_refused(harness):
     """AllowTcpForwarding remote 必须禁掉 -L。"""
     # -L 的目标由服务端解析，gateway 容器在 compose 网络里，写服务名是对的。
+    # 61001 是一体机的 SSH 默认端口（appliance 容器听的就是它），不是 22。
     out = run_ssh_password(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
                            "-o", "ExitOnForwardFailure=yes",
-                           "-L", "127.0.0.1:19099:appliance:22",
+                           "-L", "127.0.0.1:19099:appliance:61001",
                            f"{TUNNEL_USER}@{HOST}")
     assert out.returncode != 0
     assert "administratively prohibited" in out.stderr
 
 
 def test_reverse_port_outside_permitlisten_is_refused(harness):
-    """PermitListen 只放行 22001，别的端口必须被拒。"""
+    """裸端口形式的 `PermitListen 22001` 只放行 22001 这一个端口，别的必须被拒。
+
+    地址部分已不再受限（`GatewayPorts yes` 强制通配绑定），所以本用例只管端口，
+    不对绑定地址作任何断言。
+    """
     # -R 的目标地址由跑在宿主上的 ssh 客户端解析，宿主不在 compose 网络里，
     # 所以只能写一体机已发布到宿主的端口，不能写 compose 服务名。
     out = run_ssh_password(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
@@ -1068,14 +1072,20 @@ def test_reverse_port_outside_permitlisten_is_refused(harness):
     assert "remote port forwarding failed" in out.stderr.lower()
 
 
-def test_reverse_port_on_wildcard_address_is_refused(harness):
-    """客户端传 0.0.0.0 时，PermitListen 与 GatewayPorts no 都应拦住。"""
+def test_reverse_port_outside_permitlisten_is_refused_on_a_wildcard_address_too(harness):
+    """换个绑定地址也绕不过端口限制。
+
+    这个用例原先断言的是「客户端传 0.0.0.0 就被拦住」，那条性质已经作废：
+    反向端口现在就是要绑通配地址。它守的改成端口那一半——`PermitListen` 钉住的
+    是端口，不是地址，所以换成通配地址请求一个未放行的端口，照样必须被拒。
+    """
     # 同上：-R 的目标地址由宿主的 ssh 客户端解析，不能写 compose 服务名。
     out = run_ssh_password(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
                            "-o", "ExitOnForwardFailure=yes",
-                           "-R", f"0.0.0.0:{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}",
+                           "-R", f"0.0.0.0:22002:{HOST}:{APPLIANCE_SSHD}",
                            f"{TUNNEL_USER}@{HOST}")
     assert out.returncode != 0
+    assert "remote port forwarding failed" in out.stderr.lower()
 
 
 def test_sftp_subsystem_is_unavailable(harness):
@@ -1366,72 +1376,153 @@ git commit -m "feat(gateway): haproxy 在 443 终止 TLS 并转给 sshd-tunnel"
 
 ---
 
-### Task 5: 工程师入口
+### Task 5: 反向端口绑 0.0.0.0，工程师直连
 
-工程师在 Gateway 上必须没有 shell，只能跳到 loopback 上的隧道端口。
+反向端口改为绑 `0.0.0.0`，工程师用一条 `ssh -p 22001 root@gateway.company.com` 直连一体机，不再经 Gateway 跳转。`sshd-engineer`、`eng` 账号、`engineers` 组、工程师密钥与 `-J` 这一整条路径全部删掉。
+
+代价写在方案 4.3 与 7.1 里：Gateway 不再记录谁在什么时间访问了哪台一体机，也不再有逐工程师的凭据可吊销，一体机的 SSH 端口直接暴露在互联网上。本任务只负责把这个决定落地，不负责补偿它，补偿排在方案 7.3。
+
+本任务另外捎带一处与直连无关的事实修正：**一体机的 SSH 默认端口是 61001，不是 22**，测试环境的 appliance 容器要跟着改成听 61001。这不是顺手改的小事——测试里的一体机若还答在 22 上，任何把 22 写死的代码都能全绿通过、到客户现场才炸；让 harness 听 61001，这类 bug 就暴露在最便宜的地方。别把它简化回 22。宿主侧发布的端口 2322 与 `APPLIANCE_SSHD` 常量都不动，只有容器内那一侧挪位置，所以反向转发的目标仍然是 `127.0.0.1:2322`。
 
 **Files:**
-- Modify: `gateway/sshd_engineer.conf`
-- Test: `gateway/tests/test_engineer_entry.py`
+- Modify: `gateway/sshd_tunnel_config`
+- Delete: `gateway/sshd_engineer.conf`
+- Modify: `gateway/test-env/appliance/Dockerfile`
+- Modify: `gateway/test-env/gateway/Dockerfile`
+- Modify: `gateway/test-env/gateway/entrypoint.sh`
+- Modify: `gateway/test-env/docker-compose.yml`
+- Delete: `gateway/test-env/.gitignore`
+- Modify: `gateway/tests/conftest.py`
+- Modify: `gateway/tests/test_tls_frontend.py`（Task 4 的反向端口查询改走新 helper）
+- Test: `gateway/tests/test_tunnel.py`
 
 **Interfaces:**
-- Consumes: Task 2 的 `conftest.py`：`harness`、`tunnel` 固件，常量 `ENG_KEY` / `ENG_COMMON` 与 `engineer_proxy_option()`，以及 `test-env/engineer-keys/eng_ed25519`
-- Produces: 宿主 `127.0.0.1:2022` 为工程师入口，账号 `eng`，公钥认证
+- Consumes: Task 2 的 `conftest.py`：`harness`、`tunnel` 固件与口令 ssh 辅助函数
+- Produces:
+  - `sshd-tunnel` 以 `GatewayPorts yes` 把反向端口绑到 `0.0.0.0`，受管 `Match User` 块用裸端口形式的 `PermitListen <port>`
+  - compose 服务 `gateway` 新增宿主端口 `127.0.0.1:22001` → 容器内 `22001`，宿主可以直连反向端口；删掉 `127.0.0.1:2022` → 容器 `22` 与 `./engineer-keys` 挂载
+  - compose 服务 `appliance` 的映射变成 `127.0.0.1:2322` → 容器内 `61001`；宿主端口 `2322`、常量 `APPLIANCE_SSHD` 与 `APPLIANCE_PW` 都不变
+  - `conftest.py` 删掉 `ENGINEER_SSHD`、`ENG_KEY`、`ENG_COMMON`、`engineer_proxy_option()`、`ensure_engineer_keypair()`
+  - `conftest.py` 新增常量 `REVERSE_BIND_ADDRS` 与 helper `reverse_port_registered(port, *, table=None)`：查反向端口一律走它。`port_listening_in_gateway()` 保持原样不动，仍是默认查 loopback 的通用原语
+
+**说明：** `GatewayPorts yes` 之后，`ss -ltn` 里不会再有 `127.0.0.1:22001` 那一行，所以「反向端口在不在」不能再用默认查 loopback 的 `port_listening_in_gateway()` 去问。**解决办法是加一个名字说清用途的 helper `reverse_port_registered()`，不是去改 `port_listening_in_gateway()` 的默认值。** 三条理由，照这个顺序理解：
+
+1. `test_listen_table.py` 是已实现、已评审的密闭单测，十八个用例里有六个直接压着 `port_listening_in_gateway()` 现在的默认语义。改默认值会连带改那个文件；加 helper 则让它整份落在爆炸半径之外，一个字都不用动。
+2. 反向端口绑在哪个地址上，这件事只应该有一个地方知道。改默认值等于把这条知识藏进一个通用原语的签名里；加 helper 则把它收在一个有名字的函数里，Task 4 与 Task 6 的调用点不需要各自抄一遍 `"0.0.0.0"`。
+3. 方案 7.3 推后的加固最终会把这些端口从公网挪到内网网卡上。那一天要改的应该是这一个函数，而不是每一个调用点。
+
+因此 Task 4 的 `test_reverse_tunnel_works_over_tls` 与 Task 6 的两个回收用例都走 `reverse_port_registered()`，不走 `port_listening_in_gateway()`。Task 4 的代码在本任务里就地改掉（那个文件此刻已经存在）；Task 6 排在本任务之后，实现时凡是它的正文里写着 `port_listening_in_gateway(TUNNEL_PORT)` 的地方，一律落笔为 `reverse_port_registered(TUNNEL_PORT)`。
 
 - [ ] **Step 1: 写下失败的测试**
 
-创建 `gateway/tests/test_engineer_entry.py`：
+先在 `gateway/tests/conftest.py` 里紧跟 `port_listening_in_gateway()` 之后加上反向端口专用的查询 helper。`port_listening_in_gateway()` 本身与 `test_listen_table.py` 的十八个密闭单测一个字都不动：
 
 ```python
-import subprocess
+# 反向端口的绑定地址。GatewayPorts yes 强制通配绑定，`ss` 把 IPv4 通配打成
+# 0.0.0.0；`*` 与 `[::]` 是同一件事的另外两种拼法，一并认。
+# 反向端口绑在哪个地址上，整个测试套件里只有这一处知道。方案 7.3 推后的加固要
+# 把这些端口从公网挪到内网网卡时，改的是这个常量与下面那个函数，不是每个调用点。
+REVERSE_BIND_ADDRS = ("0.0.0.0", "*", "[::]")
 
+
+def reverse_port_registered(port: int, *, table: str | None = None) -> bool:
+    """Gateway 上是否已经注册了反向端口 `port`。
+
+    查反向端口一律走这里，别直接调 port_listening_in_gateway()：后者是通用原语，
+    默认地址是 loopback，而反向端口在 GatewayPorts yes 之下绑的是通配地址，用它
+    的默认值去问恒为假。Task 4 的 TLS 用例与 Task 6 的回收用例也都走这个函数，
+    不必各自把 "0.0.0.0" 抄一遍。
+
+    `table` 原样透给 port_listening_in_gateway()，给不起容器的单测注入固定的
+    `ss` 文本用；为 None 时只取一次监听表，三种拼法在同一张表上比对。
+    """
+    if table is None:
+        table = gateway_listen_table()
+    return any(port_listening_in_gateway(port, address=addr, table=table)
+               for addr in REVERSE_BIND_ADDRS)
+```
+
+再替换 `gateway/tests/test_tunnel.py`。前两个口令认证用例原样保留，后两个改成「反向端口绑在通配地址上」与「工程师直连」，第三个改走新 helper 并改掉名字里已经不成立的 `loopback`：
+
+```python
 from conftest import (
-    APPLIANCE_PW, ENG_COMMON, ENGINEER_SSHD, HOST, TUNNEL_PORT,
-    engineer_proxy_option, run_ssh_password,
+    APPLIANCE_PW, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
+    gateway_listen_table, parse_listen_table, reverse_port_registered,
+    run_ssh_password,
 )
 
 
-def test_engineer_cannot_get_a_shell(harness):
-    out = subprocess.run(
-        ["ssh", *ENG_COMMON, "-p", str(ENGINEER_SSHD), f"eng@{HOST}", "id"],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25,
-    )
+def test_tunnel_account_authenticates_with_password(harness):
+    """认证成功必须有正面证据，不能只断言 stderr 里没有某几个字符串。
+
+    「没有 Permission denied」是假绿的温床：连接被拒、被 reset、超时，或者
+    OpenSSH 改了措辞，stderr 里都不会有那两个字符串，用例照样绿。这里的风险是
+    真实存在的——wait_port(TUNNEL_SSHD) 连的是 socat 旁路，而 socat 在 2223 上
+    照单全收，不管 sshd 到底有没有起来听 2222。
+
+    正面证据用会话本身的输出：账号的 shell 是 nologin、配置里又有
+    ForceCommand /bin/false，认证一旦通过、会话一旦建立，nologin 就会打印
+    This account is currently not available. 并以 1 退出。这句话只有在认证
+    真的过了之后才可能出现，连不上的连接不会有任何 stdout。
+    """
+    out = run_ssh_password(
+        TUNNEL_PW, "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}", "true")
+    assert "This account is currently not available" in out.stdout, (
+        f"rc={out.returncode} stdout={out.stdout!r} stderr={out.stderr!r}")
+    assert out.returncode == 1, out.stderr
+
+
+def test_wrong_password_is_rejected(harness):
+    out = run_ssh_password(
+        "wrong-pw", "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}", "true")
     assert out.returncode != 0
-    assert "uid=" not in out.stdout
+    assert "Permission denied" in out.stderr
 
 
-def test_engineer_cannot_forward_to_non_loopback(harness):
-    # -L 的目标由服务端解析，gateway 容器在 compose 网络里，写服务名是对的；
-    # PermitOpen 127.0.0.1:* 必须把这种非 loopback 目标拦住。
-    out = subprocess.run(
-        ["ssh", *ENG_COMMON, "-N", "-T", "-p", str(ENGINEER_SSHD),
-         "-o", "ExitOnForwardFailure=yes",
-         "-L", "127.0.0.1:19098:appliance:22", f"eng@{HOST}"],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25,
-    )
-    assert out.returncode != 0
-    assert "administratively prohibited" in out.stderr
+def test_reverse_port_is_registered_on_gateway(tunnel):
+    """原名叫 ..._appears_on_gateway_loopback，loopback 已经不成立了。
+
+    用 reverse_port_registered() 而不是 port_listening_in_gateway()：反向端口绑
+    在哪个地址上只有那个 helper 知道，这里只关心它注册上了没有。
+    """
+    assert reverse_port_registered(TUNNEL_PORT), gateway_listen_table()
 
 
-def test_engineer_password_auth_is_disabled(harness):
-    out = subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=no",
-         "-o", "UserKnownHostsFile=/dev/null",
-         "-o", "PreferredAuthentications=password",
-         "-o", "ConnectTimeout=10",
-         "-p", str(ENGINEER_SSHD), f"eng@{HOST}"],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25,
-    )
-    assert out.returncode != 0
+def test_reverse_port_is_bound_on_a_wildcard_address(tunnel):
+    """GatewayPorts yes 必须把反向端口绑到通配地址上，不能留在 loopback。
+
+    这是原先 test_reverse_port_is_not_bound_on_a_wildcard_address 的反面。反向
+    端口现在要让公司工程师从互联网直连，绑在 loopback 上就等于谁也连不进来。
+
+    仍然只能进容器查监听表，不能改成「从宿主连 TUNNEL_PORT，连上就算通过」：
+    compose 已经把 22001 发布到宿主，docker-proxy 在宿主上一直监听，宿主那一侧
+    连得上完全说明不了端口在容器里绑的是哪个地址。
+
+    也别匹配地址字面量的子串（`"0.0.0.0:22001" in table`）：那种写法对 22001
+    恰好成立但不可移植，查 222 会命中 `0.0.0.0:2223`。这里走
+    parse_listen_table() 的整值比较。
+
+    `ss` 打通配地址有 `0.0.0.0`、`*`、`[::]` 三种拼法，落哪一种取决于容器的
+    IPv6 情况，所以只要求三者中至少出现一个；同时明确要求 loopback 那一行不再
+    出现，否则「绑到了通配地址」这句话没被真正钉住。
+    """
+    table = gateway_listen_table()
+    entries = parse_listen_table(table)
+    bound = [w for w in ("0.0.0.0", "*", "[::]") if (w, TUNNEL_PORT) in entries]
+    assert bound, table
+    assert (HOST, TUNNEL_PORT) not in entries, table
 
 
-def test_engineer_jumps_to_appliance_and_runs_command(tunnel):
+def test_engineer_connects_to_appliance_directly(tunnel):
+    """工程师一条命令直连：没有 -J，没有跳板，也没有 Gateway 账号。
+
+    生产上这条命令是 `ssh -p 22001 root@gateway.company.com`。测试里 Gateway
+    容器的 22001 由 compose 发布到宿主的同一个端口，所以只把主机名换成
+    127.0.0.1，端口与认证方式都与现场一致：口令就是一体机的动态 root 口令。
+    """
     out = run_ssh_password(
         APPLIANCE_PW,
-        *engineer_proxy_option(),
-        "-o", "HostKeyAlias=c0001-a1",
-        "-p", str(TUNNEL_PORT), "root@127.0.0.1",
-        "cat /etc/appliance-id",
+        "-p", str(TUNNEL_PORT), f"root@{HOST}", "cat /etc/appliance-id",
         timeout=40,
     )
     assert out.returncode == 0, out.stderr
@@ -1441,49 +1532,287 @@ def test_engineer_jumps_to_appliance_and_runs_command(tunnel):
 - [ ] **Step 2: 运行测试确认失败**
 
 ```bash
-cd gateway && .venv/bin/python -m pytest tests/test_engineer_entry.py -v
+cd gateway && .venv/bin/python -m pytest tests/test_tunnel.py -v
 ```
 
-预期：`test_engineer_cannot_get_a_shell` 失败，占位配置没有限制 shell。
+预期：2 passed、3 failed。两个口令认证用例仍绿。此刻 `GatewayPorts no` 还在、端口还绑 loopback，所以 `test_reverse_port_is_registered_on_gateway` 与 `test_reverse_port_is_bound_on_a_wildcard_address` 都报通配地址上找不到 22001；`test_engineer_connects_to_appliance_directly` 报连不上宿主的 22001——compose 还没发布这个端口。
 
-- [ ] **Step 3: 写最小实现**
+注意 `tunnel` 固件此刻仍然是绿的：它查的还是 `port_listening_in_gateway()` 的 loopback 默认值，而端口确实还在 loopback 上。固件要到 Step 6 才改走新 helper，所以这三条红是干净的断言失败，不是固件超时。
 
-替换 `gateway/sshd_engineer.conf`：
+- [ ] **Step 3: 服务端打开通配绑定**
+
+改 `gateway/sshd_tunnel_config`。文件头的说明：
 
 ```
-# /etc/ssh/sshd_config.d/engineer.conf
-# 工程师入口。无 shell，只能把本地端口跳到 loopback 上的隧道端口。
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PermitRootLogin no
-
-Match Group engineers
-    AllowTcpForwarding local
-    PermitOpen 127.0.0.1:*
-    PermitListen none
-    PermitTTY no
-    X11Forwarding no
-    AllowAgentForwarding no
-    AllowStreamLocalForwarding no
-    ForceCommand /bin/false
+# /etc/ssh/sshd_tunnel_config
+# 隧道专用 sshd 实例。只服务 tunnel-* 账号，只允许建立一个指定端口的反向端口。
+# 反向端口绑 0.0.0.0，公网可达；收回内网网卡或限定来源网段见方案 7.3。
+# systemd: sshd-tunnel.service
 ```
 
-`PermitOpen 127.0.0.1:*` 让工程师能跳到任意隧道端口，但到不了客户网络里的任何地址；`PermitListen none` 阻止工程师反向开端口。
+转发开关那一行：
 
-- [ ] **Step 4: 运行测试确认通过**
+```
+GatewayPorts yes
+```
+
+受管 Match 块，连同解释为什么必须是裸端口形式的注释：
+
+```
+# 以下 Match 块由 scripts/enroll-account.sh 依 registry.toml 生成，勿手工编辑。
+# PermitListen 必须写成不带地址的裸端口形式。GatewayPorts yes 要把端口绑到通配
+# 地址上，而带地址的形式（<地址>:<端口>）会在 GatewayPorts 被读到之前先一层把
+# 通配绑定拒掉，实测服务端直接记录该转发请求被拒。地址不受限制，端口仍然逐账号
+# 只放行一个。
+# BEGIN RMC MANAGED
+Match User tunnel-zhang
+    PermitListen 22001
+# END RMC MANAGED
+```
+
+重新 build：
 
 ```bash
 cd gateway/test-env && docker compose up -d --build gateway
-cd .. && .venv/bin/python -m pytest tests/test_engineer_entry.py tests/test_tunnel.py -v
 ```
 
-预期：全部通过，含 Task 2 里先前失败的 `test_engineer_reaches_appliance_through_reverse_port`。
+这一步之后 `tunnel` 固件会开始报「反向端口 22001 未在 Gateway 上出现」：它查的还是 `port_listening_in_gateway(TUNNEL_PORT)`，默认地址是 loopback，而端口已经绑到 `0.0.0.0` 了。Step 6 把它改走 `reverse_port_registered()` 才会恢复，不要停在这里调它。
 
-- [ ] **Step 5: 提交**
+若固件报的不是「未出现」，而是 ssh 输出里带 `remote port forwarding failed`，说明这套 OpenSSH 的裸端口 `PermitListen` 不接受客户端传入的带地址请求；把 `tunnel` 固件、Task 4 与 Task 6 里 `-R` 的地址部分一并去掉，写成 `-R f"{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}"` 即可——绑定地址本来就由服务端决定，客户端传什么都不影响结果。
+
+- [ ] **Step 4: 拆掉工程师入口**
+
+删掉工程师入口的配置与测试密钥。`gateway/test-env/.gitignore` 里只有 `engineer-keys/` 一行，一起删：
 
 ```bash
-git add gateway/sshd_engineer.conf gateway/tests/test_engineer_entry.py
-git commit -m "feat(gateway): 工程师入口仅允许跳转到 loopback 隧道端口"
+cd "$(git rev-parse --show-toplevel)"
+git rm -q gateway/sshd_engineer.conf gateway/test-env/.gitignore
+rm -rf gateway/test-env/engineer-keys
+```
+
+替换 `gateway/test-env/gateway/entrypoint.sh`，只剩隧道账号与 sshd-tunnel：
+
+```bash
+#!/bin/bash
+# 测试环境入口：建隧道账号、起 sshd-tunnel 与 haproxy，并把 loopback 上的
+# sshd-tunnel 通过 socat 暴露到容器网卡的 2223，使宿主的测试能直连它。
+set -euo pipefail
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "必须以 root 运行：建账号与起 sshd 都需要 root。" >&2
+    exit 1
+fi
+
+useradd --system --shell /usr/sbin/nologin --no-create-home tunnel-zhang
+echo 'tunnel-zhang:tunnel-init-pw' | chpasswd
+
+# -D -e：不 daemonize，日志写 stderr。镜像里没有 syslog 守护进程，少了 -e
+# 日志会被直接丢弃，docker logs 里一个字都看不到，认证与转发失败就只能靠猜。
+/usr/sbin/sshd -t -f /etc/ssh/sshd_tunnel_config
+/usr/sbin/sshd -D -e -f /etc/ssh/sshd_tunnel_config &
+
+# 测试用旁路：把容器网卡 2223 转到 loopback 2222。监听端口必须与 sshd-tunnel
+# 的 127.0.0.1:2222 不同，否则 socat 绑 0.0.0.0:2222 会撞上 EADDRINUSE。
+# 生产环境没有这一条。
+socat TCP-LISTEN:2223,reuseaddr,fork TCP:127.0.0.1:2222 &
+
+exec haproxy -W -db -f /etc/haproxy/haproxy.cfg
+```
+
+`gateway/test-env/gateway/Dockerfile`：`sshd_engineer.conf` 已经不存在，那一行 COPY 必须一起删掉，否则 build 直接失败。三条 COPY 变成：
+
+```dockerfile
+COPY sshd_tunnel_config /etc/ssh/sshd_tunnel_config
+COPY haproxy.cfg /etc/haproxy/haproxy.cfg
+COPY test-env/gateway/entrypoint.sh /usr/local/bin/entrypoint.sh
+```
+
+EXPOSE 把 22 换成反向端口：
+
+```dockerfile
+EXPOSE 443 2223 22001
+```
+
+替换 `gateway/test-env/docker-compose.yml`，删掉工程师入口的端口映射与密钥挂载，发布反向端口：
+
+```yaml
+name: rmc-gateway-test
+
+services:
+  appliance:
+    build: ./appliance
+    ports:
+      # 一体机的 SSH 默认端口是 61001。宿主侧仍是 2322，只有容器内那一侧挪了，
+      # 所以 APPLIANCE_SSHD 与反向转发的目标 127.0.0.1:2322 都不用动。
+      - "127.0.0.1:2322:61001"
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: test-env/gateway/Dockerfile
+    depends_on:
+      - appliance
+    ports:
+      - "127.0.0.1:2422:2223"
+      - "127.0.0.1:8443:443"
+      # 工程师直连的反向端口。生产上工程师连 gateway.company.com:22001，
+      # 测试里把它发布到宿主的同一个端口，命令形状保持一致。
+      # 只有隧道在线时容器里才有人听 22001，宿主侧的 docker-proxy 一直在，
+      # 所以「宿主能连上 22001」证明不了绑定地址，断言绑定地址仍要查监听表。
+      - "127.0.0.1:22001:22001"
+```
+
+- [ ] **Step 5: 测试环境的一体机改听 61001**
+
+一体机的 SSH 默认端口是 61001。替换 `gateway/test-env/appliance/Dockerfile`：
+
+```dockerfile
+FROM debian:12-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-server \
+ && rm -rf /var/lib/apt/lists/*
+# 一体机的 SSH 默认端口是 61001，不是 22。harness 必须照这个端口起，否则任何
+# 把 22 写死的代码都能全绿通过、到客户现场才炸。别把这里简化回 22。
+RUN mkdir -p /run/sshd \
+ && echo "root:appliance-dynamic-pw" | chpasswd \
+ && echo "c0001-a1" > /etc/appliance-id \
+ && printf '%s\n' \
+      'Port 61001' \
+      'PermitRootLogin yes' \
+      'PasswordAuthentication yes' \
+      'UsePAM yes' \
+    > /etc/ssh/sshd_config.d/appliance.conf \
+ && ssh-keygen -A
+EXPOSE 61001
+CMD ["/usr/sbin/sshd", "-D", "-e"]
+```
+
+Debian 的 `/etc/ssh/sshd_config` 里 `Port` 是注释掉的，所以 `sshd_config.d` 下的 `Port 61001` 直接生效，容器内不再有人听 22。
+
+重新 build 并确认端口真的挪了：
+
+```bash
+cd gateway/test-env && docker compose up -d --build appliance
+docker compose exec -T appliance ss -ltn
+```
+
+预期：表里有 `*:61001`（或 `0.0.0.0:61001` 与 `[::]:61001`），没有 22。宿主侧 `127.0.0.1:2322` 与 `APPLIANCE_SSHD` 不变，所以 `harness` 的 `wait_port(APPLIANCE_SSHD)` 与所有 `-R ...:{HOST}:{APPLIANCE_SSHD}` 都不用改。
+
+- [ ] **Step 6: 拆掉 conftest 里的工程师部件，把反向端口查询集中到新 helper**
+
+改 `gateway/tests/conftest.py`。常量段删掉 `ENGINEER_SSHD` 与 `ENG_KEY`：
+
+```python
+HOST = "127.0.0.1"
+TUNNEL_SSHD = 2422
+HAPROXY = 8443
+APPLIANCE_SSHD = 2322
+```
+
+删掉整个 `ENG_COMMON` 常量与 `engineer_proxy_option()` 函数（`shlex` 仍被 `askpass_env()` 用着，import 留下）。
+
+`port_listening_in_gateway()` 与 `parse_listen_table()` 的**函数体、签名、默认值一律不动**。只改两处已经作废的行文：前者 docstring 里「要断言某端口绑在通配地址上（Task 4 的 443、Task 5 的 22）」去掉 Task 5 的提法，后者 docstring 里「Task 4 要查 443、Task 5 要动 22，正是这类短端口号。」改成「Task 4 要查 443，正是这类短端口号。」。查反向端口的出口是 Step 1 加的 `reverse_port_registered()`，不是把这个原语的默认值改掉。
+
+删掉 `ensure_engineer_keypair()`，`harness` 固件不再生成密钥、也不再等工程师入口的端口：
+
+```python
+@pytest.fixture(scope="session")
+def harness():
+    compose("down", "-v", check=False)
+    # 不用 check=True：它与 capture_output=True 一起会把构建失败变成一个不带
+    # 输出的 CalledProcessError，docker 真正的报错完全看不到。Task 3 到 7 都
+    # 依赖这个固件，这里必须把 docker 的 stdout/stderr 原样抛出来。
+    up = compose("up", "-d", "--build", check=False)
+    if up.returncode != 0:
+        raise RuntimeError(
+            f"docker compose up 失败，退出码 {up.returncode}\n"
+            f"--- stdout ---\n{up.stdout}\n--- stderr ---\n{up.stderr}"
+        )
+    try:
+        wait_port(TUNNEL_SSHD)
+        wait_port(APPLIANCE_SSHD)
+        yield
+    finally:
+        if os.environ.get("RMC_KEEP_ENV") != "1":
+            compose("down", "-v", check=False)
+```
+
+把固件里查反向端口的两处改走新 helper。这两处就是 Step 3 之后固件变红的原因，改完即恢复。`_stop_tunnel()` 的收尾循环：
+
+```python
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if not reverse_port_registered(TUNNEL_PORT):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"隧道进程已退出，但反向端口 {TUNNEL_PORT} 仍留在 Gateway 上；"
+        f"后续用例会被它干扰"
+    )
+```
+
+`tunnel` 固件的等待循环（`-R` 的地址部分不动，绑定地址由服务端决定）：
+
+```python
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                pytest.fail(
+                    f"隧道进程提前退出（退出码 {proc.returncode}）：{output()}")
+            if reverse_port_registered(TUNNEL_PORT):
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail(
+                f"反向端口 {TUNNEL_PORT} 未在 Gateway 上出现；ssh 输出：{output()}")
+        yield proc
+```
+
+Task 4 的 `gateway/tests/test_tls_frontend.py` 也查反向端口，import 与调用一起改：
+
+```python
+from conftest import (
+    APPLIANCE_SSHD, HAPROXY, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_USER,
+    popen_ssh_password, reverse_port_registered,
+)
+```
+
+```python
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if reverse_port_registered(TUNNEL_PORT):
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail(f"经 TLS 建立的反向端口未出现：{proc.stderr.read()}")
+```
+
+`test_tls_frontend.py` 的另外两个用例（TLS 握手、SSH banner）不碰监听表，不动。
+
+Task 6 排在本任务之后，实现时它正文里出现 `port_listening_in_gateway(TUNNEL_PORT)` 的地方——`start_tunnel()` 的等待循环与两个回收用例的轮询——一律落笔为 `reverse_port_registered(TUNNEL_PORT)`。`RECLAIM_BUDGET`、SIGSTOP 那套逻辑与断言都不变。
+
+`gateway/tests/test_listen_table.py` **一个字都不动**：它是 `port_listening_in_gateway()` 与 `parse_listen_table()` 的密闭单测，而这两个函数在本任务里签名与语义都没变。Step 7 照样跑它，跑绿就是「已评审的单测没被这次改动波及」的证据。
+
+- [ ] **Step 7: 运行测试确认通过**
+
+```bash
+cd gateway/test-env && docker compose up -d --build
+cd .. && .venv/bin/python -m pytest tests/test_listen_table.py tests/test_tunnel.py \
+    tests/test_tunnel_restrictions.py tests/test_tls_frontend.py -v
+```
+
+预期：全部通过。`test_tunnel.py` 5 passed，其中 `test_engineer_connects_to_appliance_directly` 是第一次真正验证直连——它不再经任何跳板，`-J` 与 `ProxyCommand` 都已经不存在了。另外三个文件一起跑各有分工：`test_tls_frontend.py` 确认 Task 4 的反向端口查询已经改走新 helper，`test_tunnel_restrictions.py` 确认 Task 3 的端口边界断言没被带塌，`test_listen_table.py` 全绿则说明 `port_listening_in_gateway()` 的语义原封未动、那份已评审的密闭单测始终在爆炸半径之外。
+
+- [ ] **Step 8: 提交**
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+git add -A gateway/sshd_tunnel_config gateway/sshd_engineer.conf gateway/test-env \
+        gateway/tests/conftest.py gateway/tests/test_tls_frontend.py \
+        gateway/tests/test_tunnel.py
+git commit -m "feat(gateway): 反向端口绑 0.0.0.0，工程师直连，移除工程师入口"
 ```
 
 ---
@@ -1497,7 +1826,7 @@ git commit -m "feat(gateway): 工程师入口仅允许跳转到 loopback 隧道�
 - Test: `gateway/tests/test_zombie_port.py`
 
 **Interfaces:**
-- Consumes: Task 2 的 `conftest.py`：`harness` 固件、`port_listening_in_gateway()` 与 `popen_ssh_password()`
+- Consumes: Task 2 的 `conftest.py`：`harness` 固件、`popen_ssh_password()`，以及 Task 5 加入的 `reverse_port_registered()`（反向端口已绑 `0.0.0.0`，不能用 loopback 默认值的 `port_listening_in_gateway()` 查）
 - Produces: 无新接口
 
 - [ ] **Step 1: 写下失败的测试**
@@ -1513,7 +1842,7 @@ import pytest
 
 from conftest import (
     APPLIANCE_SSHD, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
-    popen_ssh_password, port_listening_in_gateway,
+    popen_ssh_password, reverse_port_registered,
 )
 
 RECLAIM_BUDGET = 45  # ClientAliveInterval 10 × CountMax 3 再留余量
@@ -1531,7 +1860,7 @@ def start_tunnel() -> subprocess.Popen:
     )
     deadline = time.time() + 20
     while time.time() < deadline:
-        if port_listening_in_gateway(TUNNEL_PORT):
+        if reverse_port_registered(TUNNEL_PORT):
             return proc
         time.sleep(0.5)
     proc.kill()
@@ -1545,7 +1874,7 @@ def test_frozen_client_port_is_reclaimed_within_budget(harness):
         proc.send_signal(signal.SIGSTOP)
         deadline = time.time() + RECLAIM_BUDGET
         while time.time() < deadline:
-            if not port_listening_in_gateway(TUNNEL_PORT):
+            if not reverse_port_registered(TUNNEL_PORT):
                 return
             time.sleep(1)
         pytest.fail(f"端口 {TUNNEL_PORT} 在 {RECLAIM_BUDGET} 秒内未被回收")
@@ -1561,9 +1890,9 @@ def test_port_can_be_rebound_after_reclaim(harness):
     first.send_signal(signal.SIGSTOP)
     try:
         deadline = time.time() + RECLAIM_BUDGET
-        while time.time() < deadline and port_listening_in_gateway(TUNNEL_PORT):
+        while time.time() < deadline and reverse_port_registered(TUNNEL_PORT):
             time.sleep(1)
-        assert not port_listening_in_gateway(TUNNEL_PORT), "端口未回收，后续断言无意义"
+        assert not reverse_port_registered(TUNNEL_PORT), "端口未回收，后续断言无意义"
         second = start_tunnel()
         second.terminate()
         second.wait(timeout=10)
@@ -1654,7 +1983,7 @@ TOML
 ListenAddress 127.0.0.1:2222
 # BEGIN RMC MANAGED
 Match User tunnel-zhang
-    PermitListen 127.0.0.1:22001
+    PermitListen 22001
 # END RMC MANAGED
 CONF
 }
@@ -1689,10 +2018,18 @@ teardown() {
     run /gateway/scripts/enroll-account.sh tunnel-new
     [ "$status" -eq 0 ]
     grep -q "^ListenAddress 127.0.0.1:2222$" "$RMC_SSHD_CONFIG"
-    grep -q "PermitListen 127.0.0.1:22001" "$RMC_SSHD_CONFIG"
-    grep -q "PermitListen 127.0.0.1:22007" "$RMC_SSHD_CONFIG"
+    grep -q "^    PermitListen 22001$" "$RMC_SSHD_CONFIG"
+    grep -q "^    PermitListen 22007$" "$RMC_SSHD_CONFIG"
     # 受管标记只出现一次
     [ "$(grep -c 'BEGIN RMC MANAGED' "$RMC_SSHD_CONFIG")" -eq 1 ]
+}
+
+@test "enroll 生成的 PermitListen 是不带地址的裸端口形式" {
+    # 带地址的 PermitListen 会在 GatewayPorts 之前一层把通配绑定拒掉，
+    # 反向端口就绑不到 0.0.0.0 上，工程师也就连不进来。见全局约束第一条。
+    run /gateway/scripts/enroll-account.sh tunnel-new
+    [ "$status" -eq 0 ]
+    ! grep -q "PermitListen .*:" "$RMC_SSHD_CONFIG"
 }
 
 @test "enroll 幂等，重复执行不重复写 Match 块" {
@@ -1709,7 +2046,7 @@ teardown() {
     [ "$status" -eq 0 ]
     run passwd -S tunnel-new
     [[ "$output" == *" L "* ]]
-    ! grep -q "PermitListen 127.0.0.1:22007" "$RMC_SSHD_CONFIG"
+    ! grep -q "PermitListen 22007" "$RMC_SSHD_CONFIG"
 }
 
 @test "status 列出登记表中每个账号及其端口" {
@@ -1783,7 +2120,10 @@ rewrite_match_block() {
         while IFS= read -r username; do
             local port
             port="$(python3 "$REGISTRY_PY" get "$username" | cut -f3)"
-            printf 'Match User %s\n    PermitListen 127.0.0.1:%s\n' "$username" "$port"
+            # PermitListen 写不带地址的裸端口形式。GatewayPorts yes 要把反向端口
+            # 绑到通配地址上，而带地址的 PermitListen 会在 GatewayPorts 被读到
+            # 之前先一层把通配绑定拒掉。端口仍逐账号只放行一个，只有地址不限。
+            printf 'Match User %s\n    PermitListen %s\n' "$username" "$port"
         done < <(python3 "$REGISTRY_PY" list-usernames)
         printf '%s\n' "$END_MARK"
     } >> "$tmp"
@@ -1904,7 +2244,7 @@ cd test-env && docker compose up -d --build gateway
 docker compose exec -T gateway bats /gateway/tests/test_scripts.bats
 ```
 
-预期：8 passed。
+预期：9 passed。
 
 - [ ] **Step 5: 提交**
 
@@ -1987,7 +2327,7 @@ cd gateway && .venv/bin/python -m pytest tests -v
 ```markdown
 # Maintenance Gateway
 
-远程维护的汇聚点。不含自研服务端程序，由 haproxy 与两个独立的 sshd 实例组成。
+远程维护的汇聚点。不含自研服务端程序，由 haproxy 与一个隧道专用的 sshd 实例组成。
 设计依据见 `../docs/方案设计.md` 第 4 章。
 
 ## 组成
@@ -1995,14 +2335,23 @@ cd gateway && .venv/bin/python -m pytest tests -v
 | 端口 | 组件 | 作用 |
 |---|---|---|
 | 443 | haproxy | 终止 TLS，转给 `127.0.0.1:2222` |
-| 127.0.0.1:2222 | sshd-tunnel | 只服务 `tunnel-*` 账号，只允许建立一个 loopback 反向端口 |
-| 22 | sshd-engineer | 工程师入口，无 shell，只能跳到 loopback 隧道端口 |
+| 127.0.0.1:2222 | sshd-tunnel | 只服务 `tunnel-*` 账号，只允许建立一个指定端口的反向端口 |
+| 22000-22999 | 反向端口 | 由 sshd-tunnel 按在线隧道创建，绑 `0.0.0.0`，工程师直连 |
+
+## 反向端口是公网可达的
+
+`sshd-tunnel` 配的是 `GatewayPorts yes`，所以每条在线隧道的反向端口绑在 `0.0.0.0` 上，互联网上任何人都能连到它，连上之后面对的就是客户一体机的 sshd。这是明确的取舍：先把功能打通，把安全收紧排在后面。部署这台机器之前请确认知道这一点。
+
+- 拦在前面的只有一体机自己的动态 root 口令，所以它的强度与轮换周期直接决定了安全边界；
+- 端口在 22000-22999 内连号分配，可以被顺序枚举；
+- Gateway 不记录谁在什么时间访问了哪台一体机，也没有逐工程师的凭据可吊销。
+
+把端口绑回内网网卡或限定来源网段、在一体机之前恢复认证与审计点、把端口号打散，都记在方案 7.3 的后续加固里。
 
 ## 部署
 
 ```bash
 install -m 600 sshd_tunnel_config /etc/ssh/sshd_tunnel_config
-install -m 644 sshd_engineer.conf /etc/ssh/sshd_config.d/engineer.conf
 install -m 644 haproxy.cfg /etc/haproxy/haproxy.cfg
 install -m 644 systemd/sshd-tunnel.service /etc/systemd/system/
 ssh-keygen -t ed25519 -N '' -f /etc/ssh/tunnel_host_ed25519_key
@@ -2010,7 +2359,6 @@ ssh-keygen -t ed25519 -N '' -f /etc/ssh/tunnel_host_ed25519_key
 install -m 600 gateway.pem /etc/haproxy/certs/gateway.pem
 systemctl daemon-reload
 systemctl enable --now sshd-tunnel haproxy
-systemctl reload ssh
 ```
 
 记下 `/etc/ssh/tunnel_host_ed25519_key.pub` 的指纹，客户端首次连接时要核对：
@@ -2036,12 +2384,12 @@ sudo scripts/revoke-account.sh <username>
 ## 工程师登录一体机
 
 ```bash
-ssh -J eng@gateway.company.com -p 22001 \
-    -o HostKeyAlias=c0001-a1 \
-    root@127.0.0.1
+ssh -p 22001 root@gateway.company.com
 ```
 
-口令是该设备的动态 root 口令，从公司内部口令服务按设备编号取。`HostKeyAlias` 用设备编号，避免不同设备复用同一端口时的 host key 变更告警。
+工程师在 Gateway 上不需要账号，直连反向端口即可。口令是该设备的动态 root 口令，从公司内部口令服务按设备编号取。
+
+首次连接必须核对一体机的 host key 指纹：直连时 `known_hosts` 记的是 Gateway 的地址与端口，而不同一体机会先后复用同一个端口，host key 变更告警会变成常态。现场人员的客户端界面上「复制」按钮给出的就是命令加该设备的指纹。
 
 ## 常见故障
 
@@ -2049,7 +2397,8 @@ ssh -J eng@gateway.company.com -p 22001 \
 |---|---|---|
 | 客户端报端口占用 | 上一条隧道静默断开，端口未回收 | 等 30 秒，客户端会自动重试；`tunnel-status.sh` 可看在线状态 |
 | 客户端认证失败 | 口令错误或账号被锁 | `passwd -S <username>` 看锁定状态 |
-| 工程师连上端口但被拒 | 一体机不可达 | 让现场人员看客户端是否为橙色的一体机不可达 |
+| 工程师连 22001 连不上 | 隧道不在线，端口尚未创建 | `tunnel-status.sh` 看该账号是否 online，再让现场人员开启远程维护 |
+| 工程师连上 22001 但立即断开 | 隧道在线但一体机不可达 | 让现场人员看客户端是否为橙色的一体机不可达 |
 | haproxy 起不来 | 证书路径或权限不对 | `haproxy -c -f /etc/haproxy/haproxy.cfg` |
 
 ## 本地测试
@@ -2069,7 +2418,7 @@ PidFile /run/sshd-tunnel.pid
 Subsystem sftp /bin/false
 ```
 
-并在该节的要点列表末尾补一条：`- 第二个 sshd 实例必须有独立的 host key 与 pid 文件；sftp 子系统指向 /bin/false。`
+并在该节的要点列表末尾补一条：`- 隧道 sshd 实例必须有独立的 host key 与 pid 文件；sftp 子系统指向 /bin/false。`
 
 - [ ] **Step 4: 确认全绿并推分支验证 CI**
 
@@ -2099,14 +2448,14 @@ git commit -m "ci(gateway): Gateway 测试工作流与运维手册"
 | 4.1 拓扑 | Task 2、4、5 |
 | 4.2 sshd-tunnel 配置与要点 | Task 2、3、6 |
 | 4.2 haproxy TLS 终止 | Task 4 |
-| 4.3 sshd-engineer 与 ProxyJump | Task 5 |
+| 4.3 工程师直连（反向端口绑 0.0.0.0） | Task 5 |
 | 4.4 registry.toml | Task 1 |
 | 4.4 enroll / revoke / status | Task 7 |
 | 6 新增与吊销流程 | Task 7、8 |
 | 8 Gateway 相关用例（僵尸端口、口令错误） | Task 3、6 |
 | 7.3 明确不做 pam_faillock 与来源 IP 限速 | 全局约束已列 |
 
-未覆盖且属于本计划范围之外的：一体机侧无改动（方案第 5 章），工程师账号的批量管理（方案 4.4 末句说明单独管理）。
+未覆盖且属于本计划范围之外的：一体机侧无改动（方案第 5 章）；把反向端口从公网收回、在一体机之前恢复认证与审计点、端口号打散（方案 7.3 明确推后）。工程师侧已无需管理任何 Gateway 账号。
 
 **遗留给客户端计划的接口**
 
