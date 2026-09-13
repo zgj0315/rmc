@@ -129,11 +129,22 @@ def wait_port(port: int, timeout: float = 60.0) -> None:
     raise TimeoutError(f"端口 {port} 在 {timeout} 秒内没有就绪：{last}")
 
 
-def compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+def compose(*args: str, check: bool = True,
+            timeout: float | None = None) -> subprocess.CompletedProcess:
+    """跑一条 docker compose 子命令。
+
+    `timeout` 默认 None，也就是不限时——`compose("up", "-d", "--build")` 动辄几分钟，
+    统一加上限会把构建杀掉。要限时的是那些本该秒回的调用，由调用方自己指定
+    （见 gateway_listen_table）。
+    """
     return subprocess.run(
         ["docker", "compose", *args],
-        cwd=ENV_DIR, check=check, capture_output=True, text=True,
+        cwd=ENV_DIR, check=check, capture_output=True, text=True, timeout=timeout,
     )
+
+
+# `ss -ltn` 是秒回的命令，20 秒足够宽松。
+_LISTEN_TABLE_TIMEOUT = 20.0
 
 
 def gateway_listen_table() -> str:
@@ -145,8 +156,22 @@ def gateway_listen_table() -> str:
     `docker compose exec` 失败时必须抛出来，不能把返回码和 stderr 丢掉后交回
     一张空表：空表会让 tunnel 固件白等二十秒，最后报一句「反向端口未出现」，
     把 docker 的问题伪装成 sshd 的问题。
+
+    这里也是整个取表路径上唯一该限时的地方。`compose()` 默认不限时（构建要几分钟），
+    但本函数被 tunnel 固件的启动等待、收尾轮询以及 Task 3 到 6 的每次端口查询反复调用；
+    一旦某次 `docker compose exec` 卡住，没有超时就会永远挂着——`_stop_tunnel` 的
+    15 秒期限只在两次调用之间判定，进不到下一轮就永远判不到，venv 里也没有
+    pytest-timeout 从外面兜。两层守卫分工不同：这里的单次超时管一次卡死的调用，
+    那边的循环期限管一连串飞快返回却始终不满足条件的调用。
     """
-    out = compose("exec", "-T", "gateway", "ss", "-ltn", check=False)
+    cmd = ("exec", "-T", "gateway", "ss", "-ltn")
+    try:
+        out = compose(*cmd, check=False, timeout=_LISTEN_TABLE_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"取 gateway 监听表超时：docker compose {' '.join(cmd)} "
+            f"超过 {_LISTEN_TABLE_TIMEOUT} 秒没有返回"
+        ) from exc
     if out.returncode != 0:
         raise RuntimeError(
             f"取 gateway 监听表失败，docker compose exec 退出码 {out.returncode}\n"
