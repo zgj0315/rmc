@@ -12,11 +12,31 @@ pub struct HostPort {
 }
 
 fn valid_host(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= 253
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+    {
+        return false;
+    }
+    // R18 / RFC 1123 §2.1：真实域名的最后一段从不是纯数字——顶级域名都是
+    // 字母。如果整个字符串本身解析不出合法的 IP 字面量，又以纯数字标签
+    // 收尾，那就是 "127.1"、"0x7f.1"、"2130706433" 这类历史遗留的数字式
+    // IPv4 写法：Rust 的 `IpAddr` 解析器很严格，会直接拒绝这些写法，但
+    // 这台客户端最终跑在 Windows 上，其 resolver 接受 inet_aton 风格，会
+    // 把它们当成 127.0.0.1 处理——必须在主机名校验这一层就连同整个 host
+    // 一起拒绝，不能指望 is_loopback 单独接住这种拼写（is_loopback 只在
+    // host 已经被判定合法之后才会被调用）。
+    if host.parse::<IpAddr>().is_err() {
+        if let Some(last_label) = host.rsplit('.').next() {
+            if !last_label.is_empty() && last_label.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl HostPort {
@@ -47,14 +67,25 @@ impl HostPort {
     ///   写法 "0:0:0:0:0:0:0:1"（假阴性，真正的回环地址反而被放行，
     ///   这正是校验要挡住的那类问题）。
     ///
-    /// `IpAddr::is_loopback` 按数值判断，两个方向的问题一起解决。
+    /// R17：`Ipv6Addr::is_loopback` 只特判字面量 `::1`，不会先把
+    /// IPv4-映射地址（`::ffff:127.0.0.1`、压缩写法 `::ffff:7f00:1`）折算
+    /// 成 IPv4 再判断——这类地址数值上就是 127.0.0.1，双栈系统上连它会
+    /// 落到本机回环接口，必须先用 `to_canonical()` 折算，否则原样漏判。
+    ///
+    /// R17：这是纯字符串/数值判断，不做 DNS 解析——这是个同步的校验函数，
+    /// 不能在这里发起网络 I/O，这是刻意的取舍。因此一个解析后才指向回环、
+    /// 但书写形式本身不是回环写法的主机名（例如内部 DNS 把某条自定义记录
+    /// 指向了 127.0.0.1）不在这个函数的能力范围内。
     pub fn is_loopback(&self) -> bool {
-        self.host.eq_ignore_ascii_case("localhost")
-            || self
-                .host
-                .parse::<IpAddr>()
-                .map(|ip| ip.is_loopback())
-                .unwrap_or(false)
+        if self.host.eq_ignore_ascii_case("localhost")
+            || self.host.eq_ignore_ascii_case("localhost.")
+        {
+            return true;
+        }
+        self.host
+            .parse::<IpAddr>()
+            .map(|ip| ip.to_canonical().is_loopback())
+            .unwrap_or(false)
     }
 }
 
@@ -228,5 +259,59 @@ mod tests {
         // 错误地当成回环拒绝）；必须按数值判断，而不是看字符串前缀。
         let hp = HostPort::new("127.0.0.1.example.com", 22).unwrap();
         assert!(!hp.is_loopback());
+    }
+
+    // --- R17：is_loopback 补的两处漏判。---
+
+    #[test]
+    fn loopback_detects_ipv4_mapped_ipv6_dotted_form() {
+        // ::ffff:127.0.0.1 数值上就是 127.0.0.1；Ipv6Addr::is_loopback
+        // 只特判字面量 "::1"，不会先把 IPv4-映射地址折算成 IPv4 再判断，
+        // 双栈系统上连它会落到本机回环接口——正是这个校验要挡住的
+        // "Gateway 的隧道被接回客户端自己身上"。
+        let hp = HostPort::new("::ffff:127.0.0.1", 22).unwrap();
+        assert!(hp.is_loopback());
+    }
+
+    #[test]
+    fn loopback_detects_ipv4_mapped_ipv6_compressed_form() {
+        // 同一个地址的压缩写法：::ffff:7f00:1 与 ::ffff:127.0.0.1 数值
+        // 相同（0x7f00 0x0001 = 127.0.0.1），只是没写成内嵌点分十进制。
+        let hp = HostPort::new("::ffff:7f00:1", 22).unwrap();
+        assert!(hp.is_loopback());
+    }
+
+    #[test]
+    fn loopback_detects_localhost_with_trailing_dot() {
+        // "localhost." 是 FQDN 词根写法，解析器按跟 "localhost" 完全
+        // 等价处理，不解析成 IP 字面量，字符串比较也不相等，容易漏判。
+        let hp = HostPort::new("localhost.", 22).unwrap();
+        assert!(hp.is_loopback());
+    }
+
+    // --- R18：历史遗留的数字式 IPv4 写法，主机名校验这一层就要拒绝。
+    // 每种拼写单独一条测试，便于单独验证哪种拼写被漏掉。---
+
+    #[test]
+    fn rejects_legacy_numeric_ipv4_dotted_short_form() {
+        // Windows 的 resolver 接受 inet_aton 风格，"127.1" 会被当成
+        // 127.0.0.1——不能指望 is_loopback 接住这种拼写，必须在这里连同
+        // host 一起拒绝。
+        assert!(HostPort::new("127.1", 22).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_numeric_ipv4_three_octet_form() {
+        assert!(HostPort::new("127.0.1", 22).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_numeric_ipv4_hex_octet_form() {
+        assert!(HostPort::new("0x7f.1", 22).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_numeric_ipv4_decimal_integer_form() {
+        assert!(HostPort::new("2130706433", 22).is_err());
     }
 }
