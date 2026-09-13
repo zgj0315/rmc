@@ -5,10 +5,19 @@ use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 
+/// R33：字段私有。公开字段会让结构体字面量绕过 `valid_host()`——
+/// Task 4 审查用两个具体例子演示过后果：一个含
+/// `]:443 <指纹>\n[gateway.company.com` 的 host 会让一次 known_hosts
+/// 写入产出两行，第二行是伪造成另一台 Gateway 的记录；一个含空格的
+/// host 会永久性地砸坏文件，此后每次查询全新 Gateway 都会变成 Fatal。
+/// 今天树上没有任何结构体字面量构造、也没有生产调用点，改起来成本是
+/// 零；Task 5 起 `HostPort` 会被到处使用，届时再收紧就要扫一遍所有
+/// 调用点——跟当初趁 `Error::Io` 还没有调用点时去掉 `#[from]` 是
+/// 同一个道理。读出口见下面的 `host()`/`port()`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPort {
-    pub host: String,
-    pub port: u16,
+    host: String,
+    port: u16,
 }
 
 fn valid_host(host: &str) -> bool {
@@ -51,6 +60,19 @@ impl HostPort {
             host: host.to_string(),
             port,
         })
+    }
+
+    /// R33：字段私有，这是唯一的读出口。私有字段逼着调用方只能经
+    /// `new`/`FromStr` 拿到一个已经过 `valid_host` 校验的值，堵死了拿
+    /// 结构体字面量绕过校验直接拼出 `HostPort` 的口子——见下面 `host`
+    /// 字段私有化本身的说明。
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// R33：同上，端口的唯一读出口。
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     fn is_ipv6_literal(&self) -> bool {

@@ -126,7 +126,7 @@ pub fn fingerprint_sha256(key_blob: &[u8]) -> String {
 /// 中括号，不管 host 本身是不是 IPv6 字面量，读写两边用同一个函数，不会
 /// 因为要不要加括号产生歧义。
 fn entry_key(gateway: &HostPort) -> String {
-    format!("[{}]:{}", gateway.host, gateway.port)
+    format!("[{}]:{}", gateway.host(), gateway.port())
 }
 
 /// R24/R27：host 段是否长得像一条记录该有的样子——方括号包住的内容
@@ -1142,5 +1142,56 @@ mod tests {
             "NUL 字节被原样塞进了错误文案：{text:?}"
         );
         assert!(text.contains("garbage"), "至少要保留可读的一部分：{text}");
+    }
+
+    // --- R34：`addr.rs` 的 `valid_host()`、这个模块的
+    // `is_valid_host_byte`、`entry_key` 的输出格式，三处目前只靠注释
+    // 互相承诺"字符集一致"。绑定成一条测试，不再指望三处注释同步改。
+    //
+    // 会让这条测试变红的改法（都已手动验证过）：
+    // - `is_valid_host_byte` 去掉 `b':'` 分支——IPv6 字面量
+    //   "fd00::1"/"::1"/"::ffff:127.0.0.1" 这几个夹具会让它变红；
+    // - `is_valid_host_byte` 去掉 `b'_'` 分支——"under_score.company.com"
+    //   这个夹具会让它变红；
+    // - `looks_like_host_token` 里端口的 `u16::parse` 放宽成更宽的整数
+    //   类型（比如 u32/u64）——这条不会被上面的正向夹具捕获（合法
+    //   HostPort 的端口本来就在 u16 范围内，构造不出「port 超出 u16
+    //   但仍然合法」的正例），靠下面单独的
+    //   `looks_like_host_token_rejects_port_above_u16_range` 捕获。
+    #[test]
+    fn entry_key_output_is_always_recognized_by_looks_like_host_token() {
+        // 覆盖 `valid_host()` 字符集里的每一类字符：字母数字、`.`、
+        // `-`、`_`，以及 IPv6 字面量里用到的 `:`（包括压缩写法、
+        // IPv4-映射写法）。
+        let hosts: &[&str] = &[
+            "gateway.company.com",
+            "gateway-01.company.com",
+            "under_score.company.com",
+            "192.168.100.10",
+            "fd00::1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "localhost",
+            "a",
+        ];
+        for host in hosts {
+            let hp =
+                HostPort::new(host, 443).unwrap_or_else(|e| panic!("{host} 应该是合法 host：{e}"));
+            let key = entry_key(&hp);
+            assert!(
+                looks_like_host_token(&key),
+                "entry_key 产出的 token 应该被 looks_like_host_token 认可：{key}（host={host}）"
+            );
+        }
+    }
+
+    // R34：端口段必须严格按 `u16` 的十进制表示回填，不能被放宽成更宽
+    // 的整数类型。99999 超出 u16 范围（65535 是上限），没法通过
+    // `HostPort` 的公开构造函数产出这样的值（`port` 参数本身就是
+    // u16），所以直接构造 token 字符串测这条校验本身，而不是绕道
+    // `entry_key`。
+    #[test]
+    fn looks_like_host_token_rejects_port_above_u16_range() {
+        assert!(!looks_like_host_token("[gateway.company.com]:99999"));
     }
 }

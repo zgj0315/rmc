@@ -181,7 +181,7 @@ mod tests {
         // 方案设计.md §3.8 明确要求内置默认端口 61001；brief 给的所有夹具
         // 都写 22，而 gateway/test-env/appliance/Dockerfile 专门警告过不要
         // 把这个端口简化回 22——22 恰恰是掩盖这整类错误的值。
-        assert_eq!(Config::default().appliance.port, 61001);
+        assert_eq!(Config::default().appliance.port(), 61001);
     }
 
     #[test]
