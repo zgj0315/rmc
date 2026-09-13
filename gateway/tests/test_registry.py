@@ -69,6 +69,17 @@ def test_missing_field_is_rejected(tmp_path):
         load(write(tmp_path, bad))
 
 
+def test_missing_registry_file_is_rejected(tmp_path):
+    """登记表文件根本不存在（不是内容损坏）这条路径此前没有任何测试盯着——
+    损坏的 TOML 只在 bats 里端到端测过（test_scripts.bats 的"登记表损坏时…
+    响亮失败"两条用例），文件缺失这条分支现在跟它们一样是响亮失败契约的
+    一部分，值得一条独立的单元测试，不用起容器也能跑。
+    """
+    missing = tmp_path / "does-not-exist.toml"
+    with pytest.raises(RegistryError, match="找不到登记表"):
+        load(missing)
+
+
 def test_cli_list_usernames(tmp_path):
     p = write(tmp_path, GOOD)
     out = subprocess.run(
@@ -98,3 +109,19 @@ def test_cli_get_unknown_username_exits_3(tmp_path):
     )
     assert out.returncode == 3
     assert "tunnel-nobody" in out.stderr
+
+
+def test_cli_missing_registry_file_exits_4(tmp_path):
+    """CLI 层面的同一条路径：这是三个运维脚本响亮失败契约依赖的退出码——
+    lib.sh 的 registry_get()、tunnel-status.sh 都靠 registry.py 在这种情况下
+    返回 4 并把原因写清楚，才能把"登记表读不到"和"用户名不存在"（退出码 3）
+    区分开。
+    """
+    missing = tmp_path / "does-not-exist.toml"
+    out = subprocess.run(
+        [sys.executable, str(SCRIPT), "list-usernames"],
+        env={"RMC_REGISTRY": str(missing), "PATH": "/usr/bin:/bin"},
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 4
+    assert "找不到登记表" in out.stderr

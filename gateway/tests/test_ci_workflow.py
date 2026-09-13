@@ -8,9 +8,15 @@
 若它跑完时没有 `RMC_KEEP_ENV=1`，容器在该步骤结束时就被删掉了。后面的 "脚本测试"
 步骤用 `docker compose exec -T gateway bats ...` 对着一个已经不存在的容器执行，19 条
 bats 用例从未真的跑过；`if: failure()` 的日志导出步骤同样对着空容器，导出不出任何
-日志。两个失败都不会让 CI 变红——`docker compose exec`/`docker compose logs` 对一个
-不存在的服务会报错退出，但那条报错会被淹没在一堆其它输出里，很容易被读成"环境问题"
-而不是"这一步压根没有测到东西"。
+日志。
+
+这两步确实都会让 CI 变红：`docker compose exec`/`docker compose logs` 对一个不存在
+的服务会以退出码 1 报错（已实测："service \"gateway\" is not running"），没有
+`continue-on-error` 的 `run` 步骤非零退出就是 job 失败。但报出来的是一条 docker 环境
+错误，不是任何一条 bats 用例的断言失败——排查的人看到的是"这一步的环境不对"，而不是
+"21 条用例一条都没跑到"，很容易被当成一次性的基础设施抖动去重跑，而不是去追查 CI 配置
+本身回归了 `RMC_KEEP_ENV`。这份文件要防的正是这种"红是红了，但红得让人查错方向"的退化，
+不是"红不了"。
 
 单靠调整 YAML 里几个步骤的先后顺序看不出这个 bug：`脚本测试` 本来就写在两条 pytest
 步骤之后。真正缺的是让容器活到那一刻的 `RMC_KEEP_ENV=1`，以及跑完之后把它们清理掉的
@@ -91,11 +97,15 @@ def test_workflow_file_parses_as_yaml_with_one_job():
 
 
 def test_bats_step_runs_after_both_pytest_steps():
-    """"脚本测试"（bats）必须排在"单元测试"与"集成测试"两条 pytest 步骤之后。
+    """"脚本测试"（bats）必须排在"单元测试"与"集成测试"两条 pytest 步骤之后，
+    而且这一步真的在跑 bats。
 
-    这一条只盯步骤的先后顺序：谁把"脚本测试"挪到任何一条 pytest 步骤前面，或者
-    把"集成测试"挪到"脚本测试"之后，这里就会红。顺序对不对不能证明容器在那一刻
-    还活着——活着与否由下一条用例盯，两者职责不重合。
+    只盯顺序盯不住整件事：把"脚本测试"这一步的 `run` 换成 `echo skip` 之类
+    的空操作，顺序完全不变，前一版的用例会继续全绿，21 条 bats 用例却从此
+    一条都不会再跑——这正是本文件模块 docstring 里说的"红是红了/绿是绿了，
+    但看不出内容对不对"这一类退化。`run` 里必须真的出现 `bats` 这个词，
+    再加上位置断言，才能把"排在两条 pytest 之后"与"这一步确实在执行 bats"
+    这两件事都钉住。
     """
     steps = _steps(_job(_load_workflow()))
     unit_idx = _index_by_name(steps, UNIT_TEST_STEP)
@@ -103,6 +113,9 @@ def test_bats_step_runs_after_both_pytest_steps():
     bats_idx = _index_by_name(steps, BATS_STEP)
     assert bats_idx > unit_idx, "脚本测试必须排在单元测试之后"
     assert bats_idx > integration_idx, "脚本测试必须排在集成测试之后"
+    assert "bats" in (steps[bats_idx].get("run") or ""), (
+        "“脚本测试”这一步的 run 里必须真的执行 bats"
+    )
 
 
 def test_containers_are_kept_alive_through_bats_and_log_export():
@@ -137,13 +150,20 @@ def test_containers_are_kept_alive_through_bats_and_log_export():
 
 
 def test_log_export_step_only_runs_on_failure():
-    """导出容器日志的步骤必须带 `if: failure()`，否则每次成功也会白跑一次
-    `docker compose logs`；这条用例会在这一步被删掉、或 `if` 字段被删掉/改成
-    别的条件时变红。
+    """导出容器日志的步骤必须带 `if: failure()`，且这一步真的在导出日志。
+
+    只查 `if` 字段查不住整件事：把这一步的 `run` 换成别的命令（甚至
+    `echo skip`），`if: failure()` 原样留着，前一版的用例照样全绿，失败时
+    却拿不到任何容器日志——诊断信息安静地消失了，唯一的信号只是下一次排障
+    的人发现日志是空的。`run` 里必须真的出现 `logs`，才钉得住"这一步不只是
+    条件对了，内容也没被换掉"。
     """
     steps = _steps(_job(_load_workflow()))
     idx = _index_by_name(steps, LOG_EXPORT_STEP)
     assert steps[idx].get("if") == "failure()"
+    assert "logs" in (steps[idx].get("run") or ""), (
+        "这一步的 run 里必须真的执行 docker compose logs"
+    )
 
 
 def test_timeout_is_at_least_30_minutes():
@@ -156,11 +176,21 @@ def test_timeout_is_at_least_30_minutes():
 
 
 def test_cleanup_step_always_tears_down_environment():
-    """必须有一步无条件（`if: always()`）执行 `docker compose down -v`：
-    `RMC_KEEP_ENV=1` 让容器活过"集成测试"步骤之后，总要有人负责收尾，
-    否则 runner 上会一直留着这套 docker 环境。这条用例会在这一步被删掉、
-    或者 `if` 不是 `always()`（例如漏写、或错写成 `failure()`）时变红。
+    """必须有一步无条件（`if: always()`）执行 `docker compose down -v`，
+    且这一步必须排在"脚本测试"之后。
+
+    只查 `if` 字段查不住整件事：把这一步的 `run` 换成别的命令（甚至
+    `echo skip`），或者把这一步整个挪到"脚本测试"前面，`if: always()`
+    留在原地不变，前一版的用例照样全绿——但前一种情况下 runner 上会一直
+    留着这套 docker 环境，后一种情况下容器在"脚本测试"跑到之前就被收掉了，
+    21 条 bats 用例又变回对着空容器执行。`run` 内容与位置这两条断言各防
+    一种退化。
     """
     steps = _steps(_job(_load_workflow()))
     idx = _index_by_name(steps, CLEANUP_STEP)
     assert steps[idx].get("if") == "always()"
+    assert "down -v" in (steps[idx].get("run") or ""), (
+        "清理步骤的 run 里必须真的执行 docker compose down -v"
+    )
+    bats_idx = _index_by_name(steps, BATS_STEP)
+    assert idx > bats_idx, "清理步骤必须排在脚本测试之后，不能提前把容器收掉"

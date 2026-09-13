@@ -327,6 +327,47 @@ def tunnel_effective_config(harness):
 # `GatewayPorts no` 故意没放进这张表：Task 5 会把它改成 `yes`（强制反向端口
 # 绑通配地址），现在写一条「必须是 no」的断言，Task 5 一落地就得立刻删掉，
 # 不如现在就不写——这是刻意的取舍，不是漏掉了。
+#
+# 全分支审查（task-8）又补了下面六条。之前漏掉的不是随便哪六条指令，是这张表
+# 里后果最重的六条——少了它们，这张表能钉住"边界能不能绕过"，钉不住"客户已
+# 经拍板的取舍是否还在悄悄被推翻"：
+#
+# - clientaliveinterval 10 / clientalivecountmax 3：唯一挡着「有人把约 80 秒
+#   的反向端口回收时间悄悄调回约 30 秒」这件事的两行。方案与手册四处都写着
+#   约 80-90 秒是客户在看过"调小间隔换来维护会话可能被中途打断"这个代价之后
+#   拍板接受的数字（见 `sshd_tunnel_config` 这两行上方的注释、docs/方案设计.md
+#   §4.2）。把 `ClientAliveInterval` 改成 4，回收时间会精确降到约 32 秒——
+#   `test_zombie_port.py` 110 秒的预算依然通过，63 个用例依然全绿，这个决定
+#   却已经被悄悄推翻。
+# - listenaddress 127.0.0.1:2222：唯一挡着「sshd-tunnel 直接监听公网网卡、
+#   在 haproxy 旁边裸奔明文 SSH」这件事的一行。改成 `0.0.0.0` 之后，所有端到
+#   端用例依然经 127.0.0.1:2222（生产）或 2223（测试环境的 socat 旁路）连接，
+#   一个用例都不会变红，却在生产上让 443 之外多出一个不经 TLS 终止的入口，
+#   haproxy 的 TLS 终止形同虚设。
+# - allowusers tunnel-* / permitrootlogin no：这个 sshd 实例本身「只认
+#   tunnel-* 账号、且这些账号不可能是 root」的边界，两条各管一半，缺一条
+#   都不完整。
+# - permitlisten *:22001（对应 `sshd_tunnel_config` 受管区段里裸端口形式的
+#   `PermitListen 22001`）：钉住裸端口写法本身。`sshd -T` 把它规范化成
+#   `*:<端口>` 打印，不是原始写法的字面 `22001`，所以这里必须写成 `*:22001`
+#   才对得上；已实测删掉这一行后，tunnel-zhang 的有效值回退到 Match 块之外
+#   的全局默认 `permitlisten none`。
+#
+# 逐条用 sshd -T 实测过删除效果（task-8-report.md 有完整表格），六条里五条
+# 删除后都会让参数化测试对应的那一行断言真的变红：
+#
+#   ListenAddress        → listenaddress [::]:22 / listenaddress 0.0.0.0:22
+#   PermitRootLogin       → permitrootlogin without-password
+#   AllowUsers            → 整行消失，sshd -T 不再打印 allowusers
+#   ClientAliveInterval   → clientaliveinterval 0
+#   PermitListen（裸端口）→ permitlisten none（回退到全局默认拒绝）
+#
+# ClientAliveCountMax 是本表继 X11Forwarding 之后第二个例外：OpenSSH 的出厂
+# 默认值本来就是 3，删掉这一行之后 `sshd -T` 打出来的仍然是逐字相同的
+# `clientalivecountmax 3`——这条断言钉不住「整行被删掉」，只钉得住「被显式
+# 改成别的数字」（例如手滑写成 `ClientAliveCountMax 5`，那样才会变红）。如实
+# 记录，不假装它跟其余五条一样能防删除；`ClientAliveInterval` 那一条不受这个
+# 问题影响，出厂默认是 0，删掉之后一定会变。
 _LAYERED_DIRECTIVES = [
     pytest.param("forcecommand /bin/false", id="ForceCommand"),
     pytest.param("subsystem sftp /bin/false", id="Subsystem-sftp"),
@@ -342,6 +383,14 @@ _LAYERED_DIRECTIVES = [
     pytest.param("allowstreamlocalforwarding no", id="AllowStreamLocalForwarding"),
     pytest.param("logingracetime 20", id="LoginGraceTime"),
     pytest.param("maxauthtries 3", id="MaxAuthTries"),
+    pytest.param("listenaddress 127.0.0.1:2222", id="ListenAddress"),
+    pytest.param("permitrootlogin no", id="PermitRootLogin"),
+    pytest.param("allowusers tunnel-*", id="AllowUsers"),
+    pytest.param("clientaliveinterval 10", id="ClientAliveInterval"),
+    # 例外（同上 X11Forwarding）：OpenSSH 的出厂默认值本来就是 3，删掉这一行
+    # 不会变红，只有显式改成别的数字才会。
+    pytest.param("clientalivecountmax 3", id="ClientAliveCountMax"),
+    pytest.param("permitlisten *:22001", id="PermitListen-bare-port"),
 ]
 
 
@@ -359,3 +408,39 @@ def test_layered_directive_is_still_individually_in_effect(
     像行为测试那样先去猜是不是 connection 层面出了别的事。
     """
     assert expected_line in tunnel_effective_config, tunnel_effective_config
+
+
+@pytest.fixture(scope="module")
+def tunnel_effective_config_unenrolled(harness):
+    """一个不在受管区段里的 tunnel-* 账号，在这份配置下的有效配置。
+
+    与 `tunnel_effective_config` 用的是同一份配置文件、同一条查法，只是
+    `-C user=` 换成一个 registry.toml 和受管区段里都不存在的 tunnel-* 用户名
+    （`tunnel-ghost`，不需要真实系统账号——`sshd -T -C` 只按 Match 的模式串
+    判断，不查 passwd）。sshd 因此不会匹配到 `Match User tunnel-zhang` 那个
+    块，看到的正是 Match 块之外的全局默认值——这正是全局默认拒绝
+    （`PermitListen none`）要保护的场景：账号已经在 tunnel-* 的命名空间里、
+    能连上也能通过认证，但还没有人跑过 enroll-account.sh，此时反向端口必须
+    是"什么都转不了"，不能退化成出厂默认的"任意端口绑 0.0.0.0"。
+    """
+    out = compose("exec", "-T", "gateway", "sshd", "-T",
+                  "-f", "/etc/ssh/sshd_tunnel_config",
+                  "-C", "user=tunnel-ghost,host=test,addr=127.0.0.1",
+                  check=False, timeout=20)
+    assert out.returncode == 0, f"sshd -T 失败：{out.stderr}"
+    return out.stdout.lower().splitlines()
+
+
+def test_permitlisten_default_deny_applies_to_unenrolled_tunnel_account(
+        tunnel_effective_config_unenrolled):
+    """全局默认拒绝（`PermitListen none`）此前只被一条 bats 用例当纯文本盯住
+    （在 fixture 或真实文件里 grep 这一行还在不在），从没有人问过 sshd 自己：
+    对一个真实会匹配到 `tunnel-*` 但没有专属 Match 块的账号，解析出来的有效
+    值是不是真的是 `none`。
+
+    已实测删除 `sshd_tunnel_config` 里 `PermitListen none` 这一行做过对照：
+    删掉后这个未登记账号的有效值从 `permitlisten none` 变成出厂默认的
+    `permitlisten any`，证明这条断言确实钉住了这一行，不是巧合通过。
+    """
+    assert "permitlisten none" in tunnel_effective_config_unenrolled, (
+        tunnel_effective_config_unenrolled)
