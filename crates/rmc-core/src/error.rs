@@ -62,8 +62,25 @@ pub enum Error {
     #[error("配置错误：{0}")]
     Config(String),
 
-    #[error("本地文件操作失败：{0}")]
+    #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
+
+    /// R14：本地文件系统操作失败（如 known_hosts 读写——权限错误、磁盘
+    /// 满）。与 Io 分开是因为二者需要的处置完全相反：
+    /// - Io 挂了 `#[from]`，兜底传输层任何 socket 级 io::Error；把它归为
+    ///   Network 是安全默认（一次网络抖动不该杀死会话），但也因此不能把
+    ///   Io 整体改成 Fatal——那样会连带把偶发的 socket 错误也变成永久性
+    ///   失败。
+    /// - 而 known_hosts 权限错误、磁盘满这类本地文件系统错误，退避重连
+    ///   解决不了；如果和 Io 共用 Network 分类，Supervisor（Task 10）会
+    ///   把隧道拆了重建、拆了重建，永远重连，工程师永远看不到需要处理
+    ///   的原因。所以单列 Fatal，立刻停下来醒目提示。
+    ///
+    /// 不能再给它挂 `#[from]`：同一个类型对 `std::io::Error` 的 `From`
+    /// 实现只能有一份，已经被 Io 占用了。Task 4 读写 known_hosts 时需要
+    /// 显式构造 `Error::LocalIo(e)`。
+    #[error("本地文件操作失败：{0}")]
+    LocalIo(std::io::Error),
 }
 
 impl Error {
@@ -72,7 +89,8 @@ impl Error {
             Error::HostKeyMismatch { .. }
             | Error::TlsInvalidCert(_)
             | Error::ProxyAuthFailed(_)
-            | Error::Config(_) => ErrorClass::Fatal,
+            | Error::Config(_)
+            | Error::LocalIo(_) => ErrorClass::Fatal,
             Error::AuthRejected => ErrorClass::Auth,
             Error::ForwardPortBusy(_) => ErrorClass::PortBusy,
             Error::Dns(_)
@@ -160,9 +178,21 @@ mod tests {
 
     #[test]
     fn io_error_is_network() {
-        // 本地文件操作失败（如写状态文件）按网络类处理，走退避重连。
-        let io_err = std::io::Error::other("disk full");
+        // Io 挂 #[from]，兜底任何 socket 层 io::Error，按网络类处理走退避
+        // 重连——这是安全默认，不能因为要处理本地文件系统错误就把它整体
+        // 改成 Fatal（那样一次 socket 抖动就会把会话判死）。
+        let io_err = std::io::Error::other("connection reset");
         assert_eq!(Error::from(io_err).class(), ErrorClass::Network);
+    }
+
+    #[test]
+    fn local_io_error_is_fatal_not_network() {
+        // R14：known_hosts 权限错误、磁盘满这类本地文件系统错误，重连解决
+        // 不了。如果和 Io 共用 Network 分类，Supervisor 会把隧道拆了重建、
+        // 拆了重建，永远重连，工程师永远看不到需要处理的原因。单列 LocalIo
+        // 为 Fatal，让它立刻停下来醒目提示。
+        let io_err = std::io::Error::other("permission denied");
+        assert_eq!(Error::LocalIo(io_err).class(), ErrorClass::Fatal);
     }
 
     #[test]
