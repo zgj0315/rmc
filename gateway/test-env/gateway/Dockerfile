@@ -21,7 +21,7 @@ RUN mkdir -p /etc/haproxy/certs \
  && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
       -subj "/CN=gateway.test" \
       -addext "subjectAltName=DNS:gateway.test" \
-      -keyout /tmp/k.pem -out /tmp/c.pem 2>/dev/null \
+      -keyout /tmp/k.pem -out /tmp/c.pem \
  && cat /tmp/c.pem /tmp/k.pem > /etc/haproxy/certs/gateway.pem \
  && rm /tmp/k.pem /tmp/c.pem \
  && chmod 600 /etc/haproxy/certs/gateway.pem

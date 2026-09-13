@@ -1169,7 +1169,48 @@ git commit -m "test(gateway): 隧道账号权限边界的负向测试"
 
 - [ ] **Step 1: 写下失败的测试**
 
-先在 `gateway/tests/conftest.py` 的 import 段补上 `import asyncio`、`import contextlib`、`import ssl`、`import threading`，再在文件末尾追加 TLS 中继与 `tls_wrap` 固件：
+先在 `gateway/tests/conftest.py` 的 import 段补上 `import asyncio`、`import contextlib`、`import ssl`、`import threading`，再在文件末尾追加 TLS 中继与 `tls_wrap` 固件。
+
+这一步还顺带改掉一处已有代码：新增的 `gateway_tls_cert_pem()` 与早前任务已经写下的 `gateway_listen_table()` 都要「跑一条秒回的容器内命令，超时或非零退出码都把 docker 真正的输出带出来」——两份重复过一次可以忍，第三份出现时提炼成共享的 `_compose_capture()`，`gateway_listen_table()` 也改成调它，函数体和对外行为不变：
+
+```python
+# `ss -ltn` 与 `openssl x509` 都是秒回的命令，20 秒都算宽松。
+_LISTEN_TABLE_TIMEOUT = 20.0
+_CERT_FETCH_TIMEOUT = 20.0
+
+
+def _compose_capture(*cmd: str, timeout: float, purpose: str) -> str:
+    """跑一条限时的 `docker compose` 子命令，把输出原样捕获返回。
+
+    `gateway_listen_table()` 与 `gateway_tls_cert_pem()` 都要「秒回的容器内
+    命令，超时或非零退出码都必须把 docker 真正的输出带出来，不能吞掉」——
+    第三次抄这段逻辑就不该再抄，收进这一个函数里。`purpose` 只进错误文案
+    （例如「取 gateway 监听表」「取 gateway 证书」），不影响命令本身。
+    """
+    try:
+        out = compose(*cmd, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{purpose}超时：docker compose {' '.join(cmd)} "
+            f"超过 {timeout} 秒没有返回"
+        ) from exc
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"{purpose}失败，docker compose exec 退出码 {out.returncode}\n"
+            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
+        )
+    return out.stdout
+
+
+def gateway_listen_table() -> str:
+    """Gateway 容器里 `ss -ltn` 的原始输出。（docstring 与此前一致，省略）"""
+    return _compose_capture(
+        "exec", "-T", "gateway", "ss", "-ltn",
+        timeout=_LISTEN_TABLE_TIMEOUT, purpose="取 gateway 监听表",
+    )
+```
+
+然后在文件末尾追加 TLS 中继、`tls_wrap` 固件与取证书的 `gateway_tls_cert_pem` 固件：
 
 ```python
 async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -1237,10 +1278,29 @@ class _TlsRelay:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
 
-        asyncio.run_coroutine_threadsafe(_close(), self._loop).result(timeout=10)
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=10)
-        self._loop.close()
+        # 收尾的三步必须无论如何都跑完：_close() 或它的 result(timeout=10)
+        # 一旦抛出，若不用 try/finally 包住后面几步，stop()/join()/close() 会被
+        # 跳过，daemon 线程会带着 run_forever() 陪到整个会话结束。
+        # join 超时的分支单独处理：这时 loop 仍在跑，loop.close() 会抛
+        # "Cannot close a running event loop"，那是一条误导性的第二异常，
+        # 不能盖过原始错误——所以只在线程真正停下之后才关 loop。
+        error: Exception | None = None
+        try:
+            asyncio.run_coroutine_threadsafe(_close(), self._loop).result(timeout=10)
+        except Exception as exc:
+            error = exc
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=10)
+            if not self._thread.is_alive():
+                self._loop.close()
+            elif error is None:
+                error = RuntimeError(
+                    "TLS 中继的事件循环线程在 10 秒内没有停下，"
+                    "已跳过 loop.close() 以避免遮盖这个超时"
+                )
+        if error is not None:
+            raise error
 
 
 @pytest.fixture
@@ -1252,10 +1312,6 @@ def tls_wrap(harness):
         yield port
     finally:
         relay.stop()
-
-
-# `openssl x509` 是秒回的命令，与取监听表的超时给同一个量级。
-_CERT_FETCH_TIMEOUT = 20.0
 
 
 @pytest.fixture(scope="session")
@@ -1270,21 +1326,11 @@ def gateway_tls_cert_pem(harness) -> str:
     session 作用域：每次跑测试只问容器要一次。镜像重建会重新生成证书，
     这里现取而不是把证书内容抄进代码里，测试就不会钉死在某个指纹上。
     """
-    cmd = ("exec", "-T", "gateway", "openssl", "x509",
-           "-in", "/etc/haproxy/certs/gateway.pem")
-    try:
-        out = compose(*cmd, check=False, timeout=_CERT_FETCH_TIMEOUT)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"取 gateway 证书超时：docker compose {' '.join(cmd)} "
-            f"超过 {_CERT_FETCH_TIMEOUT} 秒没有返回"
-        ) from exc
-    if out.returncode != 0:
-        raise RuntimeError(
-            f"取 gateway 证书失败，docker compose exec 退出码 {out.returncode}\n"
-            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
-        )
-    return out.stdout
+    return _compose_capture(
+        "exec", "-T", "gateway", "openssl", "x509",
+        "-in", "/etc/haproxy/certs/gateway.pem",
+        timeout=_CERT_FETCH_TIMEOUT, purpose="取 gateway 证书",
+    )
 ```
 
 创建 `gateway/tests/test_tls_frontend.py`：
@@ -1292,13 +1338,15 @@ def gateway_tls_cert_pem(harness) -> str:
 ```python
 import socket
 import ssl
+import subprocess
+import tempfile
 import time
 
 import pytest
 
 from conftest import (
     APPLIANCE_SSHD, HAPROXY, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_USER,
-    popen_ssh_password, port_listening_in_gateway,
+    _stop_tunnel, popen_ssh_password, port_listening_in_gateway,
 )
 
 
@@ -1310,8 +1358,17 @@ def test_tls_handshake_succeeds_and_presents_gateway_test_cert(harness, gateway_
     到这张证书为止、以及证书上的名字是否等于 `server_hostname="gateway.test"`。
     验证打开之后 `getpeercert()` 才会被填充，`["subject"]` 才读得出来。
 
-    version 只认 TLSv1.2/TLSv1.3：haproxy.cfg 用 `ssl-min-ver TLSv1.2` 关掉了
-    更低版本，这条断言要卡在同一条线上，否则比配置本身还宽松。
+    version 只认 TLSv1.2/TLSv1.3，但这条断言本身不足以证明 haproxy.cfg 的
+    `ssl-min-ver TLSv1.2` 真的在起作用——本机 venv 用的 LibreSSL 客户端最高
+    也只谈到 TLSv1.2，删掉那一行配置，这条断言照样绿。
+
+    下面另起一次握手，把客户端能谈的版本摁死在 TLSv1.1，验证「这个前端从不
+    接受 TLSv1.2 以下的握手」这条契约本身。**但经过实测确认**：这条负向探针
+    在把 `ssl-min-ver TLSv1.2` 从配置里删掉之后仍然通过——这个 haproxy 版本
+    （2.6.12，链接 OpenSSL 3.0）在没有该指令时本身就已经拒绝 TLSv1.0/1.1，
+    所以它并不能像最初设想的那样，把红绿状态和这一行配置的有无关联起来。
+    留着它是因为它仍然验证了一个真实且值得写进契约的属性，只是它验证的是
+    「服务端的实际行为」，不是「这一行配置在起作用」。
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.load_verify_locations(cadata=gateway_tls_cert_pem)
@@ -1322,6 +1379,16 @@ def test_tls_handshake_succeeds_and_presents_gateway_test_cert(harness, gateway_
             assert tls.version() in ("TLSv1.2", "TLSv1.3")
             cn = dict(x[0] for x in tls.getpeercert(binary_form=False)["subject"])
             assert cn["commonName"] == "gateway.test"
+
+    neg_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    neg_ctx.load_verify_locations(cadata=gateway_tls_cert_pem)
+    neg_ctx.verify_mode = ssl.CERT_REQUIRED
+    neg_ctx.check_hostname = True
+    neg_ctx.minimum_version = ssl.TLSVersion.TLSv1_1
+    neg_ctx.maximum_version = ssl.TLSVersion.TLSv1_1
+    with socket.create_connection((HOST, HAPROXY), timeout=10) as raw:
+        with pytest.raises(ssl.SSLError):
+            neg_ctx.wrap_socket(raw, server_hostname="gateway.test")
 
 
 def test_ssh_banner_arrives_through_tls(harness):
@@ -1336,6 +1403,15 @@ def test_ssh_banner_arrives_through_tls(harness):
 
 
 def test_reverse_tunnel_works_over_tls(tls_wrap):
+    """经 tls_wrap 建立反向隧道，失败路径与收尾都对齐 `tunnel` 固件的写法。
+
+    输出必须接文件而不是 PIPE：`-N -T` 是常驻进程，没人读的管道写满会把 ssh
+    卡死，红色路径里 ssh 还活着时也读不出已有内容，`pytest.fail` 永远到不了，
+    整个套件跟着挂住而不是报红。收尾也必须走 `_stop_tunnel`，等 Gateway 上的
+    反向端口真的消失，不然它会残留下来把按字母序紧跟其后的 `test_tunnel.py`
+    带塌。
+    """
+    log = tempfile.TemporaryFile()
     proc = popen_ssh_password(
         TUNNEL_PW, "-N", "-T", "-p", str(tls_wrap),
         "-o", "ExitOnForwardFailure=yes",
@@ -1343,18 +1419,29 @@ def test_reverse_tunnel_works_over_tls(tls_wrap):
         # 所以只能写一体机已发布到宿主的端口，不能写 compose 服务名。
         "-R", f"127.0.0.1:{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}",
         f"{TUNNEL_USER}@{HOST}",
+        stdout=log, stderr=subprocess.STDOUT,
     )
+
+    def output() -> str:
+        log.seek(0)
+        return log.read().decode("utf-8", "replace").strip()
+
     try:
         deadline = time.time() + 20
         while time.time() < deadline:
+            if proc.poll() is not None:
+                pytest.fail(
+                    f"隧道进程提前退出（退出码 {proc.returncode}）：{output()}")
             if port_listening_in_gateway(TUNNEL_PORT):
                 break
             time.sleep(0.5)
         else:
-            pytest.fail(f"经 TLS 建立的反向端口未出现：{proc.stderr.read()}")
+            pytest.fail(f"经 TLS 建立的反向端口未出现：{output()}")
     finally:
-        proc.terminate()
-        proc.wait(timeout=10)
+        try:
+            _stop_tunnel(proc)
+        finally:
+            log.close()
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1376,6 +1463,10 @@ cd gateway && .venv/bin/python -m pytest tests/test_tls_frontend.py -v
 global
     log stdout format raw local0
     ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+    # ciphers 管 TLSv1.2 及以下的协商，ciphersuites 只管 TLSv1.3——两条必须
+    # 都写，只给后者等于放过了 1.2 那一半：不设 ciphers 时 OpenSSL 退回自带的
+    # 默认族，里面还留着 CBC-SHA1 与没有前向保密的静态 RSA 密钥交换。
+    ssl-default-bind-ciphers ECDHE+AESGCM:ECDHE+CHACHA20
     ssl-default-bind-ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384
 
 defaults
@@ -1394,7 +1485,7 @@ backend sshd_tunnel
     server local 127.0.0.1:2222
 ```
 
-`timeout client/server` 取 1 小时，必须长于客户端的 keepalive 周期（10 秒 × 3），否则 haproxy 会在空闲隧道上先掐断连接。
+`timeout client/server` 取 1 小时：真正要盖过的下限是 sshd 的 `ClientAliveInterval 10`——keepalive 每 10 秒有一次流量经过 haproxy，只要这条空闲超时长于 10 秒，keepalive 本身就会不断把它的计时器刷新回零，连接就不会被判定为空闲。1 小时不是这条下限本身，而是留出的余量，用来扛住一条确实长时间没有任何业务流量、只靠 keepalive 吊着的隧道。（`ClientAliveCountMax 3` 与 10 秒相乘得到的 30 秒，是 sshd 自己判定对端失联、回收反向端口的预算，跟 haproxy 这条空闲超时是两回事，不是它的下限。）另外，`timeout client-fin`/`timeout server-fin` 没有单独设置，默认继承这条 1 小时的值，所以一条已经半关闭（half-closed）的连接也可能在 haproxy 上挂到这么久。
 
 在 `gateway/test-env/gateway/Dockerfile` 的 `RUN` 里追加自签证书生成：
 
@@ -1403,11 +1494,13 @@ RUN mkdir -p /etc/haproxy/certs \
  && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
       -subj "/CN=gateway.test" \
       -addext "subjectAltName=DNS:gateway.test" \
-      -keyout /tmp/k.pem -out /tmp/c.pem 2>/dev/null \
+      -keyout /tmp/k.pem -out /tmp/c.pem \
  && cat /tmp/c.pem /tmp/k.pem > /etc/haproxy/certs/gateway.pem \
  && rm /tmp/k.pem /tmp/c.pem \
  && chmod 600 /etc/haproxy/certs/gateway.pem
 ```
+
+不接 `2>/dev/null`：`&&` 链本来就会让证书生成失败时整个构建失败，接了只是让失败失去输出，读不到 `openssl req` 报错的真正原因。
 
 生产环境用公共 CA 签发的证书，放在同一路径，不使用自签。
 

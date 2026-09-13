@@ -147,8 +147,32 @@ def compose(*args: str, check: bool = True,
     )
 
 
-# `ss -ltn` 是秒回的命令，20 秒足够宽松。
+# `ss -ltn` 与 `openssl x509` 都是秒回的命令，20 秒都算宽松。
 _LISTEN_TABLE_TIMEOUT = 20.0
+_CERT_FETCH_TIMEOUT = 20.0
+
+
+def _compose_capture(*cmd: str, timeout: float, purpose: str) -> str:
+    """跑一条限时的 `docker compose` 子命令，把输出原样捕获返回。
+
+    `gateway_listen_table()` 与 `gateway_tls_cert_pem()` 都要「秒回的容器内
+    命令，超时或非零退出码都必须把 docker 真正的输出带出来，不能吞掉」——
+    第三次抄这段逻辑就不该再抄，收进这一个函数里。`purpose` 只进错误文案
+    （例如「取 gateway 监听表」「取 gateway 证书」），不影响命令本身。
+    """
+    try:
+        out = compose(*cmd, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{purpose}超时：docker compose {' '.join(cmd)} "
+            f"超过 {timeout} 秒没有返回"
+        ) from exc
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"{purpose}失败，docker compose exec 退出码 {out.returncode}\n"
+            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
+        )
+    return out.stdout
 
 
 def gateway_listen_table() -> str:
@@ -168,20 +192,10 @@ def gateway_listen_table() -> str:
     pytest-timeout 从外面兜。两层守卫分工不同：这里的单次超时管一次卡死的调用，
     那边的循环期限管一连串飞快返回却始终不满足条件的调用。
     """
-    cmd = ("exec", "-T", "gateway", "ss", "-ltn")
-    try:
-        out = compose(*cmd, check=False, timeout=_LISTEN_TABLE_TIMEOUT)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"取 gateway 监听表超时：docker compose {' '.join(cmd)} "
-            f"超过 {_LISTEN_TABLE_TIMEOUT} 秒没有返回"
-        ) from exc
-    if out.returncode != 0:
-        raise RuntimeError(
-            f"取 gateway 监听表失败，docker compose exec 退出码 {out.returncode}\n"
-            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
-        )
-    return out.stdout
+    return _compose_capture(
+        "exec", "-T", "gateway", "ss", "-ltn",
+        timeout=_LISTEN_TABLE_TIMEOUT, purpose="取 gateway 监听表",
+    )
 
 
 def parse_listen_table(text: str) -> set[tuple[str, int]]:
@@ -408,10 +422,29 @@ class _TlsRelay:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
 
-        asyncio.run_coroutine_threadsafe(_close(), self._loop).result(timeout=10)
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=10)
-        self._loop.close()
+        # 收尾的三步必须无论如何都跑完：_close() 或它的 result(timeout=10)
+        # 一旦抛出，若不用 try/finally 包住后面几步，stop()/join()/close() 会被
+        # 跳过，daemon 线程会带着 run_forever() 陪到整个会话结束。
+        # join 超时的分支单独处理：这时 loop 仍在跑，loop.close() 会抛
+        # "Cannot close a running event loop"，那是一条误导性的第二异常，
+        # 不能盖过原始错误——所以只在线程真正停下之后才关 loop。
+        error: Exception | None = None
+        try:
+            asyncio.run_coroutine_threadsafe(_close(), self._loop).result(timeout=10)
+        except Exception as exc:
+            error = exc
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=10)
+            if not self._thread.is_alive():
+                self._loop.close()
+            elif error is None:
+                error = RuntimeError(
+                    "TLS 中继的事件循环线程在 10 秒内没有停下，"
+                    "已跳过 loop.close() 以避免遮盖这个超时"
+                )
+        if error is not None:
+            raise error
 
 
 @pytest.fixture
@@ -423,10 +456,6 @@ def tls_wrap(harness):
         yield port
     finally:
         relay.stop()
-
-
-# `openssl x509` 是秒回的命令，与取监听表的超时给同一个量级。
-_CERT_FETCH_TIMEOUT = 20.0
 
 
 @pytest.fixture(scope="session")
@@ -441,18 +470,8 @@ def gateway_tls_cert_pem(harness) -> str:
     session 作用域：每次跑测试只问容器要一次。镜像重建会重新生成证书，
     这里现取而不是把证书内容抄进代码里，测试就不会钉死在某个指纹上。
     """
-    cmd = ("exec", "-T", "gateway", "openssl", "x509",
-           "-in", "/etc/haproxy/certs/gateway.pem")
-    try:
-        out = compose(*cmd, check=False, timeout=_CERT_FETCH_TIMEOUT)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"取 gateway 证书超时：docker compose {' '.join(cmd)} "
-            f"超过 {_CERT_FETCH_TIMEOUT} 秒没有返回"
-        ) from exc
-    if out.returncode != 0:
-        raise RuntimeError(
-            f"取 gateway 证书失败，docker compose exec 退出码 {out.returncode}\n"
-            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
-        )
-    return out.stdout
+    return _compose_capture(
+        "exec", "-T", "gateway", "openssl", "x509",
+        "-in", "/etc/haproxy/certs/gateway.pem",
+        timeout=_CERT_FETCH_TIMEOUT, purpose="取 gateway 证书",
+    )
