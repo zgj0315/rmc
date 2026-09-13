@@ -15,7 +15,7 @@
 - 反向端口绑 `0.0.0.0`，公网可达：绑定地址由服务端的 `GatewayPorts yes` 决定，客户端传什么地址都不影响结果。端口仍逐账号只放行一个，由 `Match User` 块中**裸端口形式**的 `PermitListen`（`PermitListen 22001`，不带地址）限定；带地址的形式不能用，通配绑定会在 `GatewayPorts` 被读到之前先一层被拒。把端口收回内网网卡或限定来源网段，是方案 7.3 明确推后的事项，本计划不做。
 - 隧道账号用户名必须匹配 `tunnel-*`，shell 为 `/usr/sbin/nologin`，`ForceCommand /bin/false`。
 - 隧道账号只允许 remote forwarding，端口由 `Match User` 块的 `PermitListen` 逐账号限定。
-- `ClientAliveInterval 10` 与 `ClientAliveCountMax 3`，异常断线后 30 秒内回收反向端口。
+- `ClientAliveInterval 10` 与 `ClientAliveCountMax 3`；异常断线后回收反向端口 Task 6 实测约 80 秒，不是 10×3=30 秒算出来的那个数，机制、测量方法与保留原值的取舍理由见 `docs/方案设计.md` §4.2。
 - `LoginGraceTime 20`、`MaxAuthTries 3`。
 - V1 不做 pam_faillock 与 haproxy 按来源 IP 限速，见方案 7.3。
 - `sshd-tunnel` 的配置文件、host key、pid 文件必须与系统自带的 sshd 完全独立。
@@ -1485,7 +1485,7 @@ backend sshd_tunnel
     server local 127.0.0.1:2222
 ```
 
-`timeout client/server` 取 1 小时：真正要盖过的下限是 sshd 的 `ClientAliveInterval 10`——keepalive 每 10 秒有一次流量经过 haproxy，只要这条空闲超时长于 10 秒，keepalive 本身就会不断把它的计时器刷新回零，连接就不会被判定为空闲。1 小时不是这条下限本身，而是留出的余量，用来扛住一条确实长时间没有任何业务流量、只靠 keepalive 吊着的隧道。（`ClientAliveCountMax 3` 与 10 秒相乘得到的 30 秒，是 sshd 自己判定对端失联、回收反向端口的预算，跟 haproxy 这条空闲超时是两回事，不是它的下限。）另外，`timeout client-fin`/`timeout server-fin` 没有单独设置，默认继承这条 1 小时的值，所以一条已经半关闭（half-closed）的连接也可能在 haproxy 上挂到这么久。
+`timeout client/server` 取 1 小时：真正要盖过的下限是 sshd 的 `ClientAliveInterval 10`——keepalive 每 10 秒有一次流量经过 haproxy，只要这条空闲超时长于 10 秒，keepalive 本身就会不断把它的计时器刷新回零，连接就不会被判定为空闲。1 小时不是这条下限本身，而是留出的余量，用来扛住一条确实长时间没有任何业务流量、只靠 keepalive 吊着的隧道。（`ClientAliveCountMax 3` 与 10 秒相乘看着是 30 秒，但那不是 sshd 自己判定对端失联、回收反向端口实际花的时间——Task 6 实测约 80 秒，机制见 `docs/方案设计.md` §4.2。不管这个预算实际是多少，它跟 haproxy 这条空闲超时都是两回事，不是它的下限。）另外，`timeout client-fin`/`timeout server-fin` 没有单独设置，默认继承这条 1 小时的值，所以一条已经半关闭（half-closed）的连接也可能在 haproxy 上挂到这么久。
 
 在 `gateway/test-env/gateway/Dockerfile` 的 `RUN` 里追加自签证书生成：
 
@@ -2015,7 +2015,9 @@ from conftest import (
     popen_ssh_password, reverse_port_registered,
 )
 
-RECLAIM_BUDGET = 45  # ClientAliveInterval 10 × CountMax 3 再留余量
+# 原定 45（10×3=30 再留余量）已被 Task 6 实测证伪：实测回收约 80 秒。110 留足
+# 余量且低于客户端 120 秒端口占用重试上限，见 docs/方案设计.md §4.2。
+RECLAIM_BUDGET = 110
 
 
 def start_tunnel() -> subprocess.Popen:
@@ -2082,11 +2084,14 @@ cd gateway && .venv/bin/python -m pytest tests/test_zombie_port.py -v
 
 - [ ] **Step 3: 记录预算**
 
-在 `gateway/sshd_tunnel_config` 的 ClientAlive 两行上方加注释：
+在 `gateway/sshd_tunnel_config` 的 ClientAlive 两行上方加注释，记录实测耗时（不是
+`ClientAliveInterval × ClientAliveCountMax` 算出来的 30 秒）与保留原值的取舍理由，
+不要照抄下面这个占位——实测数字与最终措辞以 Task 6 报告与 `docs/方案设计.md` §4.2 为准：
 
 ```
-# 客户端静默断线后 30 秒内回收反向端口。改动这两行会拉长现场重连时间，
-# 由 tests/test_zombie_port.py 守护。
+# 实测客户端静默断线后约 80 秒回收反向端口（不是 10×3=30 秒算出来的那个数，
+# 见 docs/方案设计.md §4.2）。改动这两行会影响现场重连时间与维护会话的稳定性，
+# 由 tests/test_zombie_port.py 守护，取舍理由见本文件这两行上方的注释。
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -2096,13 +2101,13 @@ cd gateway/test-env && docker compose up -d --build gateway
 cd .. && .venv/bin/python -m pytest tests/test_zombie_port.py -v
 ```
 
-预期：2 passed，单个用例耗时约 40 秒。
+预期：2 passed，单个用例耗时约 80 秒（实测的回收耗时，不是按 30 秒预算估的 40 秒）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add gateway/sshd_tunnel_config gateway/tests/test_zombie_port.py
-git commit -m "test(gateway): 僵尸反向端口在 30 秒内被回收"
+git commit -m "test(gateway): 僵尸反向端口回收测试"
 ```
 
 ---
@@ -2565,7 +2570,7 @@ ssh -p 22001 root@gateway.company.com
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 客户端报端口占用 | 上一条隧道静默断开，端口未回收 | 等 30 秒，客户端会自动重试；`tunnel-status.sh` 可看在线状态 |
+| 客户端报端口占用 | 上一条隧道静默断开，端口未回收 | 等约 90 秒（回收实测约 80 秒，非 30 秒，见 `docs/方案设计.md` §4.2），客户端会在 120 秒重试上限内自动重试；`tunnel-status.sh` 可看在线状态 |
 | 客户端认证失败 | 口令错误或账号被锁 | `passwd -S <username>` 看锁定状态 |
 | 工程师连 22001 连不上 | 隧道不在线，端口尚未创建 | `tunnel-status.sh` 看该账号是否 online，再让现场人员开启远程维护 |
 | 工程师连上 22001 但立即断开 | 隧道在线但一体机不可达 | 让现场人员看客户端是否为橙色的一体机不可达 |
