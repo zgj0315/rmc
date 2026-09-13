@@ -127,15 +127,50 @@ def compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
+def gateway_listen_table() -> str:
+    """Gateway 容器里 `ss -ltn` 的原始输出。
+
+    断言监听地址的用例都从这里取表，失败时把整张表贴进断言消息，才看得出
+    端口到底绑在哪个地址上。
+    """
+    return compose("exec", "-T", "gateway", "ss", "-ltn", check=False).stdout
+
+
 def port_listening_in_gateway(port: int) -> bool:
-    out = compose("exec", "-T", "gateway", "ss", "-ltn", check=False)
-    return f"127.0.0.1:{port}" in out.stdout
+    return f"127.0.0.1:{port}" in gateway_listen_table()
+
+
+def ensure_engineer_keypair() -> None:
+    """缺失时生成工程师测试密钥。
+
+    私钥不入库，所以新 clone 出来的仓库里 engineer-keys/ 是空的。必须在
+    compose 起容器之前生成：compose 把这个目录挂进 gateway 容器，
+    entrypoint 要从里面读 authorized_keys。
+    """
+    if ENG_KEY.exists():
+        return
+    ENG_KEY.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ENG_KEY)],
+        check=True, capture_output=True, text=True,
+    )
+    (ENG_KEY.parent / "authorized_keys").write_bytes(
+        ENG_KEY.with_suffix(".pub").read_bytes())
 
 
 @pytest.fixture(scope="session")
 def harness():
+    ensure_engineer_keypair()
     compose("down", "-v", check=False)
-    compose("up", "-d", "--build")
+    # 不用 check=True：它与 capture_output=True 一起会把构建失败变成一个不带
+    # 输出的 CalledProcessError，docker 真正的报错完全看不到。Task 3 到 7 都
+    # 依赖这个固件，这里必须把 docker 的 stdout/stderr 原样抛出来。
+    up = compose("up", "-d", "--build", check=False)
+    if up.returncode != 0:
+        raise RuntimeError(
+            f"docker compose up 失败，退出码 {up.returncode}\n"
+            f"--- stdout ---\n{up.stdout}\n--- stderr ---\n{up.stderr}"
+        )
     try:
         wait_port(TUNNEL_SSHD)
         wait_port(ENGINEER_SSHD)

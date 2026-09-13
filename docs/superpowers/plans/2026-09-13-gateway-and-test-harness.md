@@ -487,6 +487,10 @@ def engineer_proxy_option() -> list[str]:
 
     ssh 的 -J 不会把命令行上的 -i 传给跳板那一跳，所以这里显式写 ProxyCommand，
     让跳板连接用 test-env/engineer-keys 里的私钥做公钥认证。
+
+工程师密钥对不入库：整个 `engineer-keys/` 目录被忽略，由 `conftest.py` 的
+`ensure_engineer_keypair()` 在 `harness` 起环境前按需生成，缺失时才生成。
+只提交公钥会让新克隆拿到一把配不上私钥的公钥，所有工程师入口测试必然失败。
     """
     return ["-o", "ProxyCommand=ssh {} -W %h:%p -p {} eng@{}".format(
         " ".join(ENG_COMMON), ENGINEER_SSHD, HOST)]
@@ -520,7 +524,15 @@ def port_listening_in_gateway(port: int) -> bool:
 @pytest.fixture(scope="session")
 def harness():
     compose("down", "-v", check=False)
-    compose("up", "-d", "--build")
+    ensure_engineer_keypair()
+    # 不用 check=True：那样 docker 的真实报错会被 capture_output 吞掉，
+    # 只剩一个不带上下文的 CalledProcessError。Tasks 3-7 都依赖这个固件。
+    up = compose("up", "-d", "--build", check=False)
+    if up.returncode != 0:
+        raise RuntimeError(
+            "docker compose up 失败（退出码 %d）\n--- stdout ---\n%s\n--- stderr ---\n%s"
+            % (up.returncode, up.stdout, up.stderr)
+        )
     try:
         wait_port(TUNNEL_SSHD)
         wait_port(ENGINEER_SSHD)
@@ -592,11 +604,17 @@ def test_reverse_port_appears_on_gateway_loopback(tunnel):
     assert port_listening_in_gateway(TUNNEL_PORT)
 
 
-def test_reverse_port_is_not_bound_on_external_interface(tunnel):
-    """GatewayPorts no 必须把监听限制在 loopback。"""
-    with pytest.raises(OSError):
-        with socket.create_connection(("127.0.0.1", TUNNEL_PORT), timeout=3):
-            pass
+def test_reverse_port_is_not_bound_on_a_wildcard_address(tunnel):
+    """GatewayPorts no 必须把监听限制在 loopback。
+
+    直接查 gateway 容器的监听表：22001 只能出现在 127.0.0.1 上，
+    不得出现 0.0.0.0 或 :: 的通配绑定。断言宿主连不上该端口是没有
+    约束力的，因为该端口本来就没有在 compose 中发布。
+    """
+    table = gateway_listen_table()
+    assert f"127.0.0.1:{TUNNEL_PORT}" in table, table
+    for wildcard in (f"0.0.0.0:{TUNNEL_PORT}", f"*:{TUNNEL_PORT}", f"[::]:{TUNNEL_PORT}"):
+        assert wildcard not in table, f"反向端口被绑到了通配地址 {wildcard}：\n{table}"
 
 
 def test_engineer_reaches_appliance_through_reverse_port(tunnel):
@@ -611,7 +629,7 @@ def test_engineer_reaches_appliance_through_reverse_port(tunnel):
     assert out.stdout.strip() == "c0001-a1"
 ```
 
-注：`test_reverse_port_is_not_bound_on_external_interface` 断言的是宿主无法直接连到 `TUNNEL_PORT`，因为该端口没有在 compose 中发布，只存在于 gateway 容器的 loopback 上。
+注：判断反向端口是否只绑 loopback，必须查 gateway 容器内的监听表，而不是断言宿主连不上该端口。后者没有约束力，因为该端口本来就没有在 compose 中发布，无论 `GatewayPorts` 怎么设都连不上。`conftest.py` 因此提供 `gateway_listen_table()` 回传容器内 `ss -ltn` 的原文，`port_listening_in_gateway()` 在其上做子串判断。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -808,13 +826,10 @@ services:
       - "127.0.0.1:8443:443"
 ```
 
-生成工程师测试密钥：
+忽略整个工程师密钥目录，密钥对由 `conftest.py` 的 `ensure_engineer_keypair()` 按需生成，不入库：
 
 ```bash
-mkdir -p gateway/test-env/engineer-keys
-ssh-keygen -q -t ed25519 -N '' -f gateway/test-env/engineer-keys/eng_ed25519
-cp gateway/test-env/engineer-keys/eng_ed25519.pub gateway/test-env/engineer-keys/authorized_keys
-printf 'engineer-keys/eng_ed25519\n' > gateway/test-env/.gitignore
+printf 'engineer-keys/\n' > gateway/test-env/.gitignore
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -823,7 +838,12 @@ printf 'engineer-keys/eng_ed25519\n' > gateway/test-env/.gitignore
 cd gateway && .venv/bin/python -m pytest tests/test_tunnel.py -v
 ```
 
-预期：前四个用例通过；`test_engineer_reaches_appliance_through_reverse_port` 仍失败，工程师入口在 Task 5 完成。先用 `-k "not engineer"` 确认其余全绿。
+预期：5 passed，全部通过。
+
+注意 `test_engineer_reaches_appliance_through_reverse_port` 在本任务就会通过，尽管
+`sshd_engineer.conf` 此时只是个只设了 `PasswordAuthentication no` 的占位：默认 sshd
+仍允许公钥认证与 TCP 转发，而 `ssh -W` 不需要 shell，所以跳板此刻是通的。它此时的绿
+不构成对工程师入口的验证，Task 5 装上真正的配置后必须重跑它，那才是它真正把关的时刻。
 
 - [ ] **Step 5: 提交**
 
@@ -1784,13 +1804,6 @@ jobs:
           sudo apt-get install -y openssh-client
           python3 -m venv gateway/.venv
           gateway/.venv/bin/pip install -r gateway/tests/requirements.txt
-
-      - name: 生成工程师测试密钥
-        run: |
-          mkdir -p gateway/test-env/engineer-keys
-          ssh-keygen -q -t ed25519 -N '' -f gateway/test-env/engineer-keys/eng_ed25519
-          cp gateway/test-env/engineer-keys/eng_ed25519.pub \
-             gateway/test-env/engineer-keys/authorized_keys
 
       - name: 单元测试
         run: cd gateway && .venv/bin/python -m pytest tests/test_registry.py -v

@@ -1,10 +1,7 @@
-import socket
-
-import pytest
-
 from conftest import (
     APPLIANCE_PW, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
-    engineer_proxy_option, port_listening_in_gateway, run_ssh_password,
+    engineer_proxy_option, gateway_listen_table, port_listening_in_gateway,
+    run_ssh_password,
 )
 
 
@@ -27,11 +24,18 @@ def test_reverse_port_appears_on_gateway_loopback(tunnel):
     assert port_listening_in_gateway(TUNNEL_PORT)
 
 
-def test_reverse_port_is_not_bound_on_external_interface(tunnel):
-    """GatewayPorts no 必须把监听限制在 loopback。"""
-    with pytest.raises(OSError):
-        with socket.create_connection(("127.0.0.1", TUNNEL_PORT), timeout=3):
-            pass
+def test_reverse_port_is_not_bound_on_a_wildcard_address(tunnel):
+    """GatewayPorts no 必须把监听限制在 loopback。
+
+    别改回「从宿主连 TUNNEL_PORT，断言连不上」：那个断言恒真，证明不了任何事。
+    22001 从未在 compose 里发布，宿主无论如何都连不到它——就算 GatewayPorts 改成
+    yes、端口真绑到了 0.0.0.0，宿主那一侧的表现也一模一样。要看出区别，只能进
+    容器查监听表。
+    """
+    table = gateway_listen_table()
+    assert f"127.0.0.1:{TUNNEL_PORT}" in table, table
+    for wildcard in (f"0.0.0.0:{TUNNEL_PORT}", f"*:{TUNNEL_PORT}", f"[::]:{TUNNEL_PORT}"):
+        assert wildcard not in table, table
 
 
 def test_engineer_reaches_appliance_through_reverse_port(tunnel):
