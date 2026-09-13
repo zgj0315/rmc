@@ -11,3 +11,6 @@ design/*.dc.html
 .worktrees/
 .superpowers/
 gateway/.venv/
+
+# Rust
+/target/

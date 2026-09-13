@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/rmc-core"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.89"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+thiserror = "2"
+zeroize = { version = "1", features = ["std"] }
+tracing = "0.1"
