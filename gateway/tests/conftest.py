@@ -178,7 +178,7 @@ def gateway_tunnel_status() -> str:
     """Gateway 容器里 `tunnel-status.sh` 的原始输出。
 
     Task 7 的 bats 套件只在容器里跑，从来没有一次真实的 ssh 隧道在线过——
-    12 条（后来 19 条）用例全部只验证过 offline 分支的格式。online 分支
+    当时的全部用例全部只验证过 offline 分支的格式。online 分支
     （`pgrep -u <user> -n sshd` 真的命中一个进程）完全没有测过：如果它从来
     不命中，`tunnel-status.sh` 会把所有账号永远报成 offline，而这套 bats
     环境自己测不出这一点，因为它压根不会真的建立 ssh 会话。这不是假设的

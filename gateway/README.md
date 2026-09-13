@@ -142,6 +142,7 @@ ssh -p 22001 root@gateway.company.com
 | 工程师连 22001 连不上 | 隧道不在线，端口尚未创建 | `tunnel-status.sh` 看该账号是否 online，再让现场人员开启远程维护 |
 | 工程师连上 22001 但立即断开 | 隧道在线但一体机不可达 | 让现场人员看客户端是否为橙色的一体机不可达 |
 | haproxy 起不来 | 证书路径或权限不对 | `haproxy -c -f /etc/haproxy/haproxy.cfg` |
+| haproxy 配置校验通过却仍起不来 | `chroot` 目录缺失或属主不对等只在运行期暴露的问题 | `haproxy -c` 对这类问题会返回 0（实测：`chroot` 指向不存在的目录时它照样报「Configuration file is valid」），必须看 `systemctl status haproxy` 与 `journalctl -u haproxy`，真正的 `[ALERT] Cannot chroot(...)` 只在那里 |
 
 ## 本地测试
 

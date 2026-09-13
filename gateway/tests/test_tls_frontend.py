@@ -1,3 +1,4 @@
+import pathlib
 import socket
 import ssl
 import subprocess
@@ -10,6 +11,32 @@ from conftest import (
     APPLIANCE_SSHD, HAPROXY, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_USER,
     _stop_tunnel, popen_ssh_password, reverse_port_registered,
 )
+
+
+HAPROXY_CFG = pathlib.Path(__file__).resolve().parents[1] / "haproxy.cfg"
+
+# 这三行是本分支上唯一一组安全相关、却没有任何测试钉住的指令。三条 TLS 端到端
+# 用例在把它们全删掉之后照样全绿——haproxy 以 root 跑起来，TLS 一样握手成功。
+# 而 README 的部署步骤会整份覆盖 Debian 自带的 haproxy.cfg，那份配置本来就带着
+# 这三行，所以删掉它们不是"少做了一项加固"，是把这台互联网暴露的 TLS 终止器
+# 从 haproxy 用户退回 root——一次权限回归。按本套件既有的钉点做法（见
+# test_tunnel_restrictions.py 的指令表），用一条纯文本断言把它们钉住。
+_PRIVILEGE_DIRECTIVES = ["user haproxy", "group haproxy", "chroot /var/lib/haproxy"]
+
+
+@pytest.mark.parametrize("directive", _PRIVILEGE_DIRECTIVES)
+def test_haproxy_drops_privilege_in_shipped_config(directive):
+    """haproxy.cfg 必须保留降权三行，删掉任意一行本用例变红。
+
+    刻意不依赖 harness：这钉的是入库文件的内容，不是运行期行为，容器起不起来
+    都该拦得住。运行期的 uid 没有断言——worker 真以 haproxy 身份运行这件事
+    只人工用 ps 确认过，见 gateway/haproxy.cfg 上方的注释。
+    """
+    lines = [ln.strip() for ln in HAPROXY_CFG.read_text().splitlines()]
+    assert directive in lines, (
+        f"gateway/haproxy.cfg 里少了 `{directive}`。这三行缺任意一行，"
+        f"443 上的 TLS 终止器就会以 root 常驻。"
+    )
 
 
 def test_tls_handshake_succeeds_and_presents_gateway_test_cert(harness, gateway_tls_cert_pem):

@@ -31,7 +31,11 @@ case "$rc" in
         printf '已移除端口放行并 reload。\n'
         ;;
     2)
-        printf '端口放行本来就不在（配置无变化）。\n'
+        # 与 enroll 同理：无变化也要 reload。上一次 reload 失败后重跑时，
+        # 磁盘上的放行已经移除，跳过 reload 会让运行中的 sshd 继续认可
+        # 这个已被吊销账号的端口，而脚本报成功。
+        reload_sshd
+        printf '端口放行本来就不在（配置无变化），已重新 reload 以确保运行中的 sshd 与配置一致。\n'
         ;;
     *)
         die "重写受管配置返回了意料之外的状态码 $rc" "$rc"

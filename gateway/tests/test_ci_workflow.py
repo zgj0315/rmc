@@ -6,7 +6,7 @@
 `gateway/tests/conftest.py` 的 session 级 `harness` 固件在 `finally` 里默认执行
 `compose down -v`，除非环境变量 `RMC_KEEP_ENV=1`。CI 的 "集成测试" 步骤会触发这个固件；
 若它跑完时没有 `RMC_KEEP_ENV=1`，容器在该步骤结束时就被删掉了。后面的 "脚本测试"
-步骤用 `docker compose exec -T gateway bats ...` 对着一个已经不存在的容器执行，19 条
+步骤用 `docker compose exec -T gateway bats ...` 对着一个已经不存在的容器执行，整套
 bats 用例从未真的跑过；`if: failure()` 的日志导出步骤同样对着空容器，导出不出任何
 日志。
 

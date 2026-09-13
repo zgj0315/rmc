@@ -337,7 +337,7 @@ def tunnel_effective_config(harness):
 #   约 80-90 秒是客户在看过"调小间隔换来维护会话可能被中途打断"这个代价之后
 #   拍板接受的数字（见 `sshd_tunnel_config` 这两行上方的注释、docs/方案设计.md
 #   §4.2）。把 `ClientAliveInterval` 改成 4，回收时间会精确降到约 32 秒——
-#   `test_zombie_port.py` 110 秒的预算依然通过，63 个用例依然全绿，这个决定
+#   `test_zombie_port.py` 110 秒的预算依然通过，整套用例依然全绿，这个决定
 #   却已经被悄悄推翻。
 # - listenaddress 127.0.0.1:2222：唯一挡着「sshd-tunnel 直接监听公网网卡、
 #   在 haproxy 旁边裸奔明文 SSH」这件事的一行。改成 `0.0.0.0` 之后，所有端到

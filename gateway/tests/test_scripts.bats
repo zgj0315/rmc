@@ -47,6 +47,11 @@ CONF
 }
 
 teardown() {
+    # setup() 的 skip 不会阻止 teardown 运行（bats-core 的行为），所以这里必须
+    # 各自拦一次。少了这一行，在宿主上以 root 跑本文件时 21 条全部 skip，
+    # 但 userdel 照样执行 21 次——而最可能同时装着 checkout 和真实 tunnel-*
+    # 账号的机器，正是 Gateway 本身。
+    [ -f /.dockerenv ] || return 0
     userdel tunnel-new 2>/dev/null || true
 }
 

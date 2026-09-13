@@ -1,7 +1,9 @@
 #!/bin/bash
 # 依 registry.toml 开通一个隧道账号。
 # 用法：enroll-account.sh <username>
-# 幂等：已存在的用户不会被重建，配置无变化时不 reload。
+# 幂等：已存在的用户不会被重建。配置无变化时仍然 reload——上一次 reload 失败后
+# 重跑本脚本时，磁盘上的配置已经是新的，若此时跳过 reload，运行中的 sshd 会
+# 永远停在旧配置上，而脚本却报成功。
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 require_root
