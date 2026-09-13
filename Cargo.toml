@@ -12,3 +12,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync"
 thiserror = "2"
 zeroize = { version = "1", features = ["std"] }
 tracing = "0.1"
+rand = "0.8"

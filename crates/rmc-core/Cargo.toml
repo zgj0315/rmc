@@ -10,6 +10,7 @@ tokio.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 tracing.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
