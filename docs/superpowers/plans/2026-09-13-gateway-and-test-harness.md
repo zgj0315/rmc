@@ -1541,6 +1541,7 @@ git commit -m "feat(gateway): haproxy 在 443 终止 TLS 并转给 sshd-tunnel"
 - Delete: `gateway/test-env/.gitignore`
 - Modify: `gateway/tests/conftest.py`
 - Modify: `gateway/tests/test_tls_frontend.py`（Task 4 的反向端口查询改走新 helper）
+- Modify: `gateway/tests/test_tunnel_restrictions.py`（Task 3 的 `test_local_forwarding_is_refused` 把 `-L` 的目标写死成 `appliance:22`；本任务把一体机挪到 61001 之后那是个关着的端口，会让它 docstring 里「目标必须是真开着的端口，`data == b""` 才有区分度」这条论证失效，所以目标跟着改成 `appliance:61001`，断言不动）
 - Test: `gateway/tests/test_tunnel.py`
 
 **Interfaces:**
@@ -1707,10 +1708,18 @@ GatewayPorts yes
 
 ```
 # 以下 Match 块由 scripts/enroll-account.sh 依 registry.toml 生成，勿手工编辑。
-# PermitListen 必须写成不带地址的裸端口形式。GatewayPorts yes 要把端口绑到通配
-# 地址上，而带地址的形式（<地址>:<端口>）会在 GatewayPorts 被读到之前先一层把
-# 通配绑定拒掉，实测服务端直接记录该转发请求被拒。地址不受限制，端口仍然逐账号
-# 只放行一个。
+# PermitListen 必须写成不带地址的裸端口形式。两条理由都在这套 OpenSSH（9.2p1）
+# 上实测过：
+# 一、带地址的形式（<地址>:<端口>）只认客户端请求里的那个字面地址，不做解析也
+#     不做模式匹配。现场的命令 `ssh -R 22001:127.0.0.1:61001 ...` 不写监听地址，
+#     客户端据此请求的监听地址是 "localhost"，与放行项 `127.0.0.1:22001` 字面不
+#     相等，服务端直接拒掉并记录 "to remote forward to host localhost port 22001,
+#     but the request was denied"。
+# 二、GatewayPorts yes 之下实际绑在哪个地址上完全由服务端决定（恒为通配），客户端
+#     请求里的地址不影响绑定结果——实测带地址的放行项配上 `-R 127.0.0.1:22001:...`
+#     也照样绑到 0.0.0.0/[::]。所以在 PermitListen 里限制地址一分安全都不买，只会
+#     挡掉合法客户端。
+# 地址因此不受限制，端口仍然逐账号只放行一个。
 # BEGIN RMC MANAGED
 Match User tunnel-zhang
     PermitListen 22001
@@ -1840,10 +1849,14 @@ Debian 的 `/etc/ssh/sshd_config` 里 `Port` 是注释掉的，所以 `sshd_conf
 
 ```bash
 cd gateway/test-env && docker compose up -d --build appliance
-docker compose exec -T appliance ss -ltn
+# 不能用 `ss -ltn`：appliance 镜像只装了 openssh-server，没有 iproute2（有 ss 的是
+# gateway 镜像），执行会得到一句 exec: "ss": executable file not found in $PATH，
+# 看起来像容器坏了，其实只是缺个包。用内核自己的表，端口是十六进制。
+docker compose exec -T appliance sh -c 'cat /proc/net/tcp /proc/net/tcp6' \
+  | awk '$4=="0A" {print $2}'
 ```
 
-预期：表里有 `*:61001`（或 `0.0.0.0:61001` 与 `[::]:61001`），没有 22。宿主侧 `127.0.0.1:2322` 与 `APPLIANCE_SSHD` 不变，所以 `harness` 的 `wait_port(APPLIANCE_SSHD)` 与所有 `-R ...:{HOST}:{APPLIANCE_SSHD}` 都不用改。
+预期：输出里有 `00000000:EE49`（`0.0.0.0:61001`）与 IPv6 的同一个端口（`EE49` = 61001），没有 `:0016`（22）。此外会有一行 `0B00007F:xxxx`，那是 docker 内建 DNS 的 `127.0.0.11`，与 sshd 无关。宿主侧 `127.0.0.1:2322` 与 `APPLIANCE_SSHD` 不变，所以 `harness` 的 `wait_port(APPLIANCE_SSHD)` 与所有 `-R ...:{HOST}:{APPLIANCE_SSHD}` 都不用改；顺手从宿主连一次 `127.0.0.1:2322` 读到 SSH 横幅，就同时验证了 `2322 → 61001` 这条映射。
 
 - [ ] **Step 6: 拆掉 conftest 里的工程师部件，把反向端口查询集中到新 helper**
 
@@ -1916,12 +1929,12 @@ def harness():
         yield proc
 ```
 
-Task 4 的 `gateway/tests/test_tls_frontend.py` 也查反向端口，import 与调用一起改：
+Task 4 的 `gateway/tests/test_tls_frontend.py` 也查反向端口。这个文件在 Task 4 的评审里已经改过一轮，下面是它**改完本任务之后的真实现状**（本任务只动了 import 里的一个名字与循环里的一个调用）：
 
 ```python
 from conftest import (
     APPLIANCE_SSHD, HAPROXY, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_USER,
-    popen_ssh_password, reverse_port_registered,
+    _stop_tunnel, popen_ssh_password, reverse_port_registered,
 )
 ```
 
@@ -1929,12 +1942,22 @@ from conftest import (
     try:
         deadline = time.time() + 20
         while time.time() < deadline:
+            if proc.poll() is not None:
+                pytest.fail(
+                    f"隧道进程提前退出（退出码 {proc.returncode}）：{output()}")
             if reverse_port_registered(TUNNEL_PORT):
                 break
             time.sleep(0.5)
         else:
-            pytest.fail(f"经 TLS 建立的反向端口未出现：{proc.stderr.read()}")
+            pytest.fail(f"经 TLS 建立的反向端口未出现：{output()}")
+    finally:
+        try:
+            _stop_tunnel(proc)
+        finally:
+            log.close()
 ```
+
+**这条失败路径不许改回读 `proc.stderr`。** 该进程是 `stdout=log, stderr=subprocess.STDOUT` 起的常驻 ssh：`proc.stderr` 是 `None`，读它会在 f-string 里抛 `AttributeError`；就算接了管道，读一个还活着的进程的管道会挂住，`pytest.fail` 永远到不了，整个套件跟着挂死而不是报红——这正是 Task 4 评审修掉的那个 bug。输出走临时文件、失败信息走 `output()`，`finally` 里的 `_stop_tunnel(proc)` 也一并保留（它要等反向端口真的消失，否则会污染按字母序紧随其后的 `test_tunnel.py`），所以 import 里的 `_stop_tunnel` 不能漏。
 
 `test_tls_frontend.py` 的另外两个用例（TLS 握手、SSH banner）不碰监听表，不动。
 
