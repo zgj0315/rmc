@@ -136,28 +136,44 @@ def gateway_listen_table() -> str:
     return compose("exec", "-T", "gateway", "ss", "-ltn", check=False).stdout
 
 
-def port_listening_in_gateway(port: int) -> bool:
-    """Gateway 容器里是否有监听套接字精确绑在 `127.0.0.1:<port>` 上。
+def parse_listen_table(text: str) -> set[tuple[str, int]]:
+    """把 `ss -ltn` 的输出解析成 `{(地址, 端口)}` 集合，端口是 int。
 
-    必须逐行解析、把 Local Address:Port 整列当一个值来比，不能在整张表上做子串
-    匹配。具体的坑：子串查端口 22 会命中 `127.0.0.1:2222` 那一行，于是这个
-    helper 会报告一个根本不存在的监听端口，让调用它的用例在什么都没验证的情况
-    下变绿。Task 3 到 7 共用这个 helper，443 与 22 这类短端口号都会被查到，所以
-    别把它简化回 `in` 匹配。
+    纯函数，不碰 docker，所以能用固定样本做单元测试（见 test_listen_table.py）。
+    查监听端口必须走这里的整值比较，别退回在整张表上做子串匹配——这个 helper
+    因为同一个结构性原因错过两次：子串查端口 22 会命中 `127.0.0.1:2222` 那一行，
+    查 999 会命中 `127.0.0.1:9999`，于是调用方会拿到一个根本不存在的监听端口，
+    让用例在什么都没验证的情况下变绿。Task 4 要查 443、Task 5 要动 22，正是这类
+    短端口号。
+
+    地址按 `ss` 打印的原样保留，包括 IPv6 的方括号（`[::]`）与通配的 `*`；
+    IPv6 地址自带冒号，所以端口从最后一个冒号切开。表头与任何解析不出地址的行
+    一律跳过，不抛异常。
     """
-    want = str(port)
-    for line in gateway_listen_table().splitlines():
+    entries: set[tuple[str, int]] = set()
+    for line in text.splitlines():
         fields = line.split()
         # ss 的列：State / Recv-Q / Send-Q / Local Address:Port / Peer Address:Port。
-        # 表头与任何解析不出地址的行一律跳过，不让它抛异常。
         if len(fields) < 4:
             continue
-        addr, sep, listen_port = fields[3].rpartition(":")
-        if not sep:
+        addr, sep, port = fields[3].rpartition(":")
+        if not sep or not addr:
             continue
-        if addr == HOST and listen_port == want:
-            return True
-    return False
+        try:
+            entries.add((addr, int(port)))
+        except ValueError:
+            continue
+    return entries
+
+
+def port_listening_in_gateway(port: int, address: str = HOST) -> bool:
+    """Gateway 容器里是否有监听套接字精确绑在 `address:port` 上。
+
+    `address` 默认 loopback。要断言某端口绑在通配地址上（Task 4 的 443、
+    Task 5 的 22），传 `address="0.0.0.0"` / `"*"` / `"[::]"`，而不要去匹配
+    地址字面量的子串。
+    """
+    return (address, port) in parse_listen_table(gateway_listen_table())
 
 
 def ensure_engineer_keypair() -> None:

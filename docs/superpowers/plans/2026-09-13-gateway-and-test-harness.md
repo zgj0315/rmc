@@ -629,7 +629,13 @@ def test_engineer_reaches_appliance_through_reverse_port(tunnel):
     assert out.stdout.strip() == "c0001-a1"
 ```
 
-注：判断反向端口是否只绑 loopback，必须查 gateway 容器内的监听表，而不是断言宿主连不上该端口。后者没有约束力，因为该端口本来就没有在 compose 中发布，无论 `GatewayPorts` 怎么设都连不上。`conftest.py` 因此提供 `gateway_listen_table()` 回传容器内 `ss -ltn` 的原文，`port_listening_in_gateway()` 在其上**逐行解析 Local Address:Port 字段并整值比较**。不能用子串判断：查 22 会命中 `127.0.0.1:2222`，查 22 或 443 时会得到假通过。
+注：判断反向端口是否只绑 loopback，必须查 gateway 容器内的监听表，而不是断言宿主连不上该端口。后者没有约束力，因为该端口本来就没有在 compose 中发布，无论 `GatewayPorts` 怎么设都连不上。`conftest.py` 因此把这件事拆成三层：`gateway_listen_table()` 只负责取回容器内 `ss -ltn` 的原文；
+`parse_listen_table(text)` 是纯函数，逐行解析出 `(address, port)` 集合，可脱离 docker 单测；
+`port_listening_in_gateway(port, address="127.0.0.1")` 在解析结果上做**整值比较**。
+
+不能用子串判断，这个辅助已经两次因此出错：查 22 会命中 `127.0.0.1:2222`，查 999 会命中
+`127.0.0.1:9999`。Task 4 要查 443、Task 5 要处理 22，都落在易碰撞的短端口上。纯解析函数
+由 `tests/test_listen_table.py` 用固定的 `ss` 样本文本覆盖，不起容器，因此回归能被秒级捕获。
 
 - [ ] **Step 2: 运行测试确认失败**
 

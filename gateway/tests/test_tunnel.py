@@ -1,7 +1,7 @@
 from conftest import (
     APPLIANCE_PW, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
-    engineer_proxy_option, gateway_listen_table, port_listening_in_gateway,
-    run_ssh_password,
+    engineer_proxy_option, gateway_listen_table, parse_listen_table,
+    port_listening_in_gateway, run_ssh_password,
 )
 
 
@@ -31,11 +31,16 @@ def test_reverse_port_is_not_bound_on_a_wildcard_address(tunnel):
     22001 从未在 compose 里发布，宿主无论如何都连不到它——就算 GatewayPorts 改成
     yes、端口真绑到了 0.0.0.0，宿主那一侧的表现也一模一样。要看出区别，只能进
     容器查监听表。
+
+    也别改成匹配地址字面量的子串（`"0.0.0.0:22001" not in table`）：那种写法对
+    22001 恰好成立，但不可移植——查 222 会命中 `0.0.0.0:2223`，Task 4 的 443 与
+    Task 5 的 22 都会被误判。这里走 parse_listen_table() 的整值比较。
     """
     table = gateway_listen_table()
-    assert f"127.0.0.1:{TUNNEL_PORT}" in table, table
-    for wildcard in (f"0.0.0.0:{TUNNEL_PORT}", f"*:{TUNNEL_PORT}", f"[::]:{TUNNEL_PORT}"):
-        assert wildcard not in table, table
+    entries = parse_listen_table(table)
+    assert (HOST, TUNNEL_PORT) in entries, table
+    for wildcard in ("0.0.0.0", "*", "[::]"):
+        assert (wildcard, TUNNEL_PORT) not in entries, table
 
 
 def test_engineer_reaches_appliance_through_reverse_port(tunnel):
