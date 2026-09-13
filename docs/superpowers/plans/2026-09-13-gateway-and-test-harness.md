@@ -40,7 +40,7 @@
 - Produces:
   - `registry.py list-usernames` → 每行一个用户名，退出码 0
   - `registry.py get <username>` → `username\towner\tport\tappliances`（appliances 用逗号连接），未找到时 stderr 报错并退出码 3
-  - `registry.py validate` → 校验通过退出码 0，失败时 stderr 逐条列出问题并退出码 4
+  - `registry.py validate` → 校验通过退出码 0，失败时 stderr 报出发现的第一个问题并退出码 4（`load` 遇错即抛，三个运维脚本也都在首个错误处中止）
   - Python 层：`load(path: Path) -> list[Account]`，`Account` 为 dataclass，字段 `username: str, owner: str, port: int, appliances: list[str]`
 
 - [ ] **Step 1: 写下失败的测试**
