@@ -6,8 +6,9 @@ import pytest
 
 from conftest import (
     APPLIANCE_PW, APPLIANCE_SSHD, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD,
-    TUNNEL_USER, _stop_tunnel, gateway_listen_table, parse_listen_table,
-    popen_ssh_password, reverse_port_registered, run_ssh_password,
+    TUNNEL_USER, _stop_tunnel, gateway_listen_table, gateway_tunnel_status,
+    parse_listen_table, popen_ssh_password, reverse_port_registered,
+    run_ssh_password,
 )
 
 
@@ -70,6 +71,31 @@ def test_reverse_port_is_bound_on_a_wildcard_address(tunnel):
     bound = [w for w in ("0.0.0.0", "*", "[::]") if (w, TUNNEL_PORT) in entries]
     assert bound, table
     assert (HOST, TUNNEL_PORT) not in entries, table
+
+
+def test_tunnel_status_reports_online_while_a_real_tunnel_is_up(tunnel):
+    """tunnel-status.sh 的 online 分支从来没有真的被命中过一次。
+
+    Task 7 的 bats 套件整套都在容器内跑，从不建立真实的 ssh 会话，所以那边
+    十几条用例只验证过 offline 分支的格式——如果 `pgrep -u <user> -n sshd`
+    从来不命中任何进程，`tunnel-status.sh` 会把所有账号永远报成 offline，
+    而 bats 那边全绿，因为它压根没有能力制造一个在线的会话去戳穿这件事。
+
+    这不是假设的风险：OpenSSH 9.8 起把每个会话的进程名从 `sshd` 改成了
+    `sshd-session`，这个仓库现在锁的是 9.2p1（见 `ssh -V`），将来悄悄升级
+    基础镜像就会让这个脚本失去 online 检测能力却不报任何错——`pgrep` 找不到
+    进程和"没有在线会话"在退出码和输出格式上完全一样。
+
+    `tunnel` 固件建立的是一条真实的、认证过的反向端口连接，此刻 tunnel-zhang
+    名下确实有一个 sshd 子进程在服务这个会话，这是全套件唯一能提供这个前提
+    的地方，因此这条断言只能放在这里，不能补进 bats。
+    """
+    out = gateway_tunnel_status()
+    lines = {line.split()[0]: line for line in out.splitlines() if line.strip()}
+    assert TUNNEL_USER in lines, out
+    fields = lines[TUNNEL_USER].split()
+    assert fields[:3] == [TUNNEL_USER, str(TUNNEL_PORT), "online"], out
+    assert fields[3].isdigit(), out
 
 
 def test_reverse_request_without_a_bind_address_is_accepted(harness):

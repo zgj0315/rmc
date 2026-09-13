@@ -20,9 +20,28 @@ else
     printf '口令只显示这一次，请当面或经既有安全渠道交给现场人员，并要求首次连接后修改。\n'
 fi
 
-if rewrite_match_block; then
-    reload_sshd
-    printf 'sshd-tunnel 配置已更新并 reload。\n'
-else
-    printf 'sshd-tunnel 配置无变化。\n'
-fi
+# 不能再写 `if rewrite_match_block; then`：那种写法会连带把函数体内所有其它
+# 命令的 errexit 都挂起（bash 对处于 if 条件位置的命令是这么处理的），见
+# lib.sh 里 rewrite_match_block 上面那段注释。用 `|| rc=$?` 取真实返回码，
+# 再显式 case 判断——0 和 2 都是正常结果，其它任何值都不该出现（正常失败
+# rewrite_match_block 内部已经直接 die() 掉了），落到这里说明函数自己的
+# 返回码约定被破坏，同样要响亮地报错，不能被 if 悄悄吞掉。
+rc=0
+rewrite_match_block || rc=$?
+case "$rc" in
+    0)
+        reload_sshd
+        printf 'sshd-tunnel 配置已更新并 reload。\n'
+        ;;
+    2)
+        printf 'sshd-tunnel 配置无变化。\n'
+        ;;
+    *)
+        die "重写受管配置返回了意料之外的状态码 $rc" "$rc"
+        ;;
+esac
+
+# registry.toml 里可能还留着已经被吊销、口令已锁定的账号——revoke-account.sh
+# 故意不碰登记表，上面这次重写就会把它们的 Match 块也一并重新生成出来。
+# 锁着的口令是唯一还挡着的东西，这里响亮地提醒操作员。
+warn_locked_registry_accounts

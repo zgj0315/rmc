@@ -122,9 +122,10 @@ def compose(*args: str, check: bool = True,
     )
 
 
-# `ss -ltn` 与 `openssl x509` 都是秒回的命令，20 秒都算宽松。
+# `ss -ltn`、`openssl x509`、`tunnel-status.sh` 都是秒回的命令，20 秒都算宽松。
 _LISTEN_TABLE_TIMEOUT = 20.0
 _CERT_FETCH_TIMEOUT = 20.0
+_TUNNEL_STATUS_TIMEOUT = 20.0
 
 
 def _compose_capture(*cmd: str, timeout: float, purpose: str) -> str:
@@ -170,6 +171,27 @@ def gateway_listen_table() -> str:
     return _compose_capture(
         "exec", "-T", "gateway", "ss", "-ltn",
         timeout=_LISTEN_TABLE_TIMEOUT, purpose="取 gateway 监听表",
+    )
+
+
+def gateway_tunnel_status() -> str:
+    """Gateway 容器里 `tunnel-status.sh` 的原始输出。
+
+    Task 7 的 bats 套件只在容器里跑，从来没有一次真实的 ssh 隧道在线过——
+    12 条（后来 19 条）用例全部只验证过 offline 分支的格式。online 分支
+    （`pgrep -u <user> -n sshd` 真的命中一个进程）完全没有测过：如果它从来
+    不命中，`tunnel-status.sh` 会把所有账号永远报成 offline，而这套 bats
+    环境自己测不出这一点，因为它压根不会真的建立 ssh 会话。这不是假设的
+    风险——OpenSSH 9.8 起把每个会话的进程名从 `sshd` 改成了
+    `sshd-session`，将来升级基础镜像会不声不响地把这个脚本变成一个只会说
+    "offline" 的常量。
+
+    真正建立隧道的只有这个 Python 端到端套件（`tunnel` 固件），所以 online
+    分支只能在这里补——这条真实断言比在 bats 里堆多少 fixture 都管用。
+    """
+    return _compose_capture(
+        "exec", "-T", "gateway", "/gateway/scripts/tunnel-status.sh",
+        timeout=_TUNNEL_STATUS_TIMEOUT, purpose="取隧道状态",
     )
 
 

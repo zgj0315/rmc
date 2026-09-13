@@ -19,7 +19,7 @@
 - `LoginGraceTime 20`、`MaxAuthTries 3`。
 - V1 不做 pam_faillock 与 haproxy 按来源 IP 限速，见方案 7.3。
 - `sshd-tunnel` 的配置文件、host key、pid 文件必须与系统自带的 sshd 完全独立。
-- 所有脚本以 `set -euo pipefail` 开头，非 root 运行时立即退出。
+- 所有脚本以 `set -euo pipefail` 开头；会改动系统状态的脚本（建号、改口令、锁口令、改 sshd 配置、踢会话——即 `enroll-account.sh` 与 `revoke-account.sh`）非 root 运行时立即退出。`tunnel-status.sh` 只读登记表和进程表，不改动任何东西，要求它也必须 root 运行买不到任何安全性，只会训练操作员在所有命令前面无脑加 `sudo`，这比这条约束本来想防的习惯更糟；因此 `tunnel-status.sh` 刻意不做这个检查，可以由非 root 身份运行。谁在什么身份下实际运行这三个脚本，由 Task 8 的操作手册规定。
 
 ---
 
