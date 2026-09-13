@@ -137,7 +137,27 @@ def gateway_listen_table() -> str:
 
 
 def port_listening_in_gateway(port: int) -> bool:
-    return f"127.0.0.1:{port}" in gateway_listen_table()
+    """Gateway 容器里是否有监听套接字精确绑在 `127.0.0.1:<port>` 上。
+
+    必须逐行解析、把 Local Address:Port 整列当一个值来比，不能在整张表上做子串
+    匹配。具体的坑：子串查端口 22 会命中 `127.0.0.1:2222` 那一行，于是这个
+    helper 会报告一个根本不存在的监听端口，让调用它的用例在什么都没验证的情况
+    下变绿。Task 3 到 7 共用这个 helper，443 与 22 这类短端口号都会被查到，所以
+    别把它简化回 `in` 匹配。
+    """
+    want = str(port)
+    for line in gateway_listen_table().splitlines():
+        fields = line.split()
+        # ss 的列：State / Recv-Q / Send-Q / Local Address:Port / Peer Address:Port。
+        # 表头与任何解析不出地址的行一律跳过，不让它抛异常。
+        if len(fields) < 4:
+            continue
+        addr, sep, listen_port = fields[3].rpartition(":")
+        if not sep:
+            continue
+        if addr == HOST and listen_port == want:
+            return True
+    return False
 
 
 def ensure_engineer_keypair() -> None:
