@@ -14,6 +14,10 @@ services:
       dockerfile: test-env/gateway/Dockerfile
     depends_on:
       - appliance
+    volumes:
+      # Task 7 的运维脚本用 bats 测试，脚本会动系统账号与 sshd 配置，只能在
+      # 容器里跑；仓库整份只读挂载，测试直接读 /gateway/scripts、/gateway/tests。
+      - ..:/gateway:ro
     ports:
       - "127.0.0.1:2422:2223"
       - "127.0.0.1:8443:443"

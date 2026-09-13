@@ -1,7 +1,7 @@
 FROM debian:12-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      openssh-server haproxy socat iproute2 procps openssl python3 \
+      openssh-server haproxy socat iproute2 procps openssl python3 bats \
  && rm -rf /var/lib/apt/lists/*
 
 # 构建上下文是 gateway/（见 compose 的 context: ..），以下路径都相对它书写。
