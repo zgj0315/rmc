@@ -31,7 +31,9 @@ sudo install -m 644 haproxy.cfg /etc/haproxy/haproxy.cfg
 sudo install -m 644 systemd/sshd-tunnel.service /etc/systemd/system/
 sudo ssh-keygen -t ed25519 -N '' -f /etc/ssh/tunnel_host_ed25519_key
 # 证书用公共 CA 签发，合成 fullchain+key 放到下面这个路径
-sudo install -m 600 gateway.pem /etc/haproxy/certs/gateway.pem
+# -D：连同父目录一起建。/etc/haproxy/certs 不是 Debian haproxy 包自带的目录，
+# 干净的新机器上这一步不加 -D 会直接报 "No such file or directory"。
+sudo install -D -m 600 gateway.pem /etc/haproxy/certs/gateway.pem
 sudo systemctl daemon-reload
 sudo systemctl enable --now sshd-tunnel haproxy
 ```
@@ -41,6 +43,11 @@ sudo systemctl enable --now sshd-tunnel haproxy
 ```bash
 ssh-keygen -lf /etc/ssh/tunnel_host_ed25519_key.pub
 ```
+
+## 部署之后、开通第一个账号之前
+
+- `registry.toml` 里仓库自带的 `tunnel-zhang` 那条记录只是给测试环境用的样例，生产部署后要先删掉——留着它会被当成一个真实账号 enroll 出去；
+- 三个脚本必须从这台 Gateway 本机的一份 checkout 里跑：`registry.py` 默认按自己所在目录的上一级去定位 `registry.toml`（`RMC_REGISTRY` 未设置时），checkout 挪到别的机器、或者从别的路径远程执行，读到的要么是另一份登记表，要么根本读不到文件。
 
 ## 受管配置区段：勿手工编辑
 
@@ -93,6 +100,8 @@ sudo scripts/revoke-account.sh <username>
 
 `enroll-account.sh` 不校验用户名前缀本身（不调用 `require_tunnel_username`）：`registry.toml` 里本就不允许非 `tunnel-*` 的记录存在，所以一个非隧道用户名要么在登记表里查不到（退出码 3），要么因登记表整体不合法而退出码 4，不会走到退出码 6。
 
+退出码 1 不专属于「未以 root 运行」：`useradd`、`chpasswd`、`systemctl reload`（`RELOAD_CMD`）都在 `set -e` 下运行，这几步自身失败时会把各自的退出码原样带出脚本，其中 reload 失败很常见的就是退出码 1，跟 `require_root` 的检查撞在同一个数字上——看到退出码 1，先看输出文本再判断是不是权限问题。
+
 ### `revoke-account.sh`
 
 | 退出码 | 含义 |
@@ -103,6 +112,8 @@ sudo scripts/revoke-account.sh <username>
 | 4 | 登记表读取失败 / 登记表不合法（重写受管配置时触发） |
 | 5 | 生成的受管配置未通过 `sshd -t` |
 | 6 | 用户名不是 `tunnel-` 前缀——本脚本第一步就会拒绝，防止对非隧道账号（例如 `root`）执行 `passwd -l` / `pkill -u` |
+
+退出码 1 同样不专属于「未以 root 运行」：`passwd -l`、`systemctl reload`（`RELOAD_CMD`）都在 `set -e` 下运行，这两步自身失败时会把各自的退出码原样带出脚本，其中 reload 失败很常见的就是退出码 1（`pkill` 不在此列——它的失败已经被 `if pkill ...; then ... else ...; fi` 显式接住，不会导致脚本以非零退出）——看到退出码 1，先看输出文本再判断是不是权限问题。
 
 ### `tunnel-status.sh`
 
@@ -136,11 +147,14 @@ ssh -p 22001 root@gateway.company.com
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
-cd test-env && docker compose up -d --build
-cd .. && .venv/bin/python -m pytest tests -v
+RMC_KEEP_ENV=1 .venv/bin/python -m pytest tests -v
 ```
 
-脚本测试（19 条 bats 用例）在容器内运行，因为它们会创建系统账号、改写 sshd 配置：
+不用先手工 `cd test-env && docker compose up -d --build`：`tests/conftest.py` 里 session 级 `harness` 固件自己会先 `compose down -v` 再 `up --build`，手工跑一遍只是重复工作。
+
+`RMC_KEEP_ENV=1` 不能省：不带它，`harness` 固件会在 pytest 跑完时的 `finally` 里执行 `compose down -v`，等到下面这条 bats 命令再去连容器，服务已经不在了（`service "gateway" is not running`）。
+
+脚本测试（21 条 bats 用例）在容器内运行，因为它们会创建系统账号、改写 sshd 配置：
 
 ```bash
 cd test-env && docker compose exec -T gateway bats /gateway/tests/test_scripts.bats
