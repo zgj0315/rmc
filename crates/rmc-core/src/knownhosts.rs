@@ -58,10 +58,17 @@
 //!   字符串，一行「host 对不上、指纹段本身被砸烂」的记录会被当成
 //!   「一条正常但无关的记录」悄悄放过，不会被计入「文件有损坏」，
 //!   这正是要堵的洞之一。
-//! - host 段同理必须形如 `[<非空内容>]:<纯数字端口>`——方括号、冒号
-//!   这些分隔符结构本身被砸坏（掉了方括号、端口里混进了非数字字符、
-//!   方括号内容为空）时，必须算解析失败，不能被当成「跟这次查询无关
-//!   的另一个 host」放过。
+//! - **R27**：host 段同理必须形如 `[<host>]:<port>`，`<host>` 只能是
+//!   `addr.rs` 的 `valid_host()` 认可的字符（ASCII 字母数字加
+//!   `. - _ :`），`<port>` 必须是 `u16` 十进制表示且原样回填（拒绝
+//!   前导零、超出范围）。字符集第一版（R24）比这宽——方括号内允许
+//!   任意非空白字节，穷举过 256 种单字节替换后只有 134 种会被判定成
+//!   损坏，逃过去的 122 种里有 56 种是这个模块自己永远不会写出来的
+//!   字节（NUL、C0 控制符、DEL……），NUL 砸进 host 段中间不会破坏
+//!   `[…]:digits` 的外形，会被当成「干净但无关的记录」放过——而 NUL
+//!   填充块正是磁盘故障、半截写入最典型的痕迹。收紧到跟 `valid_host()`
+//!   一致后检出率变成 190/256，剩下的 66 种正好是下面这条真实边界
+//!   论证过的合法主机名字符，不多不少。
 //!
 //! **这条防线的真实边界**：如果损坏恰好把 `key` 的 host 段变成了*另一
 //! 个语法上完全合法的主机名*（比如掉了一个字符，`gateway.company.com`
@@ -122,17 +129,32 @@ fn entry_key(gateway: &HostPort) -> String {
     format!("[{}]:{}", gateway.host, gateway.port)
 }
 
-/// R24：host 段是否长得像一条记录该有的样子——方括号包住非空内容，
-/// 紧跟 `]:`，后面只有数字端口，整个 token 之外没有多余字符。
+/// R24/R27：host 段是否长得像一条记录该有的样子——方括号包住的内容
+/// 只能是 `is_valid_host_byte` 允许的字节，紧跟 `]:`，端口部分必须是
+/// `u16` 十进制表示且原样回填（拒绝前导零、超出范围、端口里混进非
+/// 数字字符）。
 ///
-/// 这不是重新实现 `HostPort` 的完整校验（不检查端口范围、不识别历史
-/// 遗留的数字式 IPv4 之类），只是「这段字节起码保持着记录该有的分隔符
-/// 结构」的最基本形状检查。目的很窄：让分隔符结构本身被砸坏（掉了
-/// 方括号、掉了冒号、端口里混进了非数字字符、方括号内容为空）能表现成
-/// 解析失败，而不是被当成「跟这次查询无关的另一个 host」悄悄放过——
-/// 见模块顶部 R26 段落里「这条防线的真实边界」：这条校验完全帮不上
-/// 「host 段本身还是一个合法主机名、只是内容不对」这种损坏，那是不同
-/// 的、没法靠内容校验关上的缺口。
+/// 这不是重新实现 `HostPort` 的完整校验（不识别历史遗留的数字式
+/// IPv4、不检查长度上限），只是「这段字节起码保持着记录该有的分隔符
+/// 结构、且字符集跟这个模块自己会写出来的东西一致」的形状检查。
+///
+/// R27（这条校验原来的版本被审查证伪过）：R24 刚落地时，这里只检查
+/// 「有方括号、有冒号、端口是纯数字」，方括号内允许任意非空白字节。
+/// 审查对 host 段做了一次穷举：把 256 种单字节取值逐个替换进 host
+/// 段里，只有 134/256 会被判定成损坏。逃过去的 122 种里，66 种是
+/// `addr.rs` 的 `valid_host()` 也认可的合法主机名字符——这是本模块
+/// 论证过、没法用内容校验关上的真实边界（见模块顶部「这条防线的真实
+/// 边界」，仍然成立）——但另外 56 种是这个模块自己**永远不会写出来**
+/// 的字节：NUL、几乎所有 C0 控制符、大部分标点、DEL。NUL 砸进 host
+/// 段中间，`[…]:digits` 的外形完好无损，这一行会被判定成「干净但
+/// 无关的记录」，不计入 damaged，被查询的 host 会拿到 `FirstSeen`——
+/// 而 NUL 填充块恰恰是磁盘故障、半截写入这类本模块要防的损坏最典型
+/// 的痕迹。把 host 段字符集收紧到跟 `valid_host()` 完全一致、外加
+/// 端口回填校验之后：检出率变成 190/256，剩下的 66 种正好就是合法
+/// 主机名字符（跟真实边界的论证吻合，不多不少），77 条测试全绿（含
+/// 两条曾经预判「收紧会拖累」的测试），顺带堵上了 `:99999`、`:0443`、
+/// `:00443`、`:4430000000000` 这类端口段本身没有对齐 `u16` 十进制
+/// 表示的畸形写法。
 fn looks_like_host_token(token: &str) -> bool {
     let Some(rest) = token.strip_prefix('[') else {
         return false;
@@ -140,7 +162,23 @@ fn looks_like_host_token(token: &str) -> bool {
     let Some((host, port)) = rest.split_once("]:") else {
         return false;
     };
-    !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+    if host.is_empty() || !host.bytes().all(is_valid_host_byte) {
+        return false;
+    }
+    let Ok(port_num) = port.parse::<u16>() else {
+        return false;
+    };
+    // 回填比对，不是只看「能不能解析成 u16」：拒绝前导零（"0443"）、
+    // 拒绝解析器可能容忍的其他非规范写法，只认十进制的标准写法。
+    port_num.to_string() == port
+}
+
+/// 跟 `addr.rs` 里 `valid_host()` 认可的字符集完全一致：ASCII 字母
+/// 数字加 `. - _ :`，一共 66 种字节。故意跟 `valid_host()` 保持
+/// 同步、不自己另起一套更宽的字符集——见 `looks_like_host_token` 上
+/// 的 R27 说明，字符集比 `valid_host()` 宽正是上一版被打穿的原因。
+fn is_valid_host_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':')
 }
 
 /// R25：指纹段是否长得像 `fingerprint_sha256()` 会产出的样子——
@@ -156,6 +194,92 @@ fn looks_like_fingerprint(token: &str) -> bool {
         && body
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+/// R28：已经校验过形状的指纹，只能通过 `Fingerprint::new` 构造。
+///
+/// `check()` 曾经原样接受调用方传来的裸 `&str`，直接写进文件——一旦
+/// 这个字符串本身形状不合法（哪怕只是空字符串、只是缺了 `SHA256:`
+/// 前缀），R25 落地之后，这一行会立刻被 `lookup()` 判定成
+/// damaged：从那一刻起，这份文件对**任何**不是精确匹配的查询都是
+/// `Fatal`，包括跟这次写坏毫无关系的全新 Gateway，而且没有比手工
+/// 编辑文件更轻的恢复办法。这不是「记录了一个错误值，下次还能纠正」，
+/// 是一次性把整份文件的可用性都赌上去——`check("SHA256:aaa")` 就是
+/// 现成的例子：这份报告自己前几轮的测试夹具（改用 `fp()` 之前）全都
+/// 踩过这个坑。
+///
+/// 用类型堵住这条路，而不是在 `append()` 前面再加一个 `if`：`Result`
+/// 里出现 `Fingerprint` 就代表校验已经跑过，`check()` 只收
+/// `Fingerprint`，不再收 `&str`。落地方式跟 `config.rs` 里
+/// `ValidatedAddresses` 是同一个模式——字段私有，本模块之外没有办法
+/// 绕开 `new()` 直接拼出一个实例。
+///
+/// Task 7 的 SSH 层要负责把它构造出来（大概率是直接调用
+/// `fingerprint_sha256()` 之后再包一层 `Fingerprint::new`），格式上的
+/// 分歧在编译期就会现形，不用等到客户第一次连接才发现。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint(String);
+
+impl Fingerprint {
+    /// 校验 `s` 是否形如 `SHA256:` 加 43 个合法字符；校验通过才能
+    /// 构造出实例。
+    pub fn new(s: &str) -> Result<Self> {
+        if looks_like_fingerprint(s) {
+            Ok(Self(s.to_string()))
+        } else {
+            Err(Error::Config(format!(
+                "指纹格式不对，应为「SHA256:」加 43 个 base64 字符：{s}"
+            )))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// R31：报错时嵌进「哪一行解析不出来」的原文，必须先经过这一道——
+/// 这一行内容不受信任：它没通过任何格式校验（那正是它进这条错误的
+/// 原因），可能是几十 KB 的垃圾（一整行没有换行符的日志被意外拼接
+/// 进来），可能是磁盘交叉写坏之后混进来的另一个文件的内容（口令、
+/// API key 之类），也可能整段都是 NUL——本项目的规矩是口令类内容不
+/// 进日志、`Debug`、错误文案，在损坏的原始字节被原样塞进用户可见的
+/// `Error` 之前，必须截断长度、转义不可打印字符，不能因为「这行是
+/// 从本地文件读出来的」就当成可以随便展示的内容。
+///
+/// 之前只有当一行的第一个 token 恰好等于当前查询的 `key` 时才会走到
+/// 这条格式化——那是本模块自己此前写下的记录，内容可信。R24 把「文件
+/// 里任意一行解析失败」都计入 damaged 之后，这里能拿到的 `raw` 不再
+/// 保证是「这个模块认识的内容」，加固就必须补在这里。
+fn redact_for_error(raw: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let mut chars = raw.chars();
+    let head: String = chars.by_ref().take(MAX_CHARS).collect();
+    let truncated = chars.next().is_some();
+    // 只转义控制字符（NUL、C0/C1、DEL 这类）——普通的可打印非 ASCII
+    // 内容（中文之类）原样保留，不然日志会被转义成一堆 \u{...}，反而
+    // 更难读。
+    let escaped: String = head
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<String>()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+    if truncated {
+        format!("{escaped}…（已截断）")
+    } else {
+        escaped
+    }
 }
 
 /// 文件已损坏时构造的错误。用 `ErrorKind::InvalidData` 包一层
@@ -252,8 +376,9 @@ impl KnownHosts {
         match (found, damaged) {
             (Some(fp), _) => Ok(Some(fp)),
             (None, Some((lineno, raw))) => Err(corrupt(format!(
-                "known_hosts 第 {lineno} 行解析不出干净的记录（{raw}），\
-                 无法确认其中是否原本是 {key} 的记录，需要人工核实后再连接"
+                "known_hosts 第 {lineno} 行解析不出干净的记录（{}），\
+                 无法确认其中是否原本是 {key} 的记录，需要人工核实后再连接",
+                redact_for_error(&raw)
             ))),
             (None, None) => Ok(None),
         }
@@ -280,8 +405,12 @@ impl KnownHosts {
     /// 首次连接记录指纹；已有记录且一致返回 `Verdict::Matched`；已有记录
     /// 但不一致时返回 `Error::HostKeyMismatch`，且不覆盖原记录——变更
     /// 拒绝是这个模块存在的唯一理由，覆盖了记录等于放弃了这个理由。
-    pub fn check(&self, gateway: &HostPort, fingerprint: &str) -> Result<Verdict> {
+    ///
+    /// R28：`fingerprint` 收 `&Fingerprint` 不收裸 `&str`——写进文件的
+    /// 值形状必须已经校验过，见 `Fingerprint` 类型上的说明。
+    pub fn check(&self, gateway: &HostPort, fingerprint: &Fingerprint) -> Result<Verdict> {
         let key = entry_key(gateway);
+        let fingerprint = fingerprint.as_str();
         match self.lookup(&key)? {
             None => {
                 self.append(&key, fingerprint)?;
@@ -310,14 +439,23 @@ mod tests {
         "gateway.company.com:443".parse().unwrap()
     }
 
-    /// 测试用的合法指纹：真的走一遍 `fingerprint_sha256()`，保证形状
-    /// 能通过 R25 的校验（43 个无填充 base64 字符），不同的 seed 产出
-    /// 不同的指纹字符串。R25 之后，字面量 "SHA256:aaa" 这种占位符已经
-    /// 不再是「看起来无所谓的短字符串」——它自己就是一个形状不合法的
-    /// 指纹，会被 lookup() 当成损坏处理，所以测试里但凡指纹要被写入
-    /// 文件、再被读回来比对，就必须用这个函数产出的真实形状。
-    fn fp(seed: &str) -> String {
+    /// 测试用的合法指纹字符串：真的走一遍 `fingerprint_sha256()`，
+    /// 保证形状能通过 R25 的校验（43 个无填充 base64 字符），不同的
+    /// seed 产出不同的指纹字符串。R25 之后，字面量 "SHA256:aaa" 这种
+    /// 占位符已经不再是「看起来无所谓的短字符串」——它自己就是一个
+    /// 形状不合法的指纹，会被 lookup() 当成损坏处理，所以测试里但凡
+    /// 指纹要被写入文件、再被读回来比对，就必须用这个函数产出的真实
+    /// 形状。
+    fn fp_str(seed: &str) -> String {
         fingerprint_sha256(seed.as_bytes())
+    }
+
+    /// R28：`check()` 现在只收 `&Fingerprint`，测试里绝大多数调用点
+    /// 要的就是一个「校验过、能直接传给 check() 的」指纹，这个函数
+    /// 包一层 `Fingerprint::new`。跟 `expected`/`actual` 这类
+    /// `String` 字段比较的地方仍然用 `fp_str()`。
+    fn fp(seed: &str) -> Fingerprint {
+        Fingerprint::new(&fp_str(seed)).expect("测试夹具产出的指纹形状必须合法")
     }
 
     #[test]
@@ -336,8 +474,8 @@ mod tests {
         let err = kh.check(&gw(), &fp("b")).unwrap_err();
         match err {
             Error::HostKeyMismatch { expected, actual } => {
-                assert_eq!(expected, fp("a"));
-                assert_eq!(actual, fp("b"));
+                assert_eq!(expected, fp_str("a"));
+                assert_eq!(actual, fp_str("b"));
             }
             other => panic!("类别不对：{other}"),
         }
@@ -431,8 +569,8 @@ mod tests {
         let err = kh2.check(&gw(), &fp("b")).unwrap_err();
         match err {
             Error::HostKeyMismatch { expected, actual } => {
-                assert_eq!(expected, fp("a"));
-                assert_eq!(actual, fp("b"));
+                assert_eq!(expected, fp_str("a"));
+                assert_eq!(actual, fp_str("b"));
             }
             other => panic!("类别不对：{other}"),
         }
@@ -520,12 +658,21 @@ mod tests {
     }
 
     // 【表格行 3：行首有空白】不该被误伤——这是正常场景，不是损坏。
-    // 缩进、手工编辑留下的前导空格必须被 `trim()` 正常吃掉，走到跟没有
-    // 缩进完全一样的干净记录路径。
+    // 缩进、手工编辑留下的前导空格得走到跟没有缩进完全一样的干净记录
+    // 路径。
     //
-    // 会让这条测试变红的改法：校验时用 `raw` 而不是 `raw.trim()`，导致
-    // 行首空白被当成 host token 的一部分，从而 `looks_like_host_token`
-    // 失败、被误判成损坏。
+    // R30：这条测试原来的注释说「改用 raw 而不是 raw.trim() 会让这条
+    // 变红」——验证过是错的：`split_whitespace()` 自己就会跳过前导
+    // 空白，就算校验用 raw 不 trim，`parts.next()` 拿到的第一个 token
+    // 依然是干净的 host 段，这条测试原样通过，杀不死它自称能杀死的
+    // 那个变异。`trim()` 真正扛住的是另外两件事，各自单独有测试：
+    // 只有空白字符的行（不 trim 就不会被判定成空行，会走到
+    // `split_whitespace()` 切出零个 token，`parts.next().expect(...)`
+    // 直接 panic——见 `whitespace_only_line_does_not_panic_and_is_
+    // treated_as_blank`）和缩进过的注释行（不 trim 就不会被识别成
+    // `#` 开头，会被当成一条格式不对的记录——见
+    // `indented_comment_line_is_ignored_not_treated_as_damage`）。
+    // 这条测试留着，只是不再声称它测的是 trim() 本身。
     #[test]
     fn leading_whitespace_before_a_record_is_not_treated_as_damage() {
         let dir = tmpdir();
@@ -533,6 +680,47 @@ mod tests {
         std::fs::write(&path, format!("   [gateway.company.com]:443 {}\n", fp("a"))).unwrap();
         let kh = KnownHosts::open(path);
         assert_eq!(kh.check(&gw(), &fp("a")).unwrap(), Verdict::Matched);
+    }
+
+    // R30：trim() 真正承重的地方之一——一整行只有空白字符（打印/编辑器
+    // 手滑留下的空白行，不是完全空行）。不 trim 的话，`raw.is_empty()`
+    // 对 "   " 是 false，这一行不会被当成空行跳过，会往下走到
+    // `split_whitespace()`——但纯空白字符串切出来是零个 token，
+    // `parts.next().expect(...)` 直接 panic，而不是走某个 Err 分支。
+    //
+    // 会让这条测试变红（这里指真的 panic，不是走 Err）的改法：把判断
+    // 空行/注释用的 `raw.trim()` 换回裸 `raw`。
+    #[test]
+    fn whitespace_only_line_does_not_panic_and_is_treated_as_blank() {
+        let dir = tmpdir();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, "   \n").unwrap();
+        let kh = KnownHosts::open(path);
+        let b: HostPort = "gw-b.company.com:443".parse().unwrap();
+        assert_eq!(kh.check(&b, &fp("b")).unwrap(), Verdict::FirstSeen);
+    }
+
+    // R30：trim() 承重的另一半——缩进过的注释行。不 trim 的话，
+    // `raw.starts_with('#')` 对带缩进的行是 false，不会被识别成注释，
+    // 会被当成一条解析不出干净记录的行，多算出一次不该有的 damaged。
+    //
+    // 文件里只放这一行缩进注释，查询一个全新、从没出现过的 host——
+    // 不能像最初写这条测试时那样，同一份文件里再放一条查询目标自己的
+    // 干净记录：那样即使缩进注释被误判成 damaged，"找到精确匹配就直接
+    // 回答、不管文件里别处是否损坏"这条规则会把误判盖过去，测试照样
+    // 绿，杀不死 trim() 被去掉这个变异（写这条测试时先犯过这个错，
+    // 跑变异验证时发现的）。
+    //
+    // 会让这条测试变红的改法：把判断空行/注释用的 `raw.trim()` 换回
+    // 裸 `raw`。
+    #[test]
+    fn indented_comment_line_is_ignored_not_treated_as_damage() {
+        let dir = tmpdir();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, "  # 缩进过的注释\n").unwrap();
+        let kh = KnownHosts::open(path);
+        let b: HostPort = "gw-b.company.com:443".parse().unwrap();
+        assert_eq!(kh.check(&b, &fp("b")).unwrap(), Verdict::FirstSeen);
     }
 
     // 【表格行 4，本轮加固的两条之一：host 段被砸坏、token 数量不变】
@@ -785,5 +973,174 @@ mod tests {
             matches!(err, Error::LocalIo(_)),
             "应为 LocalIo，而不是 {err}"
         );
+    }
+
+    // --- R27/R28/R29/R31：本轮修复补的用例 ---
+
+    // R27：host 段字符集收紧到跟 `valid_host()` 一致之后，穷举过的
+    // 56 种「这个模块自己永远不会写出来」的字节里，NUL 是最典型的
+    // 代表——磁盘故障、半截写入砸出来的往往就是一整块 NUL。收紧之前
+    // 这条会返回 FirstSeen（TOFU 被绕过），见模块顶部 R27 的说明。
+    //
+    // 会让这条测试变红的改法：把 `is_valid_host_byte` 放宽回「非空白
+    // 即可」（R24 版本的写法）。
+    #[test]
+    fn nul_byte_inside_host_is_treated_as_damaged() {
+        let dir = tmpdir();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(
+            &path,
+            format!("[gateway.company\u{0}com]:443 {}\n", fp("a")),
+        )
+        .unwrap();
+        let kh = KnownHosts::open(path);
+        let err = kh.check(&gw(), &fp("b")).unwrap_err();
+        assert_eq!(err.class(), ErrorClass::Fatal, "{err}");
+    }
+
+    // R27：端口段前导零、超范围这类没对齐 `u16` 十进制表示的写法，也是
+    // 收紧之后才关上的。
+    #[test]
+    fn host_line_with_leading_zero_port_is_treated_as_damaged() {
+        let dir = tmpdir();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, format!("[gateway.company.com]:0443 {}\n", fp("a"))).unwrap();
+        let kh = KnownHosts::open(path);
+        let err = kh.check(&gw(), &fp("b")).unwrap_err();
+        assert_eq!(err.class(), ErrorClass::Fatal, "{err}");
+    }
+
+    // R28：Fingerprint::new 是唯一能构造出 Fingerprint 的入口，这里
+    // 钉住它真的挡住了坏值——四个具体案例都是审查复现过的：check() 曾经
+    // 原样接受这些字符串，写进文件之后，那份文件对任何不是精确匹配的
+    // 查询都会变成 Fatal，包括跟这次写坏毫无关系的全新 Gateway。
+    #[test]
+    fn fingerprint_new_accepts_a_correctly_shaped_string() {
+        assert!(Fingerprint::new(&fp_str("a")).is_ok());
+    }
+
+    #[test]
+    fn fingerprint_new_rejects_empty_string() {
+        assert!(Fingerprint::new("").is_err());
+    }
+
+    #[test]
+    fn fingerprint_new_rejects_a_string_that_is_not_a_fingerprint_at_all() {
+        assert!(Fingerprint::new("not a fingerprint").is_err());
+    }
+
+    #[test]
+    fn fingerprint_new_rejects_a_fingerprint_with_an_embedded_space() {
+        assert!(Fingerprint::new("SHA256:with space").is_err());
+    }
+
+    #[test]
+    fn fingerprint_new_rejects_the_short_placeholder_used_before_this_round() {
+        // 这份报告自己前几轮的测试夹具，改用 fp()/fp_str() 之前用的就是
+        // 这个占位符——它本身就是一个形状不合法的指纹。R28 之下，这类
+        // 值现在连 Fingerprint 都构造不出来，不用等写进文件才现形。
+        assert!(Fingerprint::new("SHA256:aaa").is_err());
+    }
+
+    // R29：字符集校验里的 `+` 分支没有任何夹具覆盖过——`fp("a")`/
+    // `fp("b")` 用到的种子恰好都不含 `+`（"a" 含 `/`，"b" 两者都没
+    // 有），如果哪天有人手滑把 `|| b == b'+'` 从字符集里删掉，77 条
+    // 测试不会有一条变红——而现实里大约一半的真实 host key 产出的
+    // 指纹会带 `+`。种子 "seed-1" 的指纹里同时有 `+` 和 `/`，专门
+    // 堵住这个：`fp()` 内部调用 `Fingerprint::new`，一旦 `+` 被
+    // 拒绝，光是准备这条测试的夹具就会直接 panic。
+    #[test]
+    fn fingerprint_containing_a_plus_character_round_trips() {
+        assert!(fp_str("seed-1").contains('+'), "夹具没起作用，换个种子");
+        let dir = tmpdir();
+        let kh = KnownHosts::open(dir.path().join("known_hosts"));
+        assert_eq!(kh.check(&gw(), &fp("seed-1")).unwrap(), Verdict::FirstSeen);
+        assert_eq!(kh.check(&gw(), &fp("seed-1")).unwrap(), Verdict::Matched);
+    }
+
+    // R29：`body.len() == 43` 这条长度校验，此前唯一一条「指纹段被
+    // 砸坏」的测试（`damage_inside_the_fingerprint_token_...`）用的是
+    // 非 ASCII 垃圾，会先被字符集校验拦下来，长度校验从来没被跑到过
+    // ——把 `== 43` 松成 `>= 43`，或者干脆删掉长度校验，77 条测试
+    // 依然全绿。这里构造一个字符集完全合法、只是长度差一位（43 变
+    // 44）的指纹段，专门堵住这两种放宽。
+    #[test]
+    fn fingerprint_with_valid_alphabet_but_wrong_length_is_treated_as_damaged() {
+        let dir = tmpdir();
+        let path = dir.path().join("known_hosts");
+        let mut too_long = fp_str("a");
+        too_long.push('A'); // 43 位的合法 body 变成 44 位，字符集依旧合法
+                            // 故意写在 gw-a 名下、查询完全不同的 gw-b：如果查的是同一个
+                            // host，一旦 == 43 被放宽成 >= 43，这一行会被当成「干净但指纹
+                            // 不一致」，产出 HostKeyMismatch——那也是 Fatal，会跟
+                            // 「判定成损坏」的 Fatal 撞在一起，这条测试就测不出长度校验
+                            // 到底有没有生效了（写这条测试时先犯过这个错，跑变异验证时
+                            // 发现 >= 43 那次改动没让它变红，才改成现在这样两个不同 host
+                            // 的写法）。
+        std::fs::write(&path, format!("[gw-a.company.com]:443 {too_long}\n")).unwrap();
+        let kh = KnownHosts::open(path);
+        let b: HostPort = "gw-b.company.com:443".parse().unwrap();
+        let err = kh.check(&b, &fp("b")).unwrap_err();
+        assert_eq!(err.class(), ErrorClass::Fatal, "{err}");
+        assert!(
+            matches!(err, Error::LocalIo(_)),
+            "应为文件损坏（LocalIo），不是别的 Fatal 错误：{err}"
+        );
+    }
+
+    // R29：端口段「必须全是数字」这条，`looks_like_host_token` 文档
+    // 注释里点名过，但没有专门的测试盯住它——`u16::parse` 目前天然会
+    // 拒绝混进字母的端口，可一旦这条校验被整个删掉（比如只检查
+    // "]:" 分隔符存在、不再校验端口内容），需要有一条测试变红。
+    #[test]
+    fn host_line_with_non_numeric_port_is_treated_as_damaged() {
+        let dir = tmpdir();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, format!("[gateway.company.com]:44a3 {}\n", fp("a"))).unwrap();
+        let kh = KnownHosts::open(path);
+        let err = kh.check(&gw(), &fp("b")).unwrap_err();
+        assert_eq!(err.class(), ErrorClass::Fatal, "{err}");
+    }
+
+    // R31：报错时把「哪一行解析不出来」的原文塞进去之前必须先经过
+    // redact_for_error——这一行没通过任何格式校验，可能是几十 KB 的
+    // 垃圾（意外拼接进来的另一份日志），也可能是磁盘交叉写坏之后混进
+    // 来的另一个文件的内容。本项目的规矩是这类不受信任的内容不能
+    // 原样进用户可见的错误。
+    #[test]
+    fn damaged_line_error_message_is_bounded_in_length() {
+        let dir = tmpdir();
+        let path = dir.path().join("known_hosts");
+        // 20 KB 的垃圾行，没有任何空白，切不出两段，必定判定成损坏。
+        let junk = "x".repeat(20_000);
+        std::fs::write(&path, format!("{junk}\n")).unwrap();
+        let kh = KnownHosts::open(path);
+        let b: HostPort = "gw-b.company.com:443".parse().unwrap();
+        let err = kh.check(&b, &fp("b")).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.len() < 1000,
+            "错误文案没有被截断，长度是 {} 字节",
+            text.len()
+        );
+    }
+
+    // R31 的另一半：控制字符（NUL 是磁盘故障/半截写入最典型的痕迹）
+    // 不能原样出现在错误文案里，必须被转义。
+    #[test]
+    fn damaged_line_containing_control_bytes_does_not_leak_them_raw() {
+        let dir = tmpdir();
+        let path = dir.path().join("known_hosts");
+        let junk = "garbage\u{0}line\u{0}with\u{0}nulls";
+        std::fs::write(&path, format!("{junk}\n")).unwrap();
+        let kh = KnownHosts::open(path);
+        let b: HostPort = "gw-b.company.com:443".parse().unwrap();
+        let err = kh.check(&b, &fp("b")).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            !text.contains('\u{0}'),
+            "NUL 字节被原样塞进了错误文案：{text:?}"
+        );
+        assert!(text.contains("garbage"), "至少要保留可读的一部分：{text}");
     }
 }
