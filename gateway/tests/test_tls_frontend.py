@@ -8,7 +8,7 @@ import pytest
 
 from conftest import (
     APPLIANCE_SSHD, HAPROXY, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_USER,
-    _stop_tunnel, popen_ssh_password, port_listening_in_gateway,
+    _stop_tunnel, popen_ssh_password, reverse_port_registered,
 )
 
 
@@ -94,7 +94,7 @@ def test_reverse_tunnel_works_over_tls(tls_wrap):
             if proc.poll() is not None:
                 pytest.fail(
                     f"隧道进程提前退出（退出码 {proc.returncode}）：{output()}")
-            if port_listening_in_gateway(TUNNEL_PORT):
+            if reverse_port_registered(TUNNEL_PORT):
                 break
             time.sleep(0.5)
         else:

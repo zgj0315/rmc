@@ -1,5 +1,6 @@
 # /etc/ssh/sshd_tunnel_config
-# 隧道专用 sshd 实例。只服务 tunnel-* 账号，只允许建立一个 loopback 反向端口。
+# 隧道专用 sshd 实例。只服务 tunnel-* 账号，只允许建立一个指定端口的反向端口。
+# 反向端口绑 0.0.0.0，公网可达；收回内网网卡或限定来源网段见方案 7.3。
 # systemd: sshd-tunnel.service
 ListenAddress 127.0.0.1:2222
 HostKey /etc/ssh/tunnel_host_ed25519_key
@@ -18,7 +19,7 @@ ClientAliveCountMax 3
 LoginGraceTime 20
 MaxAuthTries 3
 
-GatewayPorts no
+GatewayPorts yes
 AllowTcpForwarding remote
 PermitOpen none
 PermitTTY no
@@ -28,7 +29,19 @@ AllowStreamLocalForwarding no
 ForceCommand /bin/false
 
 # 以下 Match 块由 scripts/enroll-account.sh 依 registry.toml 生成，勿手工编辑。
+# PermitListen 必须写成不带地址的裸端口形式。两条理由都在这套 OpenSSH（9.2p1）
+# 上实测过：
+# 一、带地址的形式（<地址>:<端口>）只认客户端请求里的那个字面地址，不做解析也
+#     不做模式匹配。现场的命令 `ssh -R 22001:127.0.0.1:61001 ...` 不写监听地址，
+#     客户端据此请求的监听地址是 "localhost"，与放行项 `127.0.0.1:22001` 字面不
+#     相等，服务端直接拒掉并记录 "to remote forward to host localhost port 22001,
+#     but the request was denied"。
+# 二、GatewayPorts yes 之下实际绑在哪个地址上完全由服务端决定（恒为通配），客户端
+#     请求里的地址不影响绑定结果——实测带地址的放行项配上 `-R 127.0.0.1:22001:...`
+#     也照样绑到 0.0.0.0/[::]。所以在 PermitListen 里限制地址一分安全都不买，只会
+#     挡掉合法客户端。
+# 地址因此不受限制，端口仍然逐账号只放行一个。
 # BEGIN RMC MANAGED
 Match User tunnel-zhang
-    PermitListen 127.0.0.1:22001
+    PermitListen 22001
 # END RMC MANAGED

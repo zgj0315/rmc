@@ -24,11 +24,8 @@ APPLIANCE_PW = "appliance-dynamic-pw"
 
 HOST = "127.0.0.1"
 TUNNEL_SSHD = 2422
-ENGINEER_SSHD = 2022
 HAPROXY = 8443
 APPLIANCE_SSHD = 2322
-
-ENG_KEY = ENV_DIR / "engineer-keys" / "eng_ed25519"
 
 # 口令认证用的公共选项。限定 password 一种认证方式、只允许一次口令提示，
 # 免得失败时 ssh 反复重试或退回其他方式，让断言的含义变模糊。
@@ -37,15 +34,6 @@ SSH_COMMON = [
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "PreferredAuthentications=password",
     "-o", "NumberOfPasswordPrompts=1",
-    "-o", "ConnectTimeout=10",
-]
-
-# 工程师入口用公钥认证。
-ENG_COMMON = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "IdentitiesOnly=yes",
-    "-i", str(ENG_KEY),
     "-o", "ConnectTimeout=10",
 ]
 
@@ -105,19 +93,6 @@ def run_sftp_password(password: str, *args: str, timeout: int = 25) -> subproces
         env=askpass_env(password), stdin=subprocess.DEVNULL,
         capture_output=True, text=True, timeout=timeout,
     )
-
-
-def engineer_proxy_option() -> list[str]:
-    """经工程师入口跳到 Gateway loopback 的 ProxyCommand。
-
-    ssh 的 -J 不会把命令行上的 -i 传给跳板那一跳，所以这里显式写 ProxyCommand，
-    让跳板连接用 test-env/engineer-keys 里的私钥做公钥认证。
-    """
-    # ENG_COMMON 要拼成一条由 shell 解析的命令行，逐项 shlex.quote：
-    # 私钥路径里只要有空格（仓库被 clone 到带空格的目录下），不加引号就会被拆开。
-    opts = " ".join(shlex.quote(item) for item in ENG_COMMON)
-    return ["-o", "ProxyCommand=ssh {} -W %h:%p -p {} eng@{}".format(
-        opts, ENGINEER_SSHD, HOST)]
 
 
 def wait_port(port: int, timeout: float = 60.0) -> None:
@@ -205,8 +180,7 @@ def parse_listen_table(text: str) -> set[tuple[str, int]]:
     查监听端口必须走这里的整值比较，别退回在整张表上做子串匹配——这个 helper
     因为同一个结构性原因错过两次：子串查端口 22 会命中 `127.0.0.1:2222` 那一行，
     查 999 会命中 `127.0.0.1:9999`，于是调用方会拿到一个根本不存在的监听端口，
-    让用例在什么都没验证的情况下变绿。Task 4 要查 443、Task 5 要动 22，正是这类
-    短端口号。
+    让用例在什么都没验证的情况下变绿。Task 4 要查 443，正是这类短端口号。
 
     地址按 `ss` 打印的原样保留，包括 IPv6 的方括号（`[::]`）与通配的 `*`；
     IPv6 地址自带冒号，所以端口从最后一个冒号切开。表头与任何解析不出地址的行
@@ -232,9 +206,8 @@ def port_listening_in_gateway(port: int, address: str = HOST, *,
                               table: str | None = None) -> bool:
     """Gateway 容器里是否有监听套接字精确绑在 `address:port` 上。
 
-    `address` 默认 loopback。要断言某端口绑在通配地址上（Task 4 的 443、
-    Task 5 的 22），传 `address="0.0.0.0"` / `"*"` / `"[::]"`，而不要去匹配
-    地址字面量的子串。
+    `address` 默认 loopback。要断言某端口绑在通配地址上（Task 4 的 443），传
+    `address="0.0.0.0"` / `"*"` / `"[::]"`，而不要去匹配地址字面量的子串。
 
     `table` 给单元测试用：传入一段固定的 `ss` 文本就直接解析它，不去容器取表。
     两个真实 bug 都出在这个函数身上（而不是 parse_listen_table 里），所以它必须
@@ -246,27 +219,32 @@ def port_listening_in_gateway(port: int, address: str = HOST, *,
     return (address, port) in parse_listen_table(table)
 
 
-def ensure_engineer_keypair() -> None:
-    """缺失时生成工程师测试密钥。
+# 反向端口的绑定地址。GatewayPorts yes 强制通配绑定，`ss` 把 IPv4 通配打成
+# 0.0.0.0；`*` 与 `[::]` 是同一件事的另外两种拼法，一并认。
+# 反向端口绑在哪个地址上，整个测试套件里只有这一处知道。方案 7.3 推后的加固要
+# 把这些端口从公网挪到内网网卡时，改的是这个常量与下面那个函数，不是每个调用点。
+REVERSE_BIND_ADDRS = ("0.0.0.0", "*", "[::]")
 
-    私钥不入库，所以新 clone 出来的仓库里 engineer-keys/ 是空的。必须在
-    compose 起容器之前生成：compose 把这个目录挂进 gateway 容器，
-    entrypoint 要从里面读 authorized_keys。
+
+def reverse_port_registered(port: int, *, table: str | None = None) -> bool:
+    """Gateway 上是否已经注册了反向端口 `port`。
+
+    查反向端口一律走这里，别直接调 port_listening_in_gateway()：后者是通用原语，
+    默认地址是 loopback，而反向端口在 GatewayPorts yes 之下绑的是通配地址，用它
+    的默认值去问恒为假。Task 4 的 TLS 用例与 Task 6 的回收用例也都走这个函数，
+    不必各自把 "0.0.0.0" 抄一遍。
+
+    `table` 原样透给 port_listening_in_gateway()，给不起容器的单测注入固定的
+    `ss` 文本用；为 None 时只取一次监听表，三种拼法在同一张表上比对。
     """
-    if ENG_KEY.exists():
-        return
-    ENG_KEY.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ENG_KEY)],
-        check=True, capture_output=True, text=True,
-    )
-    (ENG_KEY.parent / "authorized_keys").write_bytes(
-        ENG_KEY.with_suffix(".pub").read_bytes())
+    if table is None:
+        table = gateway_listen_table()
+    return any(port_listening_in_gateway(port, address=addr, table=table)
+               for addr in REVERSE_BIND_ADDRS)
 
 
 @pytest.fixture(scope="session")
 def harness():
-    ensure_engineer_keypair()
     compose("down", "-v", check=False)
     # 不用 check=True：它与 capture_output=True 一起会把构建失败变成一个不带
     # 输出的 CalledProcessError，docker 真正的报错完全看不到。Task 3 到 7 都
@@ -279,7 +257,6 @@ def harness():
         )
     try:
         wait_port(TUNNEL_SSHD)
-        wait_port(ENGINEER_SSHD)
         wait_port(APPLIANCE_SSHD)
         yield
     finally:
@@ -306,7 +283,7 @@ def _stop_tunnel(proc: subprocess.Popen) -> None:
             proc.wait(timeout=10)
     deadline = time.time() + 15
     while time.time() < deadline:
-        if not port_listening_in_gateway(TUNNEL_PORT):
+        if not reverse_port_registered(TUNNEL_PORT):
             return
         time.sleep(0.5)
     raise RuntimeError(
@@ -343,7 +320,7 @@ def tunnel(harness):
             if proc.poll() is not None:
                 pytest.fail(
                     f"隧道进程提前退出（退出码 {proc.returncode}）：{output()}")
-            if port_listening_in_gateway(TUNNEL_PORT):
+            if reverse_port_registered(TUNNEL_PORT):
                 break
             time.sleep(0.5)
         else:

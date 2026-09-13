@@ -59,9 +59,10 @@ def test_local_forwarding_is_refused(harness):
     等本地端口真的开始监听后主动往里连一次，用这次连接触发服务端的拒绝，
     再从常驻进程的日志里读拒绝原因。
 
-    目标写的是 `appliance:22`（一体机测试容器目前真正监听的端口），不是
-    Step 1 原稿里的 61001——61001 是"一体机"未来的默认端口（Task 5 的范畴），
-    当前 test-env 的 appliance 容器还是标准的 22。选一个真实开着的端口，是为了
+    目标写的是 `appliance:61001`：Task 5 已经把 test-env 的 appliance 容器挪到
+    一体机真正的默认端口 61001，容器内不再有人听 22（已从 gateway 容器实测：
+    连 `appliance:61001` 读得到 SSH 横幅，连 `appliance:22` 是
+    Connection refused）。选一个真实开着的端口，是为了
     让 `data == b""` 这条检查本身也有区分度：如果转发被放行，客户端会真的收到
     一段 SSH 版本横幅（已实测：把 AllowTcpForwarding 和 PermitOpen 都放宽后，
     连接到转发端口能读到 `b'SSH-2.0-OpenSSH_9.2p1 ...'`）；如果转发被拒，通道
@@ -82,7 +83,7 @@ def test_local_forwarding_is_refused(harness):
         proc = popen_ssh_password(
             TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
             "-o", "ExitOnForwardFailure=yes",
-            "-L", "127.0.0.1:19099:appliance:22",
+            "-L", "127.0.0.1:19099:appliance:61001",
             f"{TUNNEL_USER}@{HOST}",
             stdout=log, stderr=subprocess.STDOUT,
         )
@@ -122,14 +123,10 @@ def test_local_forwarding_is_refused(harness):
 def test_reverse_port_outside_permitlisten_is_refused(harness):
     """`PermitListen` 只放行登记过的端口，别的必须被拒。
 
-    现状：`sshd_tunnel_config` 里这条是地址限定形式
-    `PermitListen 127.0.0.1:22001`，`GatewayPorts` 也还是 `no`（强制把允许的
-    反向端口绑在 loopback）。请求 22002 会被拒，是因为它跟"127.0.0.1:22001"
-    这唯一一条放行项完全不匹配——地址和端口两个维度都对不上。
-
-    Task 5 计划把这改成裸端口形式（`PermitListen 22001`）、`GatewayPorts`
-    改成 `yes`（强制绑通配地址），到那时地址就不再是 `PermitListen` 管的事，
-    这条用例断言的"端口被拒"这条性质本身不受影响、不用改。
+    Task 5 已经把这条改成裸端口形式（`PermitListen 22001`）、`GatewayPorts` 也
+    改成了 `yes`（强制绑通配地址），地址因此不再是 `PermitListen` 判断的一部分：
+    请求 22002 被拒的唯一原因就是端口不在放行项里。断言与 Task 5 之前一字未改
+    ——"端口被拒"这条性质本来就不受绑定地址那一层的影响。
     """
     # -R 的目标地址由跑在宿主上的 ssh 客户端解析，宿主不在 compose 网络里，
     # 所以只能写一体机已发布到宿主的端口，不能写 compose 服务名。
@@ -144,17 +141,18 @@ def test_reverse_port_outside_permitlisten_is_refused(harness):
 def test_reverse_port_outside_permitlisten_is_refused_on_a_wildcard_address_too(harness):
     """换个绑定地址也绕不过端口限制。
 
-    现状说明清楚：这条用例眼下并不比上面那条多测出什么——当前的
-    `PermitListen 127.0.0.1:22001` 是地址限定形式，请求
-    `0.0.0.0:22002` 会因为地址和端口两个维度都对不上而被拒，跟上面那条
-    请求 `127.0.0.1:22002` 被拒的原因（地址对、端口不对）并不是同一件事，
-    但从客户端能看到的现象（"remote port forwarding failed"）上分不出区别。
+    Task 5 落地之后这条用例才真正独立于上面那条。`PermitListen` 现在是裸端口
+    形式（`PermitListen 22001`）、`GatewayPorts yes`，地址不再是 `PermitListen`
+    判断的一部分，于是这两条用例的唯一差别就是请求里的绑定地址：上面请求
+    `127.0.0.1:22002`，这里请求 `0.0.0.0:22002`，两者都只能因为端口 22002 不在
+    放行项里而被拒。它多测出来的那条性质是"客户端换一个绑定地址也逃不出端口
+    白名单"。
 
-    这条用例是为 Task 5 预留的：等 `PermitListen` 改成裸端口形式、
-    `GatewayPorts` 改成 `yes`，地址就不再是 `PermitListen` 判断的一部分，
-    到那时"换个地址也挡不住端口限制"才会成为一条独立于上面那条、真正测出
-    额外东西的性质。现在留着它，是为了那条性质一旦生效就立刻有测试盯着，
-    而不是等 Task 5 落地时才想起来要写。
+    Task 5 之前它并不比上面那条多测出什么：那时 `PermitListen` 是地址限定形式
+    `127.0.0.1:22001`，请求 `0.0.0.0:22002` 地址与端口两个维度都对不上，被拒的
+    原因跟上面那条并不是同一件事，但从客户端能看到的现象
+    （"remote port forwarding failed"）上分不出区别。当时留着它，是为了那条性质
+    一旦生效就立刻有测试盯着，而不是等 Task 5 落地时才想起来要写。
     """
     # 同上：-R 的目标地址由宿主的 ssh 客户端解析，不能写 compose 服务名。
     out = run_ssh_password(TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
