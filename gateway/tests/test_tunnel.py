@@ -1,7 +1,13 @@
+import subprocess
+import tempfile
+import time
+
+import pytest
+
 from conftest import (
-    APPLIANCE_PW, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
-    gateway_listen_table, parse_listen_table, reverse_port_registered,
-    run_ssh_password,
+    APPLIANCE_PW, APPLIANCE_SSHD, HOST, TUNNEL_PORT, TUNNEL_PW, TUNNEL_SSHD,
+    TUNNEL_USER, _stop_tunnel, gateway_listen_table, parse_listen_table,
+    popen_ssh_password, reverse_port_registered, run_ssh_password,
 )
 
 
@@ -64,6 +70,69 @@ def test_reverse_port_is_bound_on_a_wildcard_address(tunnel):
     bound = [w for w in ("0.0.0.0", "*", "[::]") if (w, TUNNEL_PORT) in entries]
     assert bound, table
     assert (HOST, TUNNEL_PORT) not in entries, table
+
+
+def test_reverse_request_without_a_bind_address_is_accepted(harness):
+    """现场那条 `-R` 不写绑定地址，服务端必须照收——裸端口 PermitListen 的作用。
+
+    现场的隧道命令是 `ssh -R 22001:127.0.0.1:61001 tunnel-zhang@gateway`：只给
+    端口，不给绑定地址。OpenSSH 客户端据此请求的监听主机是 "localhost"，而
+    `PermitListen` 只做字面比较、不解析也不做模式匹配，所以
+    `PermitListen 127.0.0.1:22001` 那种带地址的写法会把这条请求拒掉，服务端记
+    `to remote forward to host localhost port 22001, but the request was denied`；
+    只有裸端口形式 `PermitListen 22001` 才收。
+
+    这条用例存在的唯一理由，就是让「必须写成裸端口形式」这件事有人盯着：套件里
+    另外两条活的反向转发（`tunnel` 固件与 TLS 用例）请求的都是
+    `127.0.0.1:22001` 这种带地址的形式，带地址的放行项照收不误；两条 PermitListen
+    边界用例请求的是 22002，两种写法都会拒。也就是说，在这条用例之前，把配置
+    退回 `PermitListen 127.0.0.1:22001` 整套 53 个用例仍然全绿，而现场的命令已经
+    连不上了。
+
+    刻意没有塞进 `tunnel` 固件，也没有改固件里 `-R` 的写法：固件里的失败会以
+    fixture ERROR 的形式炸成一片，而不是某一条用例红着说出坏掉的是哪条性质；
+    Task 6 紧接着也要用这个固件，这么晚改共享行为会一次动到四个任务的测试。
+    新加一条用例只做加法。
+
+    失败路径必须报得出来：常驻 ssh 的输出接临时文件而不是管道（没人读的管道写满
+    会把 ssh 卡死，进程还活着时也读不出已有内容），并且每轮先看 `proc.poll()`
+    ——请求被拒时 `ExitOnForwardFailure=yes` 会让 ssh 立刻退出，这一条就直接
+    带着 `remote port forwarding failed` 报红，不用等满 20 秒。
+    """
+    log = tempfile.TemporaryFile()
+    proc = popen_ssh_password(
+        TUNNEL_PW, "-N", "-T", "-p", str(TUNNEL_SSHD),
+        "-o", "ExitOnForwardFailure=yes",
+        # 不写绑定地址，与现场命令的形状一致；-R 的目标地址仍由宿主上的 ssh
+        # 客户端解析，所以只能写一体机已发布到宿主的端口。
+        "-R", f"{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}",
+        f"{TUNNEL_USER}@{HOST}",
+        stdout=log, stderr=subprocess.STDOUT,
+    )
+
+    def output() -> str:
+        log.seek(0)
+        return log.read().decode("utf-8", "replace").strip()
+
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                pytest.fail(
+                    f"不带绑定地址的 -R 请求被拒或隧道提前退出"
+                    f"（退出码 {proc.returncode}）：{output()}")
+            if reverse_port_registered(TUNNEL_PORT):
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail(
+                f"不带绑定地址的 -R 请求没能把反向端口 {TUNNEL_PORT} 注册上；"
+                f"ssh 输出：{output()}")
+    finally:
+        try:
+            _stop_tunnel(proc)
+        finally:
+            log.close()
 
 
 def test_engineer_connects_to_appliance_directly(tunnel):

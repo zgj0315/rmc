@@ -28,6 +28,15 @@ AllowAgentForwarding no
 AllowStreamLocalForwarding no
 ForceCommand /bin/false
 
+# 全局默认拒绝一切反向端口，逐账号的 Match 块才是唯一放行的地方（见下面受管区
+# 段里的 PermitListen <port>，Match 块里的值覆盖这里的全局值）。
+# 没有这一行，一个还没写进受管区段的 tunnel-* 账号（例如登记表加了账号但
+# scripts/enroll-account.sh 还没跑）就会落到 PermitListen 的出厂默认「任意端口」
+# 上——在 GatewayPorts yes 之下那是任意端口绑 0.0.0.0，公网可达。客户接受的是
+# 「一个账号一个端口公网可达」，不是「任意端口」，所以漏登记必须退化成「什么都
+# 转不了」，而不是退化成敞开。
+PermitListen none
+
 # 以下 Match 块由 scripts/enroll-account.sh 依 registry.toml 生成，勿手工编辑。
 # PermitListen 必须写成不带地址的裸端口形式。两条理由都在这套 OpenSSH（9.2p1）
 # 上实测过：

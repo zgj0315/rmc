@@ -241,6 +241,8 @@ def test_pubkey_auth_is_disabled(harness):
     `AuthenticationMethods`，报的是 "(publickey)"）同时改变了两条指令，
     把两者的差异全记到了其中一条头上——这类"换一个配置整体做对照"的验证，
     只有在两份配置恰好只差被测的那一条指令时才成立，这里不满足。
+    （那个 engineer sshd 实例已经在 Task 5 随工程师入口一起删掉了，这个对照
+    实验现在也复现不了，留在这里只是为了说明当初的结论是怎么被推翻的。）
 
     因此删掉 `PubkeyAuthentication no` 并不会让这条断言变红（"(password)"
     后缀不会变成 "(publickey)"，因为 `AuthenticationMethods password` 还在）。
