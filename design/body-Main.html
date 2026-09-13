@@ -1,0 +1,56 @@
+    <div style="display: flex; align-items: center; gap: 11px; padding: 13px 14px; background: #ffffff; border: 1px solid #e8e8e8; border-radius: 6px">
+      <span style="width: 10px; height: 10px; border-radius: 50%; background: #8a8a8a; box-shadow: 0 0 0 3px rgba(138,138,138,0.15); flex-shrink: 0"></span>
+      <div class="col">
+        <div style="font-size: 15px; font-weight: 600">未开启</div>
+        <div class="sub">远程维护默认关闭，由现场人员确认后开启</div>
+      </div>
+    </div>
+
+    <div class="sec">维护目标</div>
+    <div class="card">
+      <div class="row">
+        <span class="lbl">一体机</span>
+        <div class="in mono">192.168.100.10</div>
+        <span class="sub">:</span>
+        <div class="in mono" style="flex-grow: 0; width: 54px; justify-content: center">22</div>
+      </div>
+    </div>
+
+    <div class="sec">公司 Gateway</div>
+    <div class="card">
+      <div class="row">
+        <span class="lbl">地址</span>
+        <div class="in mono">gateway.company.com</div>
+        <span class="sub">:</span>
+        <div class="in mono" style="flex-grow: 0; width: 54px; justify-content: center">443</div>
+      </div>
+      <div class="row">
+        <span class="lbl">出网</span>
+        <svg style="flex-shrink: 0" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.2 8.4l3.1 3.1L12.8 5" stroke="#0f7b0f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>经系统代理 proxy.company.com:8080</span>
+        <span style="flex-grow: 1"></span>
+        <span class="sub">自动检测</span>
+      </div>
+      <div class="row">
+        <span class="lbl">账号</span>
+        <div class="in">tunnel-zhang</div>
+      </div>
+      <div class="row">
+        <span class="lbl">密码</span>
+        <div class="in" style="justify-content: space-between">
+          <span style="letter-spacing: 2px; color: #3b3b3b">••••••••••</span>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M1.6 8s2.4-4.1 6.4-4.1S14.4 8 14.4 8s-2.4 4.1-6.4 4.1S1.6 8 1.6 8z" stroke="#6b6b6b" stroke-width="1.2" stroke-linejoin="round"/><circle cx="8" cy="8" r="1.7" stroke="#6b6b6b" stroke-width="1.2"/></svg>
+        </div>
+      </div>
+      <div class="row">
+        <span class="lbl"></span>
+        <span class="chk"></span>
+        <span>记住密码</span>
+        <span class="sub">默认不保存，勾选后加密落盘</span>
+      </div>
+    </div>
+
+    <span style="flex-grow: 1"></span>
+
+    <div class="btn btn-a">开启远程维护</div>
+    <div class="sub" style="text-align: center">开启后仅转发 192.168.100.10:22，可随时停止</div>

@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; font-family: "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+    a { color: #0067c0; text-decoration: none; }
+    a:hover { color: #005ba1; text-decoration: underline; }
+    .win { width: 520px; height: 720px; display: flex; flex-direction: column; background: #f3f3f3; color: #1c1c1c; font-size: 13px; line-height: 1.45; overflow: hidden; }
+    .tbar { height: 40px; flex-shrink: 0; display: flex; align-items: center; gap: 9px; padding-left: 14px; }
+    .wbtn { width: 44px; height: 32px; display: flex; align-items: center; justify-content: center; }
+    .tabs { height: 40px; flex-shrink: 0; display: flex; align-items: stretch; gap: 4px; padding: 0 14px; border-bottom: 1px solid #e5e5e5; }
+    .tab { display: flex; align-items: center; padding: 0 10px; font-size: 13px; color: #5d5d5d; border-bottom: 2px solid transparent; }
+    .tab-on { color: #1c1c1c; font-weight: 600; border-bottom: 2px solid #0067c0; }
+    .body { flex-grow: 1; display: flex; flex-direction: column; gap: 12px; padding: 14px; overflow: hidden; }
+    .card { background: #ffffff; border: 1px solid #e8e8e8; border-radius: 6px; overflow: hidden; }
+    .row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; }
+    .row + .row { border-top: 1px solid #f0f0f0; }
+    .lbl { width: 66px; flex-shrink: 0; color: #3b3b3b; }
+    .col { display: flex; flex-direction: column; gap: 1px; flex-grow: 1; }
+    .sec { font-size: 12px; font-weight: 600; color: #5d5d5d; margin-bottom: -4px; }
+    .sub { font-size: 12px; color: #6b6b6b; }
+    .mono { font-family: "Cascadia Mono", "SF Mono", Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    .in { height: 30px; flex-grow: 1; display: flex; align-items: center; padding: 0 9px; background: #fbfbfb; border: 1px solid #d8d8d8; border-bottom-color: #8d8d8d; border-radius: 4px; }
+    .btn { height: 34px; display: flex; align-items: center; justify-content: center; gap: 7px; border-radius: 4px; font-size: 13px; background: #fdfdfd; border: 1px solid #d4d4d4; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.05); color: #1c1c1c; }
+    .btn-a { background: #0067c0; border: 1px solid rgba(0,0,0,0.12); box-shadow: inset 0 -1px 0 rgba(0,0,0,0.16); color: #ffffff; font-weight: 600; }
+    .chk { width: 16px; height: 16px; border: 1px solid #8d8d8d; border-radius: 3px; background: #fbfbfb; flex-shrink: 0; }
+    .spin { animation: sp 1.1s linear infinite; transform-origin: 50% 50%; }
+    @keyframes sp { to { transform: rotate(360deg); } }
+    .pulse { animation: pu 1.6s ease-in-out infinite; }
+    @keyframes pu { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+  </style>
+</helmet>

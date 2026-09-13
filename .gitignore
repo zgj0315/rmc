@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# 画布成品文件，约 2.5 MB，由 design/ 下的源文件生成
+design/remote-maintenance-client-ui.html
+
+# 画板由 build.mjs 从 body-*.html 与 _shell_head.txt 生成
+design/*.dc.html

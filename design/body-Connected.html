@@ -1,0 +1,64 @@
+    <div style="display: flex; align-items: center; gap: 11px; padding: 13px 14px; background: #f2f8f2; border: 1px solid #cfe3cf; border-radius: 6px">
+      <span style="width: 10px; height: 10px; border-radius: 50%; background: #0f7b0f; box-shadow: 0 0 0 3px rgba(15,123,15,0.16); flex-shrink: 0"></span>
+      <div class="col">
+        <div style="font-size: 15px; font-weight: 600">已连接</div>
+        <div class="sub">Gateway 反向端口 127.0.0.1:22001</div>
+      </div>
+      <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 1px">
+        <span class="mono" style="font-size: 17px; font-weight: 600">00:34:14</span>
+        <span class="sub">已连接</span>
+      </div>
+    </div>
+
+    <div class="sec">链路</div>
+    <div class="card">
+      <div class="row" style="align-items: flex-start">
+        <svg style="margin-top: 2px; flex-shrink: 0" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.2 8.4l3.1 3.1L12.8 5" stroke="#0f7b0f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div class="col">
+          <span>一体机 192.168.100.10:22</span>
+          <span class="sub mono">host key SHA256:kM9v…7bQe</span>
+        </div>
+      </div>
+      <div class="row" style="align-items: flex-start">
+        <svg style="margin-top: 2px; flex-shrink: 0" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.2 8.4l3.1 3.1L12.8 5" stroke="#0f7b0f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div class="col">
+          <span>Gateway gateway.company.com:443</span>
+          <span class="sub">经系统代理 proxy.company.com:8080 · TLS 1.3</span>
+        </div>
+      </div>
+      <div class="row" style="align-items: flex-start">
+        <svg style="margin-top: 2px; flex-shrink: 0" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.2 8.4l3.1 3.1L12.8 5" stroke="#0f7b0f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div class="col">
+          <span>Gateway 反向端口 127.0.0.1:22001</span>
+          <span class="sub">已注册，仅 Gateway 本机可访问</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="display: flex; align-items: baseline; gap: 8px">
+      <span class="sec" style="margin: 0">远程会话</span>
+      <span class="sub">2 个进行中</span>
+    </div>
+    <div class="card">
+      <div class="row">
+        <span class="mono" style="color: #8a8a8a; width: 20px; flex-shrink: 0">#1</span>
+        <div class="col">
+          <span>11:14 起 · 32 分 58 秒</span>
+          <span class="sub">发往一体机 1.2 MB · 来自一体机 340 KB</span>
+        </div>
+        <div class="btn" style="height: 26px; padding: 0 11px; font-size: 12px; flex-shrink: 0">断开</div>
+      </div>
+      <div class="row">
+        <span class="mono" style="color: #8a8a8a; width: 20px; flex-shrink: 0">#2</span>
+        <div class="col">
+          <span>11:41 起 · 6 分 04 秒</span>
+          <span class="sub">发往一体机 98 KB · 来自一体机 22 KB</span>
+        </div>
+        <div class="btn" style="height: 26px; padding: 0 11px; font-size: 12px; flex-shrink: 0">断开</div>
+      </div>
+    </div>
+
+    <span style="flex-grow: 1"></span>
+
+    <div class="btn">停止远程维护</div>
+    <div class="sub" style="text-align: center">停止后 Gateway 反向端口立即释放</div>
