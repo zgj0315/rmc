@@ -1,0 +1,9 @@
+# Gateway 隧道账号登记表，账号与反向端口的唯一事实来源。
+# 新增账号后运行 scripts/enroll-account.sh <username>。
+# 端口范围 22000-22999，逐账号唯一。
+
+[[tunnel_account]]
+username   = "tunnel-zhang"
+owner      = "张三"
+port       = 22001
+appliances = ["c0001-a1"]

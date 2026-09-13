@@ -10,3 +10,4 @@ design/*.dc.html
 # 隔离工作区
 .worktrees/
 .superpowers/
+gateway/.venv/
