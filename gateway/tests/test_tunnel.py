@@ -6,11 +6,23 @@ from conftest import (
 
 
 def test_tunnel_account_authenticates_with_password(harness):
+    """认证成功必须有正面证据，不能只断言 stderr 里没有某几个字符串。
+
+    「没有 Permission denied」是假绿的温床：连接被拒、被 reset、超时，或者
+    OpenSSH 改了措辞，stderr 里都不会有那两个字符串，用例照样绿。这里的风险是
+    真实存在的——wait_port(TUNNEL_SSHD) 连的是 socat 旁路，而 socat 在 2223 上
+    照单全收，不管 sshd 到底有没有起来听 2222。
+
+    正面证据用会话本身的输出：账号的 shell 是 nologin、配置里又有
+    ForceCommand /bin/false，认证一旦通过、会话一旦建立，nologin 就会打印
+    This account is currently not available. 并以 1 退出。这句话只有在认证
+    真的过了之后才可能出现，连不上的连接不会有任何 stdout。
+    """
     out = run_ssh_password(
         TUNNEL_PW, "-p", str(TUNNEL_SSHD), f"{TUNNEL_USER}@{HOST}", "true")
-    # ForceCommand /bin/false 会让命令失败，但认证必须通过。
-    assert "Permission denied" not in out.stderr
-    assert "Authentication failed" not in out.stderr
+    assert "This account is currently not available" in out.stdout, (
+        f"rc={out.returncode} stdout={out.stdout!r} stderr={out.stderr!r}")
+    assert out.returncode == 1, out.stderr
 
 
 def test_wrong_password_is_rejected(harness):

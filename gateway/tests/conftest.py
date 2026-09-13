@@ -79,12 +79,18 @@ def run_ssh_password(password: str, *args: str, timeout: int = 25) -> subprocess
     )
 
 
-def popen_ssh_password(password: str, *args: str) -> subprocess.Popen:
-    """起一条常驻的口令认证 ssh（例如 -N -T 的隧道），收尾由调用方负责。"""
+def popen_ssh_password(password: str, *args: str, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE) -> subprocess.Popen:
+    """起一条常驻的口令认证 ssh（例如 -N -T 的隧道），收尾由调用方负责。
+
+    默认把输出接到管道，适合马上就会退出的短命进程。要长期留着的进程请改接
+    临时文件（见 tunnel 固件）：没人读的管道写满缓冲区会把 ssh 卡死，而且进程
+    还活着时也读不出里面已有的内容，失败信息就报不出来。
+    """
     return subprocess.Popen(
         ["ssh", *SSH_COMMON, *args],
         env=askpass_env(password), stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=stdout, stderr=stderr, text=True,
     )
 
 
@@ -103,8 +109,11 @@ def engineer_proxy_option() -> list[str]:
     ssh 的 -J 不会把命令行上的 -i 传给跳板那一跳，所以这里显式写 ProxyCommand，
     让跳板连接用 test-env/engineer-keys 里的私钥做公钥认证。
     """
+    # ENG_COMMON 要拼成一条由 shell 解析的命令行，逐项 shlex.quote：
+    # 私钥路径里只要有空格（仓库被 clone 到带空格的目录下），不加引号就会被拆开。
+    opts = " ".join(shlex.quote(item) for item in ENG_COMMON)
     return ["-o", "ProxyCommand=ssh {} -W %h:%p -p {} eng@{}".format(
-        " ".join(ENG_COMMON), ENGINEER_SSHD, HOST)]
+        opts, ENGINEER_SSHD, HOST)]
 
 
 def wait_port(port: int, timeout: float = 60.0) -> None:
@@ -132,8 +141,18 @@ def gateway_listen_table() -> str:
 
     断言监听地址的用例都从这里取表，失败时把整张表贴进断言消息，才看得出
     端口到底绑在哪个地址上。
+
+    `docker compose exec` 失败时必须抛出来，不能把返回码和 stderr 丢掉后交回
+    一张空表：空表会让 tunnel 固件白等二十秒，最后报一句「反向端口未出现」，
+    把 docker 的问题伪装成 sshd 的问题。
     """
-    return compose("exec", "-T", "gateway", "ss", "-ltn", check=False).stdout
+    out = compose("exec", "-T", "gateway", "ss", "-ltn", check=False)
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"取 gateway 监听表失败，docker compose exec 退出码 {out.returncode}\n"
+            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
+        )
+    return out.stdout
 
 
 def parse_listen_table(text: str) -> set[tuple[str, int]]:
@@ -166,14 +185,22 @@ def parse_listen_table(text: str) -> set[tuple[str, int]]:
     return entries
 
 
-def port_listening_in_gateway(port: int, address: str = HOST) -> bool:
+def port_listening_in_gateway(port: int, address: str = HOST, *,
+                              table: str | None = None) -> bool:
     """Gateway 容器里是否有监听套接字精确绑在 `address:port` 上。
 
     `address` 默认 loopback。要断言某端口绑在通配地址上（Task 4 的 443、
     Task 5 的 22），传 `address="0.0.0.0"` / `"*"` / `"[::]"`，而不要去匹配
     地址字面量的子串。
+
+    `table` 给单元测试用：传入一段固定的 `ss` 文本就直接解析它，不去容器取表。
+    两个真实 bug 都出在这个函数身上（而不是 parse_listen_table 里），所以它必须
+    能脱离 docker 被覆盖——否则谁把这里改回 `f"{address}:{port}" in ...`，
+    十几个解析器用例还会全绿。见 test_listen_table.py。
     """
-    return (address, port) in parse_listen_table(gateway_listen_table())
+    if table is None:
+        table = gateway_listen_table()
+    return (address, port) in parse_listen_table(table)
 
 
 def ensure_engineer_keypair() -> None:
@@ -217,9 +244,40 @@ def harness():
             compose("down", "-v", check=False)
 
 
+def _stop_tunnel(proc: subprocess.Popen) -> None:
+    """收掉隧道进程，并等 Gateway 上的反向端口真的消失。
+
+    wait 必须带兜底：TimeoutExpired 从 finally 里抛出去，会留下一个还活着的 ssh
+    占着 TUNNEL_PORT，而下一个 tunnel 用 ExitOnForwardFailure=yes 连同一个端口，
+    于是后面每个用例都被毒到。
+
+    客户端退出也不等于 sshd 立刻释放监听。Task 6 要测反向端口的回收时延，
+    连着跑的用例之间必须等端口消失再返回，否则会互相干扰。
+    """
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if not port_listening_in_gateway(TUNNEL_PORT):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"隧道进程已退出，但反向端口 {TUNNEL_PORT} 仍留在 Gateway 上；"
+        f"后续用例会被它干扰"
+    )
+
+
 @pytest.fixture
 def tunnel(harness):
     """以 tunnel-zhang 建立反向端口，yield 期间隧道在线。"""
+    # 输出写临时文件而不是管道：常驻的 ssh 没人读管道，写满就卡死；而且用文件
+    # 才能在进程还活着时把 stderr 读出来，「端口没出现」那条失败路径才报得出原因。
+    log = tempfile.TemporaryFile()
     proc = popen_ssh_password(
         TUNNEL_PW,
         "-N", "-T",
@@ -229,18 +287,28 @@ def tunnel(harness):
         # 所以这里只能写一体机已发布到宿主的端口，不能写 compose 服务名。
         "-R", f"127.0.0.1:{TUNNEL_PORT}:{HOST}:{APPLIANCE_SSHD}",
         f"{TUNNEL_USER}@{HOST}",
+        stdout=log, stderr=subprocess.STDOUT,
     )
+
+    def output() -> str:
+        log.seek(0)
+        return log.read().decode("utf-8", "replace").strip()
+
     try:
         deadline = time.time() + 20
         while time.time() < deadline:
             if proc.poll() is not None:
-                pytest.fail(f"隧道进程提前退出：{proc.communicate()[1]}")
+                pytest.fail(
+                    f"隧道进程提前退出（退出码 {proc.returncode}）：{output()}")
             if port_listening_in_gateway(TUNNEL_PORT):
                 break
             time.sleep(0.5)
         else:
-            pytest.fail(f"反向端口 {TUNNEL_PORT} 未在 Gateway 上出现")
+            pytest.fail(
+                f"反向端口 {TUNNEL_PORT} 未在 Gateway 上出现；ssh 输出：{output()}")
         yield proc
     finally:
-        proc.terminate()
-        proc.wait(timeout=10)
+        try:
+            _stop_tunnel(proc)
+        finally:
+            log.close()
