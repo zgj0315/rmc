@@ -44,4 +44,4 @@ else
     printf '%s 当前没有在线会话。\n' "$username"
 fi
 
-printf '请从 registry.toml 中删除 %s 的记录，再次运行 enroll 以对齐配置。\n' "$username"
+printf '本脚本不会修改 registry.toml；请手工删除 %s 的记录——在删除之前，下一次任意账号的\nenroll 都会把它的端口放行重新生成出来（届时 enroll 会对仍在册但已锁定的账号发出警告）。\n' "$username"

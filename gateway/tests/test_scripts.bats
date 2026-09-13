@@ -218,7 +218,7 @@ teardown() {
     run /gateway/scripts/revoke-account.sh tunnel-new
     [ "$status" -eq 0 ]
     [[ "$output" == *"tunnel-new 当前没有在线会话"* ]]
-    [[ "$output" == *"请从 registry.toml 中删除 tunnel-new 的记录"* ]]
+    [[ "$output" == *"请手工删除 tunnel-new 的记录"* ]]
 }
 
 @test "enroll 处理不相关账号时，对仍在登记表却已被锁定的账号发出警告" {

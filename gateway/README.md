@@ -26,14 +26,14 @@
 ## 部署
 
 ```bash
-install -m 600 sshd_tunnel_config /etc/ssh/sshd_tunnel_config
-install -m 644 haproxy.cfg /etc/haproxy/haproxy.cfg
-install -m 644 systemd/sshd-tunnel.service /etc/systemd/system/
-ssh-keygen -t ed25519 -N '' -f /etc/ssh/tunnel_host_ed25519_key
+sudo install -m 600 sshd_tunnel_config /etc/ssh/sshd_tunnel_config
+sudo install -m 644 haproxy.cfg /etc/haproxy/haproxy.cfg
+sudo install -m 644 systemd/sshd-tunnel.service /etc/systemd/system/
+sudo ssh-keygen -t ed25519 -N '' -f /etc/ssh/tunnel_host_ed25519_key
 # 证书用公共 CA 签发，合成 fullchain+key 放到下面这个路径
-install -m 600 gateway.pem /etc/haproxy/certs/gateway.pem
-systemctl daemon-reload
-systemctl enable --now sshd-tunnel haproxy
+sudo install -m 600 gateway.pem /etc/haproxy/certs/gateway.pem
+sudo systemctl daemon-reload
+sudo systemctl enable --now sshd-tunnel haproxy
 ```
 
 记下 `/etc/ssh/tunnel_host_ed25519_key.pub` 的指纹，客户端首次连接时要核对：
