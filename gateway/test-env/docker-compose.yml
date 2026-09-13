@@ -1,0 +1,20 @@
+name: rmc-gateway-test
+
+services:
+  appliance:
+    build: ./appliance
+    ports:
+      - "127.0.0.1:2322:22"
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: test-env/gateway/Dockerfile
+    depends_on:
+      - appliance
+    volumes:
+      - ./engineer-keys:/engineer-keys:ro
+    ports:
+      - "127.0.0.1:2422:2223"
+      - "127.0.0.1:2022:22"
+      - "127.0.0.1:8443:443"

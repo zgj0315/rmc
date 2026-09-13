@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenSSH tunnel-only instance for Remote Maintenance
+After=network.target
+Requires=sshd-keygen-tunnel.service
+
+[Service]
+Type=notify
+ExecStartPre=/usr/sbin/sshd -t -f /etc/ssh/sshd_tunnel_config
+ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_tunnel_config
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
