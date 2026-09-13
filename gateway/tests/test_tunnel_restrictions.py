@@ -2,6 +2,8 @@ import socket
 import subprocess
 import tempfile
 
+import pytest
+
 from conftest import (
     APPLIANCE_SSHD, HOST, TUNNEL_PW, TUNNEL_SSHD, TUNNEL_USER,
     compose, popen_ssh_password, run_sftp_password, run_ssh_password, wait_port,
@@ -190,3 +192,66 @@ def test_pubkey_auth_is_disabled(harness):
     )
     assert out.returncode != 0
     assert "Permission denied (password)." in out.stderr, out.stderr
+
+
+@pytest.fixture(scope="module")
+def tunnel_effective_config(harness):
+    """tunnel-zhang 在这份配置下、sshd 自己解析出来的有效配置（转小写后整段返回）。
+
+    跟 test_agent_forwarding_is_refused 用的是同一个查法：带 `-C user=...` 让
+    Match 块真的被解析，输出反映的是账号连接时 sshd 实际会查到的值，而不是
+    源文件里的原始文本。
+    """
+    out = compose("exec", "-T", "gateway", "sshd", "-T",
+                  "-f", "/etc/ssh/sshd_tunnel_config",
+                  "-C", f"user={TUNNEL_USER},host=test,addr=127.0.0.1",
+                  check=False, timeout=20)
+    assert out.returncode == 0, f"sshd -T 失败：{out.stderr}"
+    return out.stdout.lower()
+
+
+# 下面这张表钉住的都是「行为测试测的是端到端可观察结果，而不是某一行配置」
+# 暴露出来的盲区：两组指令里任何一条单独被删掉，对应的行为测试都不会变红，
+# 因为另一层还在，端到端现象（refuse 的具体文本）完全没变——已经逐条用
+# sshd -T 实测过删除效果（见 task-3-report.md），确认这四条各自单独删掉时
+# effective config 都会变成默认值，因而都会让下面的断言真的变红：
+#
+# - sftp：`Subsystem sftp /bin/false` 与顶层 `ForceCommand /bin/false` 二选一
+#   在场，test_sftp_subsystem_is_unavailable 报的都是同一句
+#   "Received message too long"；只删 Subsystem 那一行，未声明的子系统请求会被
+#   sshd 直接拒绝（"subsystem request failed"，行为测试的断言依然会因为文本
+#   变了而失败，但那是巧合，不是这条测试在把关）；只删 ForceCommand、换成真正
+#   的 sftp-server，sftp 会变得可用，行为测试才会失败。也就是说光靠行为测试，
+#   删掉 Subsystem 这一行本身完全可能被巧合地接住，删掉 ForceCommand 这一行
+#   则接不住（因为 test_no_shell_and_no_command_execution 会先接住它——但那是
+#   另一个测试在关另一件事，不是这条测试的问题）。
+# - 本地转发：`AllowTcpForwarding remote` 与 `PermitOpen none` 二选一在场，
+#   test_local_forwarding_is_refused 报的都是同一句 "administratively
+#   prohibited"；只放宽其中一条、留着另一条，实测过报错文本完全不变，行为
+#   测试会继续通过，看不出少了一层。
+#
+# `nologin` 登录 shell（test_no_shell_and_no_command_execution 的另一层保险）
+# 不在这张表里：那是测试环境建账号时给的 `--shell /usr/sbin/nologin`
+# （见 test-env/gateway/entrypoint.sh），不是 sshd_tunnel_config 里的指令，
+# `sshd -T` 查不到，也不归这份配置管。
+_LAYERED_DIRECTIVES = [
+    pytest.param("forcecommand /bin/false", id="ForceCommand"),
+    pytest.param("subsystem sftp /bin/false", id="Subsystem-sftp"),
+    pytest.param("allowtcpforwarding remote", id="AllowTcpForwarding"),
+    pytest.param("permitopen none", id="PermitOpen"),
+]
+
+
+@pytest.mark.parametrize("expected_line", _LAYERED_DIRECTIVES)
+def test_layered_directive_is_still_individually_in_effect(
+        tunnel_effective_config, expected_line):
+    """防止「删掉双重保险里的一层，因为另一层还在、行为测试仍然全绿」的静默退化。
+
+    这条测试跟上面的行为测试做的是不同的事：行为测试证明边界端到端仍然挡得住，
+    这条测试证明挡住它的每一层配置本身还都在——两者都要，缺一个都会漏掉一种
+    退化路径。谁把这张表里的某一行从 sshd_tunnel_config 删掉，行为测试可能因为
+    另一层backstop（或者别的测试碰巧接住）而继续全绿，这条测试会先变红，
+    而且失败信息直接就是「哪一条指令没了」，不用像行为测试那样先去猜是不是
+    connection 层面出了别的问题。
+    """
+    assert expected_line in tunnel_effective_config, tunnel_effective_config
