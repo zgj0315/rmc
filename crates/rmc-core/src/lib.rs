@@ -6,6 +6,8 @@ pub mod backoff;
 pub mod config;
 pub mod error;
 pub mod knownhosts;
+pub mod platform;
+pub mod transport;
 
 pub use addr::HostPort;
 pub use error::{Error, ErrorClass, Result};
