@@ -62,23 +62,34 @@ pub enum Error {
     #[error("配置错误：{0}")]
     Config(String),
 
+    /// 传输层 socket 级 io::Error 的落点，归 Network——一次网络抖动不该
+    /// 杀死会话，这是安全默认。
+    ///
+    /// R15：故意不挂 `#[from]`。一个类型对 `std::io::Error` 的 `From`
+    /// 实现只能有一份；如果这里挂着 `#[from]`，`?` 就会把任何
+    /// `std::io::Error`（包括本该走 LocalIo 的本地文件系统错误）都顺手
+    /// 转成 Io，而 Io 与 LocalIo 需要的处置完全相反（见 LocalIo 上的
+    /// 注释）。少了 `#[from]` 这个"顺手"的路，才逼着调用方在每个 io 落点
+    /// 上想一遍"这是 socket 还是本地文件"——构造时用 `Error::Io(e)`。
     #[error("IO 错误：{0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
 
     /// R14：本地文件系统操作失败（如 known_hosts 读写——权限错误、磁盘
     /// 满）。与 Io 分开是因为二者需要的处置完全相反：
-    /// - Io 挂了 `#[from]`，兜底传输层任何 socket 级 io::Error；把它归为
-    ///   Network 是安全默认（一次网络抖动不该杀死会话），但也因此不能把
-    ///   Io 整体改成 Fatal——那样会连带把偶发的 socket 错误也变成永久性
-    ///   失败。
+    /// - Io 归 Network 是安全默认（一次网络抖动不该杀死会话），但也因此
+    ///   不能把 Io 整体改成 Fatal——那样会连带把偶发的 socket 错误也变成
+    ///   永久性失败。
     /// - 而 known_hosts 权限错误、磁盘满这类本地文件系统错误，退避重连
     ///   解决不了；如果和 Io 共用 Network 分类，Supervisor（Task 10）会
     ///   把隧道拆了重建、拆了重建，永远重连，工程师永远看不到需要处理
     ///   的原因。所以单列 Fatal，立刻停下来醒目提示。
     ///
-    /// 不能再给它挂 `#[from]`：同一个类型对 `std::io::Error` 的 `From`
-    /// 实现只能有一份，已经被 Io 占用了。Task 4 读写 known_hosts 时需要
-    /// 显式构造 `Error::LocalIo(e)`。
+    /// R15：同样故意不挂 `#[from]`（哪怕它没被 Io 占用，也不该挂）——
+    /// `?` 的自动转换不知道一个 io::Error 到底是 socket 错误还是本地文件
+    /// 错误，挂上 `#[from]` 只会制造第二条能被 `?` 悄悄选中的隐式路径，
+    /// 而具体走哪条完全取决于哪个变体先写上 `#[from]`，这本身就是运气。
+    /// 两个变体都要求显式构造：本地文件系统错误用 `Error::LocalIo(e)`，
+    /// socket 级错误用 `Error::Io(e)`。
     #[error("本地文件操作失败：{0}")]
     LocalIo(std::io::Error),
 }
@@ -178,11 +189,11 @@ mod tests {
 
     #[test]
     fn io_error_is_network() {
-        // Io 挂 #[from]，兜底任何 socket 层 io::Error，按网络类处理走退避
-        // 重连——这是安全默认，不能因为要处理本地文件系统错误就把它整体
-        // 改成 Fatal（那样一次 socket 抖动就会把会话判死）。
+        // socket 层 io::Error 按网络类处理走退避重连——这是安全默认，不能
+        // 因为要处理本地文件系统错误就把它整体改成 Fatal（那样一次 socket
+        // 抖动就会把会话判死）。R15：不再挂 `#[from]`，显式构造。
         let io_err = std::io::Error::other("connection reset");
-        assert_eq!(Error::from(io_err).class(), ErrorClass::Network);
+        assert_eq!(Error::Io(io_err).class(), ErrorClass::Network);
     }
 
     #[test]
