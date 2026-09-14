@@ -18,6 +18,32 @@ while let Ok(event) = ev_rx.recv().await {
 （`ssh`/`transport`/`preflight`/`audit` 等 `pub mod` 是给本 crate 内部
 分层用的，不是设计上打算让 rmc-win 越过 `Supervisor` 直接触碰的接口）。
 
+### Gateway 地址是每次 `Start` 带进来的
+
+方案 §3.8/§3.10 要求 Gateway 地址与端口可以现场修改。`Command::Start`
+携带的 `gateway` 就是这条隧道**实际拨号**的那一台，也是 host key 比对、
+预检探测、审计日志记录的那一台——四者读的是同一个值，不存在"界面显示
+一台、实际连另一台"的可能。改地址只需要再发一条 `Start`，**不需要**
+重建 `Supervisor` 或重新注入 `Deps`。
+
+`Config::gateway` 只是界面的初始值/上次使用值，不参与拨号；
+`Deps::factory` 里的 `SshTunnelFactory` 也不持有任何 Gateway 地址（它
+只有 `Transport` 与 `known_hosts`）。细节与这条约束是怎么被钉住的，见
+`tunnel::TunnelParams` 与 `ssh::SshTunnelFactory` 上的 R96 说明，以及
+`supervisor` 里的
+`start_passes_the_commanded_gateway_all_the_way_to_the_factory`。
+
+### 还没有生产装配点
+
+把一份 `Config` 变成 `Transport` + `KnownHosts` + `SshTunnelFactory` +
+`TransportPreflight` + `Deps` 这件事，本 crate 里目前**没有任何地方
+做过**：`Deps { .. }` 的唯一构造点在 `#[cfg(test)]` 里，
+`SshTunnelFactory::new` 的唯一调用点在 `tests/common/mod.rs`，
+`TransportPreflight::new` 全树零调用，`Config::known_hosts_path` 零
+读取。rmc-app 接上来的时候应当加一个 `Deps::production(cfg,
+platform...)` 把这条路径收进 core 自己（反向端口范围校验也归它），
+而不是让每个调用方各拼一遍。
+
 ## 平台能力注入
 
 `platform.rs` 中的三个 trait 由 rmc-win 实现：`ProxyResolver`、

@@ -310,7 +310,6 @@
 //!     设计.md` §3.5 表格下的说明与 `ssh/pump.rs` 里两处"全 crate
 //!     唯一那行 `warn!`"的注释都已经跟着 R81/R82 一并订正。
 
-use crate::addr::HostPort;
 use crate::audit::{Audit, Level};
 use crate::backoff::{Backoff, Jitter};
 use crate::config::{Config, ValidatedAddresses};
@@ -366,11 +365,20 @@ struct Credentials {
 }
 
 impl Credentials {
+    /// R96：`gateway` 也从这里出去。这是 `Command::Start` 携带的那台
+    /// Gateway 第一次真正参与拨号——在此之前它只流向地址关系校验、
+    /// `Preflight::run` 与审计日志，隧道实际连的是 `SshTunnelFactory`
+    /// 构造时就固定的另一个地址，两者失配时没有任何东西会报错。因果
+    /// 与实测见 `tunnel::TunnelParams` 上的 R96 说明。
+    ///
+    /// 会让 `start_passes_the_commanded_gateway_all_the_way_to_the_
+    /// factory` 变红的实现改法：把下面这一行换成任何别的地址。
     fn params(&self, reverse_port: u16) -> TunnelParams {
         TunnelParams {
             username: self.username.clone(),
             password: self.password.clone(),
             reverse_port,
+            gateway: self.addrs.gateway().clone(),
             appliance: self.addrs.appliance().clone(),
         }
     }
@@ -629,14 +637,20 @@ impl Ctx {
 /// 前提：`Ctx` 留在主循环那一侧，两者只通过 `connect_tx`/`msg_tx`
 /// 通信。
 /// [`run_connect_sequence`] 需要的一切输入，打包成一个结构体纯粹是为了
-/// 躲开 `clippy::too_many_arguments`（8 个参数超过默认上限 7）——拆开
-/// 传没有任何行为上的理由，合并成结构体也不改变每个字段各自的含义。
+/// 躲开 `clippy::too_many_arguments`（拆开传正好卡在默认上限 7 上）——
+/// 合并成结构体不改变每个字段各自的含义。
+///
+/// R96：原来这里还有 `gateway`/`appliance` 两个字段，专供
+/// `Preflight::run` 使用，跟 `params` 里的地址是两份独立的拷贝。既然
+/// `TunnelParams` 现在自己带着这两个地址（见 `tunnel::TunnelParams`
+/// 上的 R96 说明），这两个字段就删掉了——预检探测的地址与随后
+/// `establish` 拨号的地址此后是同一个值的两次读取，不可能分叉。删掉
+/// 它们不是为了少两行，是为了让「诊断页描述的那台机器就是实际连上的
+/// 那台」这件事在结构上无从违反。
 struct ConnectRequest {
     do_preflight: bool,
     preflight: Arc<dyn Preflight>,
     factory: Arc<dyn TunnelFactory>,
-    gateway: HostPort,
-    appliance: HostPort,
     params: TunnelParams,
 }
 
@@ -686,8 +700,6 @@ async fn run_connect_sequence(
         do_preflight,
         preflight,
         factory,
-        gateway,
-        appliance,
         params,
     } = req;
     let mut guard = FailOnPanic {
@@ -696,7 +708,9 @@ async fn run_connect_sequence(
     };
     if do_preflight {
         let _ = connect_tx.send(ConnectEvent::EnteredPreflight).await;
-        let report = preflight.run(&gateway, &appliance).await;
+        // R96：探的就是下面 `factory.establish(params, ..)` 要拨的那
+        // 一对地址——同一个 `params` 的两个字段，不是另一份拷贝。
+        let report = preflight.run(&params.gateway, &params.appliance).await;
         let passed = report.passed();
         let failure = report.first_failure().cloned();
         let _ = connect_tx.send(ConnectEvent::PreflightReport(report)).await;
@@ -751,8 +765,9 @@ fn spawn_connect(
     PendingHandle,
 )> {
     let creds = ctx.creds.as_ref()?;
-    let gateway = creds.addrs.gateway().clone();
-    let appliance = creds.addrs.appliance().clone();
+    // R96：地址不再单独拷一份出来——`params` 自己带着 gateway 与
+    // appliance，预检与拨号读的是同一对值，见 `ConnectRequest` 上的
+    // 说明。
     let params = creds.params(ctx.cfg.reverse_port);
     let preflight = ctx.deps.preflight.clone();
     let factory = ctx.deps.factory.clone();
@@ -767,8 +782,6 @@ fn spawn_connect(
         do_preflight,
         preflight,
         factory,
-        gateway,
-        appliance,
         params,
     };
     let task = tokio::spawn(run_connect_sequence(
@@ -1460,6 +1473,10 @@ mod tests {
     //! 定时器，脚本化的假隧道压根不会触发它。
 
     use super::*;
+    // R96：主体代码已经不再直接提 `HostPort`（地址一律经
+    // `ValidatedAddresses` 与 `TunnelParams` 传递），只有测试里的假
+    // `Preflight` 签名和地址字面量还要用它，所以导入收进测试模块。
+    use crate::addr::HostPort;
     use crate::backoff::FixedJitter;
     use crate::platform::{NoProxy, NoProxyAuth, NoSystemEvents, SystemEvent, SystemEvents};
     use crate::transport::tls::TlsRoots;
@@ -3296,6 +3313,109 @@ mod tests {
         .await;
     }
 
+    // --- R96（最终复审）：`Command::Start` 携带的 Gateway 地址必须
+    // 真的参与拨号，不能只参与"校验 + 预检 + 审计日志"。---
+
+    /// 记下每次 `run()` 被问到的 (gateway, appliance)，然后一律放行。
+    ///
+    /// 存在的理由：光断言"工厂收到的 gateway 等于 Start 传的那个"，
+    /// 还漏掉这条问题的另一半——诊断页显示的是**预检**探到的结果。
+    /// 必须同时钉住"预检探的那台"与"隧道实际连的那台"是同一台，
+    /// 否则日后谁把 `run_connect_sequence` 里预检的入参换回一份独立
+    /// 拷贝，诊断页又会开始稳定地描述一台不是实际连上的机器，而两条
+    /// 各管一头的断言都照样绿。
+    #[derive(Default)]
+    struct RecordingPreflight(Mutex<Vec<(HostPort, HostPort)>>);
+
+    #[async_trait::async_trait]
+    impl Preflight for RecordingPreflight {
+        async fn run(
+            &self,
+            gateway: &HostPort,
+            appliance: &HostPort,
+        ) -> preflight::PreflightReport {
+            self.0
+                .lock()
+                .unwrap()
+                .push((gateway.clone(), appliance.clone()));
+            AlwaysPassPreflight.run(gateway, appliance).await
+        }
+    }
+
+    // 方案 §3.8/§3.10：现场工程师可以把界面上的运维服务器地址改成客户
+    // 现场那一台再点「开启」。这条测试就演这个场景——`Start` 携带的
+    // Gateway 故意跟 `config()` 里那个（也就是 R96 之前
+    // `SshTunnelFactory` 构造时会被固定下来的那一个）不一样。
+    //
+    // R96 之前这件事完全没人盯：把 `Credentials::params` 里取 gateway
+    // 那一行（当时在 `spawn_connect` 里，写作
+    // `let gateway = creds.addrs.gateway().clone();`）换成任何一个写死
+    // 的错误地址，237 条测试 0 失败——`TunnelParams` 里根本没有这个
+    // 字段，假工厂 `Scripted` 看不到它，`AlwaysPassPreflight` 忽略参数。
+    //
+    // 会让这条测试变红的实现改法（三处，各自单独试过）：
+    //
+    // 1. 把 `Credentials::params` 里的
+    //    `gateway: self.addrs.gateway().clone()` 换成别的地址
+    //    （比如 `ctx.cfg.gateway`）——第一条断言红。
+    // 2. 把 `run_connect_sequence` 里的
+    //    `preflight.run(&params.gateway, &params.appliance)` 换成探测
+    //    另一个地址——第二条断言红。
+    // 3. 给 `SshTunnelFactory` 加回构造期固定的 `gateway` 字段、让
+    //    `establish()` 拨那一个——这条测试用的是假工厂，抓不到；那一
+    //    层现在靠"字段整个不存在"在结构上保证，见 `ssh/mod.rs` 上
+    //    `SshTunnelFactory` 的 R96 说明。
+    #[tokio::test(start_paused = true)]
+    async fn start_passes_the_commanded_gateway_all_the_way_to_the_factory() {
+        guard(async {
+            // 跟 `config().gateway`（gateway.company.com:443）不同的
+            // 一台——"现场工程师把地址改成客户现场那一台"。
+            let onsite: HostPort = "onsite-gw.customer.example:8443".parse().unwrap();
+            let appliance: HostPort = "192.168.100.10:22".parse().unwrap();
+
+            let (factory, calls) = Scripted::new(vec![Outcome::Ok(vec![
+                TunnelMsg::Authenticated {
+                    host_key_fp: "SHA256:aaa".into(),
+                    first_seen: false,
+                },
+                TunnelMsg::ForwardRegistered { port: 22001 },
+            ])]);
+            let preflight = Arc::new(RecordingPreflight::default());
+            let mut deps = deps(factory, Arc::new(NoSystemEvents::default()));
+            deps.preflight = preflight.clone();
+
+            let (tx, mut rx) = Supervisor::spawn(config(), deps);
+            tx.send(Command::Start {
+                username: "tunnel-zhang".into(),
+                password: Zeroizing::new("pw".into()),
+                gateway: onsite.clone(),
+                appliance: appliance.clone(),
+            })
+            .await
+            .unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Connected { .. })).await;
+
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].gateway, onsite,
+                "隧道必须建到 Start 命令携带的那台 Gateway，而不是别处\
+                 固定下来的某一台——host key 也是对着它比对的"
+            );
+            assert_eq!(calls[0].appliance, appliance);
+
+            let probed = preflight.0.lock().unwrap();
+            assert_eq!(probed.len(), 1);
+            assert_eq!(
+                probed[0].0, calls[0].gateway,
+                "预检探测的 Gateway 必须就是隧道实际连上的那一台，否则\
+                 诊断页会稳定地描述一台不是实际连上的机器"
+            );
+            assert_eq!(probed[0].1, calls[0].appliance);
+        })
+        .await;
+    }
+
     // R62：地址校验失败必须清空凭据——不然改错地址之后点 RetryNow
     // （Failed 状态下允许）会拿旧地址旧口令重新连接。这里直接钉住
     // "校验失败之后凭据确实是 None"这件事本身，不通过端到端的
@@ -4023,21 +4143,14 @@ mod tests {
             tx: mpsc::Sender<TunnelMsg>,
         ) -> crate::error::Result<Box<dyn TunnelHandle>> {
             use crate::ssh::test_support::{
-                spawn_freezable_gateway, test_gateway_hostport, tmp_known_hosts, GatewayConfig,
+                spawn_freezable_gateway, tmp_known_hosts, GatewayConfig,
             };
             let (reads, switch, pending, conn) = spawn_freezable_gateway(GatewayConfig {
                 permitted_port: params.reverse_port as u32,
                 accept_password: true,
             });
             let known_hosts = Arc::new(tmp_known_hosts());
-            let handle = crate::ssh::establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                params,
-                tx,
-            )
-            .await?;
+            let handle = crate::ssh::establish_over(conn, &known_hosts, params, tx).await?;
             *self.state.lock().unwrap() = Some((switch, reads));
             // 不需要驱动服务端 handle 做任何事，这条测试只关心客户端一侧
             // 的行为；丢弃它不影响后台的 `run_stream` 任务继续运行。

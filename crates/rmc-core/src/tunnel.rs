@@ -24,9 +24,15 @@
 //! 所以校验的调用点仍然按 config.rs 原有的说法留在 Task 10：Supervisor
 //! 处理 `Command::Start` 时必须先 `ValidatedAddresses::validate(gateway,
 //! appliance)`，校验通过后再取 `.gateway()`/`.appliance()` 拼出
-//! `SshTunnelFactory`/`TunnelParams`；这里拿到的应当已经是校验过的值，
-//! 这道契约没有编译期强制力，只能算文档承诺，读到这段注释的人（包括
-//! Task 10 的作者）应当把它当成前置条件对待。
+//! `TunnelParams`（R96 之后 `SshTunnelFactory` 不再收地址，两个地址
+//! 一起走 `TunnelParams`，见下面 `TunnelParams` 上的说明）；这里拿到的
+//! 应当已经是校验过的值，这道契约没有编译期强制力，只能算文档承诺，
+//! 读到这段注释的人（包括 Task 10 的作者）应当把它当成前置条件对待。
+//!
+//! 注意 R96 只解决了这道契约的**后半句**——「校验时用的 gateway 与这条
+//! 隧道实际要连的 Gateway 必须是同一个」现在由类型保证（只有一个
+//! `params.gateway`，预检、拨号、host key 比对读的都是它）。前半句
+//! 「必须先校验过」仍然是文档承诺。
 //!
 //! ## R48（第二轮评审）：加了进程内 russh 服务端（`ssh::test_support`，
 //! 见 R40）之后，这条决定要不要翻过来？
@@ -72,14 +78,42 @@ use zeroize::Zeroizing;
 
 /// 建立一条隧道所需的全部输入。口令用 Zeroizing 承载，Debug 时被遮蔽。
 ///
-/// 调用方（Task 10）必须保证 `appliance` 已经通过
-/// `config::ValidatedAddresses::validate` 校验过，且校验时用的 gateway
-/// 与这条隧道实际要连的 Gateway 是同一个——本类型自己不重复这道校验，
-/// 理由见模块顶部的说明。
+/// 调用方（Task 10）必须保证 `gateway`/`appliance` 这一对地址已经通过
+/// `config::ValidatedAddresses::validate` 校验过——本类型自己不重复这道
+/// 校验，理由见模块顶部的说明。
+///
+/// ## R96（最终复审发现）：`gateway` 为什么在这里，而不在工厂里
+///
+/// 这个字段是最终复审加的。原来 `SshTunnelFactory` 自己攥着一个
+/// 构造时就固定的 `gateway`，`establish()` 拨的是**那一个**，host key
+/// 也是对着**那一个**比对的；而 Supervisor 这一侧，`Command::Start`
+/// 携带的 Gateway 地址只流向三处——`ValidatedAddresses` 的关系校验、
+/// `Preflight::run`、审计日志那一行——一处都不参与拨号。
+///
+/// 后果不是抽象的：方案 §3.8/§3.10 允许现场工程师把界面上的运维服务器
+/// 地址改成客户现场那一台再点「开启」。改完之后，预检对着**新**地址做
+/// DNS/TCP/TLS（诊断页显示的是新地址的结果）、审计日志写「Gateway
+/// 新地址」、地址关系校验也用新地址——而隧道建到的仍然是构造工厂时用
+/// 的那一台，host key 比对用的也是那一台的。诊断页与追责日志会稳定地
+/// 描述一台不是实际连上的机器；而 §3.8「Gateway 地址与端口可现场修改」
+/// 在当时那套 API 下根本做不到（`Deps::factory` 在 `Supervisor::spawn`
+/// 时一次性传入，此后无法更换）。
+///
+/// 测试当时完全失明：把 Supervisor 里取 gateway 那一行换成一个写死的
+/// 错误地址，237 条测试 0 失败——假工厂 `Scripted` 看不到 gateway
+/// （`TunnelParams` 里没有这个字段），`AlwaysPassPreflight` 忽略参数。
+///
+/// 修法是把 Gateway 地址从「工厂的构造参数」搬成「每次 establish 的
+/// 入参」，并且**把工厂里那个字段整个删掉**——留着它只会留下两个可以
+/// 各自漂移的真相来源。现在这三件事（预检探哪台、拨号拨哪台、host key
+/// 对哪台）读的是同一个 `params.gateway`，在类型上就没有分叉的余地，
+/// 不再是一条只能靠注释维持的调用方义务。
 pub struct TunnelParams {
     pub username: String,
     pub password: Zeroizing<String>,
     pub reverse_port: u16,
+    /// 这条隧道实际要拨的 Gateway，也是 host key 要比对的那一台。
+    pub gateway: HostPort,
     pub appliance: HostPort,
 }
 
@@ -89,6 +123,7 @@ impl std::fmt::Debug for TunnelParams {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("reverse_port", &self.reverse_port)
+            .field("gateway", &self.gateway)
             .field("appliance", &self.appliance)
             .finish()
     }
@@ -169,6 +204,7 @@ mod tests {
             username: "tunnel-zhang".into(),
             password: Zeroizing::new("super-secret-pw".to_string()),
             reverse_port: 22001,
+            gateway: HostPort::new("gateway.company.com", 443).unwrap(),
             appliance: HostPort::new("192.168.1.1", 61001).unwrap(),
         };
         let printed = format!("{p:?}");

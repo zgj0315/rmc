@@ -215,6 +215,7 @@ mod tests {
             username: TEST_USER.into(),
             password: Zeroizing::new(TEST_PASSWORD.to_string()),
             reverse_port: 22001,
+            gateway: test_gateway_hostport(),
             appliance,
         }
     }
@@ -240,13 +241,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                params_with_appliance(appliance),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, params_with_appliance(appliance), tx),
         )
         .await
         .unwrap();
@@ -375,13 +370,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                params_with_appliance(appliance),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, params_with_appliance(appliance), tx),
         )
         .await
         .unwrap();
@@ -461,13 +450,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                params_with_appliance(appliance),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, params_with_appliance(appliance), tx),
         )
         .await
         .unwrap();
@@ -621,13 +604,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                params_with_appliance(appliance),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, params_with_appliance(appliance), tx),
         )
         .await
         .unwrap();

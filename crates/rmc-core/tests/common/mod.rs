@@ -73,7 +73,7 @@ pub fn factory(known_hosts: KnownHosts) -> SshTunnelFactory {
         Arc::new(NoProxyAuth),
         roots,
     ));
-    SshTunnelFactory::new(transport, Arc::new(known_hosts), gateway())
+    SshTunnelFactory::new(transport, Arc::new(known_hosts))
 }
 
 pub fn params(password: &str, port: u16) -> TunnelParams {
@@ -81,6 +81,10 @@ pub fn params(password: &str, port: u16) -> TunnelParams {
         username: TUNNEL_USER.into(),
         password: Zeroizing::new(password.to_string()),
         reverse_port: port,
+        // R96：Gateway 地址从工厂的构造参数搬到了这里——现在
+        // `establish()` 拨的、host key 比对的，都是这个值。见
+        // `rmc_core::tunnel::TunnelParams` 上的说明。
+        gateway: gateway(),
         appliance: appliance(),
     }
 }

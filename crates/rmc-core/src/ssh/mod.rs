@@ -6,7 +6,6 @@ pub mod pump;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use crate::addr::HostPort;
 use crate::error::{Error, Result};
 use crate::knownhosts::KnownHosts;
 use crate::platform::Conn;
@@ -17,18 +16,30 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
+/// R96（最终复审）：这里**没有** `gateway` 字段，是故意的。
+///
+/// 原来有——`new()` 收一个 `gateway: HostPort` 存起来，`establish()`
+/// 就拨那一个、host key 也对那一个比。于是「界面上显示、预检探测、
+/// 审计日志记录的那台 Gateway」与「隧道实际连上、host key 实际比对的
+/// 那台 Gateway」变成两个可以各自漂移的真相来源，而工厂是
+/// `Supervisor::spawn` 时一次性传进 `Deps` 的，此后无法更换——方案
+/// §3.8 要求的「Gateway 地址与端口可现场修改」在那套 API 下做不到，
+/// 而且失配时没有任何东西会报错，只会安静地连错机器。完整的因果与
+/// 实测见 `tunnel::TunnelParams` 上的文档。
+///
+/// 现在 Gateway 地址随每一次 `establish` 从 [`TunnelParams`] 进来，
+/// 工厂只留跟具体目标无关的两样东西：拨号用的 `Transport` 与
+/// `known_hosts` 账本。
 pub struct SshTunnelFactory {
     transport: Arc<Transport>,
     known_hosts: Arc<KnownHosts>,
-    gateway: HostPort,
 }
 
 impl SshTunnelFactory {
-    pub fn new(transport: Arc<Transport>, known_hosts: Arc<KnownHosts>, gateway: HostPort) -> Self {
+    pub fn new(transport: Arc<Transport>, known_hosts: Arc<KnownHosts>) -> Self {
         Self {
             transport,
             known_hosts,
-            gateway,
         }
     }
 }
@@ -222,8 +233,11 @@ impl TunnelFactory for SshTunnelFactory {
         params: TunnelParams,
         tx: mpsc::Sender<TunnelMsg>,
     ) -> Result<Box<dyn TunnelHandle>> {
-        let conn = self.transport.connect(&self.gateway).await?;
-        establish_over(conn, &self.gateway, &self.known_hosts, params, tx).await
+        // 拨号与 host key 比对读的是同一个 `params.gateway`——这一句
+        // 里不存在第二个 Gateway 地址来源，也就没有「预检探的那台」与
+        // 「实际连的那台」分叉的余地，见类型上的 R96 说明。
+        let conn = self.transport.connect(&params.gateway).await?;
+        establish_over(conn, &self.known_hosts, params, tx).await
     }
 }
 
@@ -251,9 +265,17 @@ impl TunnelFactory for SshTunnelFactory {
 /// `/etc/hosts` 都凑齐才能验证。docker 版的 `tests/ssh_tunnel.rs` 仍然
 /// 保留——它验证的是"真实 Gateway/sshd 是否也这样表现"，跟这里验证的
 /// "我们自己的代码是否这样表现"是两件事，互补不冲突。
+///
+/// R96：原来这里还单独收一个 `gateway: &HostPort` 参数，跟
+/// `params.appliance`/`params.reverse_port` 并列着往 `ClientHandler`
+/// 里塞。`TunnelParams` 现在自己带着 gateway（见
+/// `tunnel::TunnelParams` 上的 R96 说明），那个参数就删掉了——留着它
+/// 等于在函数签名上重新开一个"host key 对着哪台机器比"的独立入口，
+/// 调用方可以传一个跟 `params.gateway` 不一样的值，而编译器不会说
+/// 什么。整条链路（预检 → 拨号 → host key 比对）现在自始至终只读
+/// 一个 `params.gateway`。
 pub(crate) async fn establish_over(
     conn: Conn,
-    gateway: &HostPort,
     known_hosts: &Arc<KnownHosts>,
     params: TunnelParams,
     tx: mpsc::Sender<TunnelMsg>,
@@ -263,7 +285,7 @@ pub(crate) async fn establish_over(
     let verdict = Arc::new(std::sync::Mutex::new(None));
     let channels = pump::new_shared_channels();
     let handler = handler::ClientHandler {
-        gateway: gateway.clone(),
+        gateway: params.gateway.clone(),
         known_hosts: known_hosts.clone(),
         appliance: params.appliance.clone(),
         reverse_port: params.reverse_port,
@@ -453,8 +475,8 @@ mod tests {
     // 预算耗尽后 panic。
 
     use crate::ssh::test_support::{
-        drain_authenticated_and_forward_registered, next_msg, spawn_gateway, test_gateway_hostport,
-        test_params, tmp_known_hosts, with_timeout, GatewayConfig,
+        drain_authenticated_and_forward_registered, next_msg, spawn_gateway, test_params,
+        tmp_known_hosts, with_timeout, GatewayConfig,
     };
 
     #[tokio::test]
@@ -464,13 +486,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                test_params(22001),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, test_params(22001), tx),
         )
         .await
         .unwrap();
@@ -508,13 +524,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                test_params(22001),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, test_params(22001), tx),
         )
         .await
         .unwrap();

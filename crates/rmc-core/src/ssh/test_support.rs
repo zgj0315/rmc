@@ -140,6 +140,7 @@ pub(crate) fn test_params_with_password(password: &str, reverse_port: u16) -> Tu
         username: TEST_USER.into(),
         password: Zeroizing::new(password.to_string()),
         reverse_port,
+        gateway: test_gateway_hostport(),
         appliance: "192.168.100.10:61001".parse().unwrap(),
     }
 }
@@ -507,13 +508,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(32);
             let handle = with_timeout(
                 "establish_over",
-                establish_over(
-                    conn,
-                    &test_gateway_hostport(),
-                    &known_hosts,
-                    test_params(22001),
-                    tx,
-                ),
+                establish_over(conn, &known_hosts, test_params(22001), tx),
             )
             .await
             .unwrap();
@@ -548,13 +543,7 @@ mod tests {
         let err = expect_err(
             with_timeout(
                 "establish_over",
-                establish_over(
-                    conn,
-                    &test_gateway_hostport(),
-                    &known_hosts,
-                    test_params(22001),
-                    tx,
-                ),
+                establish_over(conn, &known_hosts, test_params(22001), tx),
             )
             .await,
         );
@@ -624,7 +613,6 @@ mod tests {
                 "establish_over",
                 establish_over(
                     conn,
-                    &test_gateway_hostport(),
                     &known_hosts,
                     test_params_with_password("definitely-wrong", 22001),
                     tx,
@@ -653,13 +641,7 @@ mod tests {
         let err = expect_err(
             with_timeout(
                 "establish_over",
-                establish_over(
-                    conn,
-                    &test_gateway_hostport(),
-                    &known_hosts,
-                    test_params(22002),
-                    tx,
-                ),
+                establish_over(conn, &known_hosts, test_params(22002), tx),
             )
             .await,
         );
@@ -687,13 +669,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                test_params(22001),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, test_params(22001), tx),
         )
         .await
         .unwrap();
@@ -757,13 +733,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                test_params(22001),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, test_params(22001), tx),
         )
         .await
         .unwrap();
@@ -794,13 +764,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                test_params(22001),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, test_params(22001), tx),
         )
         .await
         .unwrap();
@@ -834,13 +798,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout(
             "establish_over",
-            establish_over(
-                conn,
-                &test_gateway_hostport(),
-                &known_hosts,
-                test_params(22001),
-                tx,
-            ),
+            establish_over(conn, &known_hosts, test_params(22001), tx),
         )
         .await
         .unwrap();
