@@ -97,14 +97,44 @@ async fn disconnect_session(session: &AsyncMutex<russh::client::Handle<handler::
 /// `disconnected` 标志由 `shutdown()` 在 disconnect **真的完成之后**
 /// 才置位，所以"`shutdown()` 的 future 跑到一半被取消"这种情况仍然会
 /// 落到这条兜底路径上，正是想要的行为。
+///
+/// R81（Task 11 复审顺手做）：兜底真的触发时补一条 `tracing::warn!`。
+/// 上一轮实现者拒绝在这里打日志，理由是 `ssh/pump.rs` 里 R59 那条哨兵
+/// 测试对全 crate 的 `warn!` 分布有依赖——那条测试现在已经改成对捕获
+/// 内容做匹配（含端口号 "22002"、不含转发内容的特征字节，见该文件
+/// R74 的说明），不再要求"全 crate 只有一处 `warn!` callsite"，这个
+/// 顾虑不成立了。
+///
+/// 信号故意放在 `tracing`，不放进 `crate::audit` 那本审计日志：兜底
+/// 生效意味着代码本身有 bug（主循环某处又漏了 `shutdown()`，跟
+/// R71/R72/R75 是同一个根源），这是给开发者/维护者看的**实现缺陷**
+/// 信号，不是给现场工程师或事后追责审计看的**运维事件**——审计日志的
+/// 受众关心"谁连到了哪台一体机、干了多久"，混进一条"某个内部句柄被
+/// 兜底回收"只会让真正的账目更难读，且暴露的是代码问题而不是会话
+/// 本身的任何事实。少这条 tracing 信号的代价是：`Drop` 把泄漏兜住的
+/// 同时，也把"有人新写了一条忘记 `shutdown` 的路径"这件事从生产环境
+/// 里完全藏起来——见本函数文档最上面那段："晚了最多一个调度周期的
+/// 断开"不该是一个没人会注意到的降级。
 impl Drop for SshTunnel {
     fn drop(&mut self) {
         if self.disconnected.load(Ordering::SeqCst) {
             return;
         }
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            // 拿不到运行时通常意味着进程正在退出，操作系统会收掉 TCP
+            // 连接——不在这里打日志：那是"正常关闭"，不是需要有人去看
+            // 的实现缺陷，见本函数文档上面那段说明。
             return;
         };
+        // 兜底真的要发一次 disconnect 了——这本身就是一个信号："有一条
+        // 路径持有了 `SshTunnel` 却没调用 `shutdown()`"，且运行时还
+        // 活着（不是进程退出的正常路径）。不含地址、会话 id、字节数：
+        // 这条日志的受众是读代码的人，不是审计。
+        tracing::warn!(
+            "SshTunnel 被丢弃时尚未 shutdown()，Drop 兜底补发了一次 \
+             disconnect——这意味着某处调用点忘了 shutdown()，是需要修的 \
+             实现缺陷，不是运维事件"
+        );
         let session = self.session.clone();
         rt.spawn(async move {
             disconnect_session(&session).await;
