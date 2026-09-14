@@ -275,13 +275,13 @@ fn unit_job_runs_clippy_with_deny_warnings_and_fmt_check() {
     let doc = load_workflow();
     let steps = steps(job(&doc, UNIT_JOB));
 
-    let fmt = run_text(step_by_name(steps, STEP_FMT));
+    let fmt = run_code(step_by_name(steps, STEP_FMT));
     assert!(
         fmt.contains("cargo fmt") && fmt.contains("--check"),
         "格式检查步骤应该跑 cargo fmt --check，实际 {fmt:?}"
     );
 
-    let clippy = run_text(step_by_name(steps, STEP_CLIPPY));
+    let clippy = run_code(step_by_name(steps, STEP_CLIPPY));
     assert!(
         clippy.contains("cargo clippy") && clippy.contains("-D warnings"),
         "clippy 步骤必须带 -D warnings，实际 {clippy:?}"
@@ -334,7 +334,7 @@ fn unit_job_pins_the_toolchain_to_the_documented_msrv() {
 fn integration_job_container_toolchain_matches_the_documented_msrv() {
     let doc = load_workflow();
     let steps = steps(job(&doc, INTEGRATION_JOB));
-    let run = run_text(step_by_name(steps, STEP_IGNORED_TESTS));
+    let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
     let channel = toolchain_channel();
 
     assert!(
@@ -342,7 +342,7 @@ fn integration_job_container_toolchain_matches_the_documented_msrv() {
         "容器镜像标签必须跟 rust-toolchain.toml 的 channel（{channel}）一致，实际 run={run:?}"
     );
 
-    let rustup_toolchain = env_assignment_value(run, "RUSTUP_TOOLCHAIN")
+    let rustup_toolchain = env_assignment_value(&run, "RUSTUP_TOOLCHAIN")
         .unwrap_or_else(|| panic!("run 里没找到 RUSTUP_TOOLCHAIN= 这个环境变量赋值：{run:?}"));
     assert_eq!(
         major_minor(rustup_toolchain),
@@ -361,7 +361,7 @@ fn integration_job_container_toolchain_matches_the_documented_msrv() {
 fn unit_test_step_has_an_inner_timeout_wrapper() {
     let doc = load_workflow();
     let steps = steps(job(&doc, UNIT_JOB));
-    let run = run_text(step_by_name(steps, STEP_UNIT_TESTS));
+    let run = run_code(step_by_name(steps, STEP_UNIT_TESTS));
     assert!(
         run.trim_start().starts_with("timeout "),
         "单元测试步骤必须用 timeout 包一层，实际 {run:?}"
@@ -383,7 +383,7 @@ fn unit_test_step_has_an_inner_timeout_wrapper() {
 fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
     let doc = load_workflow();
     let steps = steps(job(&doc, UNIT_JOB));
-    let run = run_text(step_by_name(steps, STEP_UNIT_TESTS));
+    let run = run_code(step_by_name(steps, STEP_UNIT_TESTS));
     let trimmed = run.trim();
     let after_timeout = trimmed
         .strip_prefix("timeout ")
@@ -407,7 +407,7 @@ fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
 fn compose_up_step_always_rebuilds_the_images() {
     let doc = load_workflow();
     let steps = steps(job(&doc, INTEGRATION_JOB));
-    let run = run_text(step_by_name(steps, STEP_COMPOSE_UP));
+    let run = run_code(step_by_name(steps, STEP_COMPOSE_UP));
     assert!(
         run.contains("docker compose up") && run.contains("--build"),
         "拉起测试环境必须带 --build，实际 {run:?}"
@@ -516,7 +516,7 @@ fn ignored_tests_step_really_runs_the_ignored_tests_and_can_fail_the_build() {
     let doc = load_workflow();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let step = step_by_name(steps, STEP_IGNORED_TESTS);
-    let run = run_text(step);
+    let run = run_code(step);
     assert!(run.contains("-- --ignored"), "{run:?}");
     assert!(run.contains("--test-threads=1"), "{run:?}");
     assert!(!run.contains("|| true"), "{run:?}");
@@ -539,7 +539,7 @@ fn ignored_tests_step_really_runs_the_ignored_tests_and_can_fail_the_build() {
 fn ignored_tests_run_inside_a_container_with_network_host_and_add_host() {
     let doc = load_workflow();
     let steps = steps(job(&doc, INTEGRATION_JOB));
-    let run = run_text(step_by_name(steps, STEP_IGNORED_TESTS));
+    let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
     assert!(run.contains("--network host"), "{run:?}");
     assert!(run.contains("--add-host gateway.test:127.0.0.1"), "{run:?}");
 }
@@ -552,7 +552,7 @@ fn ignored_tests_run_inside_a_container_with_network_host_and_add_host() {
 fn ignored_tests_step_has_an_inner_timeout_wrapper() {
     let doc = load_workflow();
     let steps = steps(job(&doc, INTEGRATION_JOB));
-    let run = run_text(step_by_name(steps, STEP_IGNORED_TESTS));
+    let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
     assert!(
         run.contains("timeout 1200"),
         "运行 --ignored 集成测试必须用 timeout 包一层，实际 {run:?}"
@@ -572,7 +572,7 @@ fn log_export_step_runs_only_on_failure_after_the_tests() {
     let idx = step_index_by_name(steps, STEP_LOG_EXPORT);
     let ignored_idx = step_index_by_name(steps, STEP_IGNORED_TESTS);
     assert_eq!(steps[idx]["if"].as_str(), Some("failure()"));
-    assert!(run_text(&steps[idx]).contains("logs"), "{:?}", steps[idx]);
+    assert!(run_code(&steps[idx]).contains("logs"), "{:?}", steps[idx]);
     assert!(idx > ignored_idx, "日志导出必须排在测试步骤之后");
 }
 
@@ -590,7 +590,7 @@ fn cleanup_step_always_tears_down_after_every_test_related_step() {
     let idx = step_index_by_name(steps, STEP_CLEANUP);
     assert_eq!(steps[idx]["if"].as_str(), Some("always()"));
     assert!(
-        run_text(&steps[idx]).contains("down -v"),
+        run_code(&steps[idx]).contains("down -v"),
         "{:?}",
         steps[idx]
     );
