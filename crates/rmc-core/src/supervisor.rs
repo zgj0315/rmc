@@ -195,9 +195,34 @@
 //!     !connecting_or_connected(&ctx)`。
 //!
 //!     这已经是同一个根源第三次造成隧道泄漏，所以这一轮同时在
-//!     `SshTunnel` 上加了 `Drop`（见 `ssh/mod.rs`）做纵深防御——逐个
-//!     堵调用点是治标，让"句柄被丢弃"这件事本身不再等于"Gateway 侧
-//!     泄漏"才是治本。
+//!     `SshTunnel` 上加了 `Drop`（R76，见 `ssh/mod.rs`）做纵深防御
+//!     ——逐个堵调用点是治标，让"句柄被丢弃"这件事本身不再等于
+//!     "Gateway 侧泄漏"才是治本。
+//! 17. **[R77] 三处被证伪的说法已订正**——`degraded_stays_degraded_
+//!     while_the_appliance_is_still_down` 里那段解释"死地址加固为何
+//!     失败"的注释、`preflight.rs` 模块文档里"真实 I/O 会让
+//!     `start_paused` 测试挂起"那一条、以及
+//!     `cancel_racing_a_successful_establish_never_leaks_the_tunnel_
+//!     handle` 上"删掉槎位兜底第 0 次迭代就失败"那一条，成因/结论都
+//!     写得不准确。真相记在各自的注释里（一句话版本：`start_paused`
+//!     的自动前进量取自时间轮**层级槽的边界**，不是定时器的真实到期
+//!     时刻，所以一次真实 I/O 的 `await` 会让虚拟钟一步跳掉 262 秒）。
+//!     那个当时被回退的自检也零风险地加了回来——改用阻塞的
+//!     `std::net::TcpStream::connect_timeout`，完全不经过 tokio 的
+//!     I/O driver，不会让运行时 park。
+//! 18. **[R78，安全] `Failed` 状态下 `Stop` 必须仍然有效**——R71 的新
+//!     准入条件让 `Failed` 下 `Cancel`/`Stop` 都成了空操作。按方案
+//!     §3.5 的表格，`Failed` 只允许"重试、查看诊断"，从状态机角度这
+//!     更贴规格；但副作用是 `Failed` 期间那份 `Zeroizing<String>`
+//!     口令会一直留在进程内存里，直到下一次 `Start` 或进程退出——而
+//!     §3.8 明确要求口令"仅存于进程内存，认证后清除"，工程师遇到
+//!     失败之后合上笔记本走人恰恰是最常见的收尾方式。
+//!
+//!     裁定：两条规格冲突时安全那条优先。`Failed` 下 `Stop` 有效
+//!     （走 `teardown`、清 `creds`、回 `Idle`），`Cancel` 保持空操作
+//!     ——`Cancel` 是"取消正在进行的这次开启"，`Stop` 是"我不玩了"，
+//!     后者在任何状态下可用符合直觉。两者受理之后的动作完全相同，
+//!     抽成了共享的 [`stop_everything`]，差别只在准入判断上。
 
 use crate::addr::HostPort;
 use crate::backoff::{Backoff, Jitter};
@@ -603,6 +628,33 @@ fn connecting_or_connected(ctx: &Ctx) -> bool {
     ctx.connect_task.is_some() || ctx.handle.is_some()
 }
 
+/// `Command::Cancel` 与 `Command::Stop` 受理之后要做的事，两者完全相同
+/// ——差别只在**准入判断**上（`Failed` 状态下只有 `Stop` 受理，见
+/// `Command::Stop` 分支上的说明与模块顶部第 18 条），受理之后的动作
+/// 一模一样。R78 把这段从原来合并的一个 match 分支里抽出来，让两个
+/// 分支各自写各自的准入判断而不用复制这五行。
+///
+/// 顺序是有讲究的：先广播 `Stopping` 再 `teardown()`——`teardown()`
+/// 里的 `shutdown()`/`JoinHandle::await` 都可能要等一会儿，界面应该在
+/// 这段等待**开始之前**就看到"正在停止"，而不是等它结束才一次性跳到
+/// `Idle`。
+async fn stop_everything(
+    ctx: &mut Ctx,
+    connect_rx: &mut mpsc::Receiver<ConnectEvent>,
+    pending_handle: &PendingHandle,
+    retry_at: &mut Option<Instant>,
+    probe_at: &mut Option<Instant>,
+) {
+    ctx.set_state(State::Stopping);
+    ctx.teardown(connect_rx, pending_handle).await;
+    // 方案 §3.8：口令仅存于进程内存，用完即清。`Credentials` 里的
+    // `Zeroizing<String>` 在这一行被丢弃时会把底层缓冲区清零。
+    ctx.creds = None;
+    *retry_at = None;
+    *probe_at = None;
+    ctx.set_state(State::Idle);
+}
+
 /// `Command::Start`（校验通过后）与 `Supervisor::spawn_with_validated_
 /// start`（跳过校验，仅测试）初始化一次新会话共用的逻辑：记凭据、
 /// 重置退避/端口占用计时、发起第一次连接尝试。R74：这段逻辑原来在两处
@@ -750,19 +802,55 @@ async fn run(
                             }
                         }
                     }
-                    Command::Cancel | Command::Stop => {
+                    Command::Cancel => {
                         // R71：同上，不看 `ctx.state`——`Start` 之后
                         // 立刻 `Cancel`，`ctx.state` 可能还是 `Idle`，
                         // 但 `ctx.connect_task` 已经被同步设置好了。
+                        //
+                        // R78：`Failed` 下 `Cancel` 是空操作——方案
+                        // §3.5 的表格里 `Failed` 只允许"重试、查看
+                        // 诊断"，而 `Cancel` 的语义是"取消正在进行的
+                        // 这次开启"，`Failed` 下没有任何正在进行的
+                        // 东西可取消。跟 `Stop` 的差别见下一个分支。
                         if !connecting_or_connected(&ctx) && retry_at.is_none() {
                             continue;
                         }
-                        ctx.set_state(State::Stopping);
-                        ctx.teardown(&mut connect_rx, &pending_handle).await;
-                        ctx.creds = None;
-                        retry_at = None;
-                        probe_at = None;
-                        ctx.set_state(State::Idle);
+                        stop_everything(&mut ctx, &mut connect_rx, &pending_handle, &mut retry_at, &mut probe_at).await;
+                    }
+                    Command::Stop => {
+                        // R78：`Failed` 下 `Stop` 必须仍然有效——见
+                        // 模块顶部第 18 条。上一轮（R71）的新准入条件
+                        // 让 `Failed` 下 `Cancel`/`Stop` 都成了空操作，
+                        // 从状态机角度更贴 §3.5 的表格，副作用却是
+                        // `Zeroizing<String>` 口令会在 `Failed` 期间
+                        // 一直留在内存里，直到下一次 `Start` 或进程
+                        // 退出——而 §3.8 明确要求口令"仅存于进程内存，
+                        // 认证后清除"。工程师遇到失败之后合上笔记本
+                        // 走人，恰恰是最常见的收尾方式。两条规格冲突
+                        // 时安全那条优先。
+                        //
+                        // 准入判断因此比 `Cancel` 多两条：
+                        //  - `ctx.creds.is_some()`：内存里还留着口令，
+                        //    这是安全要求的核心判据；
+                        //  - `matches!(ctx.state, State::Failed { .. })`：
+                        //    即使口令已经被清掉（例如地址校验失败那条
+                        //    路，见 R62），"我不玩了"也应该能把界面从
+                        //    `Failed` 带回 `Idle`——`Stop` 表达的是
+                        //    "我不玩了"，任何状态下可用符合直觉。
+                        //
+                        // 这里读 `ctx.state` 不重蹈 R71 的覆辙：R71 的
+                        // 危险在于"状态滞后导致误判为可以开始/没什么可
+                        // 取消"，而这两条只会让准入**更宽**；状态如果
+                        // 还没来得及变成 `Failed`，前面几条同步字段的
+                        // 判据必然已经成立。
+                        if !connecting_or_connected(&ctx)
+                            && retry_at.is_none()
+                            && ctx.creds.is_none()
+                            && !matches!(ctx.state, State::Failed { .. })
+                        {
+                            continue;
+                        }
+                        stop_everything(&mut ctx, &mut connect_rx, &pending_handle, &mut retry_at, &mut probe_at).await;
                     }
                     Command::RetryNow => {
                         // R71：只看"有没有正在建连/已经建立"，不看
@@ -2161,6 +2249,99 @@ mod tests {
             let before = calls.lock().unwrap().len();
             tokio::time::sleep(Duration::from_secs(120)).await;
             assert_eq!(calls.lock().unwrap().len(), before, "停止后仍在重试");
+        })
+        .await;
+    }
+
+    // --- R78（第四轮评审，安全）：`Failed` 下 `Stop` 必须仍然有效 ---
+    //
+    // 上一轮（R71）的新准入条件让 `Failed` 下 `Cancel`/`Stop` 都变成了
+    // 空操作（三项判据皆假）。按方案 §3.5 的表格，`Failed` 只允许
+    // "重试、查看诊断"，所以从状态机角度这更贴规格——但副作用是
+    // `Failed` 期间那份 `Zeroizing<String>` 口令会一直留在进程内存里，
+    // 直到下一次 `Start` 或进程退出。而 §3.8 明确要求口令"仅存于进程
+    // 内存，认证后清除"。工程师遇到失败之后合上笔记本走人，恰恰是最
+    // 常见的收尾方式。
+    //
+    // 裁定：两条规格冲突时安全那条优先，`Failed` 下 `Stop` 有效
+    // （走 `teardown`、清 `creds`、回 `Idle`），`Cancel` 保持空操作
+    // （见下一条测试）。
+    //
+    // "口令真的被清掉了"这件事没有直接的观测点（`Credentials` 不
+    // 外泄、也不进任何事件），这里用它唯一的可观测后果代替：`Stop`
+    // 之后再发一条 `RetryNow`，`spawn_connect` 会因为 `ctx.creds` 是
+    // `None` 而什么都不做，`establish` 的调用次数不会增加。
+    //
+    // 会让这条测试变红的实现改法：把 `Command::Stop` 的准入判断改回
+    // 跟 `Command::Cancel` 一样（即去掉 `ctx.creds.is_some()` 与
+    // `matches!(ctx.state, State::Failed { .. })` 这两条）——`Stop`
+    // 在 `Failed` 下被直接吞掉，等不到 `Idle`，`states_until` 会在
+    // 300 秒虚拟超时后 panic。
+    #[tokio::test(start_paused = true)]
+    async fn stop_from_failed_clears_the_password_and_returns_to_idle() {
+        guard(async {
+            // host key 不匹配 → Fatal → `Failed`，而且这条路径**不会**
+            // 顺手清掉凭据（只有 `Auth` 类和地址校验失败会清），正是
+            // "口令留在内存里"那个场景。
+            let (factory, calls) = Scripted::new(vec![Outcome::Err(Error::HostKeyMismatch {
+                expected: "SHA256:aaa".into(),
+                actual: "SHA256:bbb".into(),
+            })]);
+            let (tx, mut rx) =
+                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Failed { .. })).await;
+            assert_eq!(calls.lock().unwrap().len(), 1);
+
+            tx.send(Command::Stop).await.unwrap();
+            let seen = states_until(&mut rx, |s| matches!(s, State::Idle)).await;
+            assert!(
+                seen.iter().any(|s| matches!(s, State::Stopping)),
+                "Stop 应该先广播 Stopping 再回 Idle，实际：{seen:?}"
+            );
+
+            // 凭据真的被清掉了：`RetryNow` 拿不到凭据，不会再发起一次
+            // 连接尝试。
+            tx.send(Command::RetryNow).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                1,
+                "Stop 之后凭据仍在内存里：RetryNow 又拿旧口令去连了一次"
+            );
+        })
+        .await;
+    }
+
+    // R78 的另一半：`Cancel` 在 `Failed` 下**保持**空操作，这个不对称
+    // 是有意的。`Cancel` 的语义是"取消正在进行的这次开启"，`Failed`
+    // 下没有任何正在进行的东西可取消；`Stop` 的语义是"我不玩了"，
+    // 任何状态下可用符合直觉，而且它还兼着清口令的安全职责。
+    //
+    // 会让这条测试变红的实现改法：把 `Command::Cancel` 的准入判断也
+    // 加上 `Failed` 那两条（或者干脆把两个分支合并回一个）——`Cancel`
+    // 会把状态机带回 `Idle`，下面那次"1 秒内不应该有任何状态事件"的
+    // 断言立刻落空。
+    #[tokio::test(start_paused = true)]
+    async fn cancel_from_failed_is_a_no_op_by_design() {
+        guard(async {
+            let (factory, _calls) = Scripted::new(vec![Outcome::Err(Error::HostKeyMismatch {
+                expected: "SHA256:aaa".into(),
+                actual: "SHA256:bbb".into(),
+            })]);
+            let (tx, mut rx) =
+                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Failed { .. })).await;
+
+            tx.send(Command::Cancel).await.unwrap();
+            // `start_paused` 下这 1 秒是虚拟时间，不花真实时间；同时
+            // 它也是这条断言的超时上限，不会挂住。
+            let next = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+            assert!(
+                next.is_err(),
+                "Failed 下的 Cancel 应该是空操作，实际又广播了状态：{next:?}"
+            );
         })
         .await;
     }
