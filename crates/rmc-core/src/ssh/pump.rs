@@ -527,11 +527,13 @@ mod tests {
     // `Interest` 缓存是**进程全局**的，且只有一个已注册 dispatcher 时会
     // 走捷径（`Dispatchers::rebuilder()` 返回 `Rebuilder::JustOne`，
     // `for_each` 直接调 `dispatcher::get_default(f)`，用的是"谁第一个
-    // 撞到这个 callsite"那条线程的 subscriber）。全 crate 唯一的
-    // `tracing::warn!` 在 `handler.rs`——如果本测试 `set_default` 之后、
-    // 自己触发这行 `warn!` 之前，另一条会触发同一处 `warn!` 的测试
-    // （`forwarded_channel_open_is_rejected_when_port_does_not_match`，
-    // 在 `test_support.rs`）先在别的线程撞上这个 callsite，
+    // 撞到这个 callsite"那条线程的 subscriber）。R59 发现这个问题时，
+    // 全 crate 只有 `handler.rs` 这一处 `tracing::warn!`（R81 之后
+    // `ssh/mod.rs` 的 `impl Drop for SshTunnel` 又加了第二处，两处
+    // callsite 各自独立，不影响这里的推理）——如果本测试 `set_default`
+    // 之后、自己触发这行 `warn!` 之前，另一条会触发同一处 `warn!` 的
+    // 测试（`forwarded_channel_open_is_rejected_when_port_does_not_
+    // match`，在 `test_support.rs`）先在别的线程撞上这个 callsite，
     // `get_default` 拿到的是那条线程的 `NoSubscriber`，`Interest::
     // never` 就会被**永久缓存**进这个全局 callsite——此后包括本测试在
     // 内的任何线程再触发这一行 `warn!`，都会被这个缓存的 `Interest`
@@ -699,14 +701,18 @@ mod tests {
 
         let captured = captured.lock().unwrap();
         // R74（第三轮评审）：只断言"捕获到过至少一行"曾经削弱过——换成
-        // `set_global_default` 之后（见上面 R59 的说明），全 crate 唯一
-        // 那行 `tracing::warn!` 还有另一条测试
+        // `set_global_default` 之后（见上面 R59 的说明），R74 那时全
+        // crate 唯一那行 `tracing::warn!` 还有另一条测试
         // （`test_support.rs::forwarded_channel_open_is_rejected_when_
-        // port_does_not_match`）也会触发它；如果那条测试先跑、往这个
-        // *全局* 缓冲区里塞了一行，而本测试自己触发的那一次因为某种
-        // 原因没被捕获到，`!captured.is_empty()` 依然会通过——哨兵只
-        // 证明了"这个 callsite 能被捕获"，不能证明"是本测试自己这次
-        // 触发被捕获"。改成对内容做匹配：本测试用端口 22002（注册的是
+        // port_does_not_match`）也会触发它（R81 之后 `ssh/mod.rs` 的
+        // `Drop for SshTunnel` 又加了第二处 `warn!` callsite，跟下面
+        // 这条断言无关——它不含 "22002"，不会让 `!captured.is_empty()`
+        // 这类弱断言意外通过，但也证明不了当年 R74 想证明的那件事，
+        // 所以照样得靠内容匹配）；如果那条测试先跑、往这个 *全局*
+        // 缓冲区里塞了一行，而本测试自己触发的那一次因为某种原因没被
+        // 捕获到，`!captured.is_empty()` 依然会通过——哨兵只证明了
+        // "这个 callsite 能被捕获"，不能证明"是本测试自己这次触发被
+        // 捕获"。改成对内容做匹配：本测试用端口 22002（注册的是
         // 22001）触发拒绝，`handler.rs` 的 `warn!` 把 `connected_port`
         // 当字段记录下来，匹配这个具体端口号才能证明确实是这一次
         // 触发被捕获到，不是蒙对了非空。
