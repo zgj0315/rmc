@@ -82,6 +82,47 @@
 //!    权衡后决定不做，是没考虑过。见 [`harden_dir_permissions`]/
 //!    [`harden_file_permissions`] 上的说明，包括为什么 Windows 上是
 //!    有意的空操作。
+//!
+//! # Task 12 复审追加的修复（R93/R94/R95），逐条写明理由
+//!
+//! 10. **[R93] 目录/文件的权限收紧原来有 TOCTOU 窗口**——R88 的修法是
+//!     "先用默认权限创建、再 chmod"：`create_dir_all` 先把目录建成
+//!     `0755`，`OpenOptions::create` 先把文件建成 `0644`，两次系统
+//!     调用之间有一个窗口。同机另一个用户能在这个窗口里 `open()` 住
+//!     一个 fd（对目录是先 `readdir`/进入目录，对文件是直接
+//!     `open()`），`chmod` 收紧权限管不住已经打开的 fd——之后这个
+//!     进程往这份日志追加的每一行内容，那个 fd 都能照读不误。修法是
+//!     [`create_dir_all_hardened`]/[`open_log_file_hardened`]：分别用
+//!     `DirBuilderExt::mode(0o700)`/`OpenOptionsExt::mode(0o600)`，
+//!     让内核在 `mkdir`/`open` 那一次系统调用里就带上目标权限，不再
+//!     有"先宽后收紧"的中间状态。这条性质是系统调用原子性给的，不是
+//!     能用单线程单元测试直接复现竞态来证明的——验证方式是代码审查
+//!     （确认不再是"创建 + 事后 chmod"两步）加上原有的权限断言（确认
+//!     最终态仍然正确）。
+//! 11. **[R94] `record()` 原来每写一行都把目录强制 chmod 回 `0700`**
+//!     ——如果现场把 `log_dir` 指到一个需要让日志采集账号读的共享
+//!     目录，运维特意放宽的目录权限会被下一行日志立刻覆盖回去，且
+//!     没有开关能关掉这个行为。现在目录的权限收紧只发生在两个地方：
+//!     `open()`（会话开始时纠正一次，覆盖"目录是升级前的旧版本建
+//!     出来的，还停留在 `0755`"这种情况）与
+//!     [`create_dir_all_hardened`] 真的新建目录的那一刻（原子完成，
+//!     见上一条）——目录已经存在时，`record()` 不会再对它做任何
+//!     `chmod`。**故意不对文件做同样的放宽**：R94 的问题场景是"运维
+//!     需要让日志采集账号遍历/读这个目录"，`log_dir` 本身经常需要对
+//!     别的账号打开一条口子；但文件内容就是这个模块存在的唯一理由
+//!     （R88："本机任何用户都能读"），没有一个合理场景是"运维想让
+//!     文件对外放宽、又不想 record() 帮忙纠正回来"，所以文件那一侧
+//!     仍然保留"每次成功 `open()` 都重新 `harden_file_permissions`"
+//!     ——这也顺带兜住了"今天的文件是升级前的旧二进制建出来的，还
+//!     停留在 `0644`"这种 `open_log_file_hardened` 的 `.mode()` 管不
+//!     到的既存文件场景（`.mode()` 只在真正新建时生效）。
+//! 12. **[R95] `today()` 上关于回退触发条件的说明第二次订正**——
+//!     R87 那一轮把"多线程导致 `Err`"这个错误归因换成了"系统缺时区
+//!     数据库/环境变量会导致 `Err`"，这句话本身也没经过验证，实测是
+//!     假的：真实 Linux 容器里删掉 `/etc/localtime` 与
+//!     `/usr/share/zoneinfo` 之后 `now_local()` 仍然是 `Ok`，偏移量
+//!     `+00:00`——glibc 缺 tzdb 时静默当 UTC 处理，不会返回错误。
+//!     准确表述见 [`today`] 上的说明。
 
 use crate::error::{Error, Result};
 use std::io::Write;
@@ -125,9 +166,21 @@ impl Level {
 /// 安全的 `libc::localtime_r`，不像该 crate 更早的版本那样按
 /// `num_threads::is_single_threaded()` 决定要不要返回 `Err`（那条
 /// 逻辑现在只留在一个不相关的内部工具函数 `refresh_tz` 里，`now_
-/// local()` 不会走到它）。真正会触发这条回退的场景是系统本身缺时区
-/// 数据库/环境变量（精简容器、某些嵌入式环境），确实少见，但跟"是否
-/// 多线程"无关，这里不再把原因归到线程模型上。
+/// local()` 不会走到它）。
+///
+/// R95（Task 12 复审第二次订正）：上一段留下的"真正会触发这条回退的
+/// 场景是系统本身缺时区数据库/环境变量"这句话本身也不成立，已经实测
+/// 证伪：在一个真实 Linux 容器里删掉 `/etc/localtime` 与
+/// `/usr/share/zoneinfo` 后重新调用 `now_local()`，结果是 `Ok`，
+/// 偏移量 `+00:00`——**不是** `Err`。glibc 的 `localtime_r` 缺时区
+/// 数据时会静默按 UTC 返回成功，不会让上一层的 `now_local()` 观察到
+/// 任何失败。准确的表述是：`local_offset_at`（Unix 侧）源码里唯一的
+/// `Err` 来源是 `libc::localtime_r` 本身返回错误——实际上不可达（它
+/// 的 C 语言契约里没有为"没有时区数据"定义一个错误返回），所以下面这
+/// 行 `unwrap_or_else(now_utc)` 在 Unix 上是死代码，从未被真正执行
+/// 到。缺 tzdb 时系统是直接把本地时区当成 UTC 处理，日志里的表现是
+/// 时间戳带 `+00:00`——这跟"这台机器的本地时区本来就是 UTC"是同一种
+/// 输出，无法从日志文本本身区分是哪一种。
 ///
 /// 无论具体原因是什么，回退这件事本身现在在日志文本里是可见的：
 /// [`line_for`] 把 `UtcOffset` 显式写进时间戳（`±HH:MM`），退化到
@@ -184,6 +237,51 @@ fn is_log_file(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .map(|n| n.starts_with(PREFIX) && n.ends_with(SUFFIX))
         .unwrap_or(false)
+}
+
+/// R93：递归创建目录，Unix 上让内核在 `mkdir` 那一次系统调用里就带上
+/// `0700`，不是先用默认权限（`0755`）创建、再单独 `chmod` 一遍——两次
+/// 系统调用之间那个窗口正是 R93 要堵的 TOCTOU。`DirBuilder::create`
+/// 在 `recursive(true)` 下对已存在的目录直接返回 `Ok(())`、不会碰它
+/// 的权限（这一点被 [`Audit::record`] 依赖：目录已存在时不重新
+/// `chmod`，见该方法上 R94 的说明）。
+#[cfg(unix)]
+fn create_dir_all_hardened(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_dir_all_hardened(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// R93：以追加模式打开（必要时创建）日志文件，Unix 上让内核在 `open`
+/// 那一次系统调用里就带上 `0600`——原因与 [`create_dir_all_hardened`]
+/// 完全对称。`.mode()` 只在文件真的被这次调用创建时生效：如果文件已经
+/// 存在（例如同一天里第二次 `record()`，或者是升级前的旧二进制建
+/// 出来的），这次 `open` 不会改动它现有的权限，`Audit::record` 之后
+/// 仍然会调用 [`harden_file_permissions`] 补一次——理由见该方法上的
+/// 说明。
+#[cfg(unix)]
+fn open_log_file_hardened(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_log_file_hardened(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 /// R88（复审发现，中低严重）：审计日志记的是"谁在什么时候连了哪台
@@ -252,7 +350,12 @@ impl Audit {
     /// 一段——道理跟 [`Audit::record`] 上写的一样：记不下审计日志不该
     /// 掐断一次正在进行的维护会话。
     pub fn open(dir: PathBuf) -> Result<Self> {
-        std::fs::create_dir_all(&dir).map_err(Error::LocalIo)?;
+        create_dir_all_hardened(&dir).map_err(Error::LocalIo)?;
+        // R94：这一次性纠正是给"目录在这次调用之前就已经存在，可能是
+        // 升级前的旧版本用默认权限建出来的"这种情况用的——
+        // `create_dir_all_hardened` 对已经存在的目录不会重新
+        // `chmod`（见该函数上 R93 的说明）。会话跑起来之后 `record()`
+        // 不会再重复这个动作，见该方法上 R94 的说明。
         harden_dir_permissions(&dir);
         Ok(Self {
             dir,
@@ -312,23 +415,30 @@ impl Audit {
     /// `record_recovers_after_the_log_directory_is_removed`）。
     pub fn record(&self, level: Level, message: &str) {
         let flat = message.replace("\r\n", " ").replace(['\n', '\r'], " ");
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+        if let Err(e) = create_dir_all_hardened(&self.dir) {
             tracing::warn!(error = %e, dir = ?self.dir, "审计日志目录不可用，这条记录已丢弃");
             return;
         }
-        // R88：目录权限每次都重新收紧一遍，跟上面 `create_dir_all` 每次
-        // 都重试同一个道理——万一目录是之前用别的权限建出来的，或者
-        // 权限被后来改动过，这里会自己纠正回来，不需要重启进程。
-        harden_dir_permissions(&self.dir);
+        // R94（复审发现）：这里原来在每次成功写入前都无条件重新调一次
+        // `harden_dir_permissions`——如果现场把 `log_dir` 指到一个需要
+        // 让日志采集账号读的共享目录，运维特意放宽的目录权限会被下一行
+        // 日志立刻覆盖回去，没有开关能关掉这个行为。目录的权限收紧现在
+        // 只发生在上面的 `create_dir_all_hardened` 真的新建目录的那一刻
+        // （R93，原子完成，不会有"先宽后收紧"的中间状态）与 `open()`
+        // 里的一次性纠正（针对升级前遗留的旧权限目录）；目录已经存在时
+        // 这里不再重复 `chmod`，运维的调整不会被每一行日志悄悄撤销。
         let d = (self.clock)();
         let path = self.dir.join(file_name_for(d));
         let line = line_for(d, level, &flat);
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        match open_log_file_hardened(&path) {
             Ok(mut f) => {
+                // 文件侧仍然每次都重新收紧一遍，跟目录侧不对称——理由见
+                // 模块文档 R94 一节：文件内容本身就是这个模块存在的唯一
+                // 理由，没有合理场景是"运维想放宽文件权限、又不想
+                // record() 纠正回来"；这也顺带兜住"今天的文件是升级前的
+                // 旧二进制建出来的，还停留在 0644"这类
+                // `open_log_file_hardened` 的 `.mode()` 管不到的既存
+                // 文件场景。
                 harden_file_permissions(&path);
                 if let Err(e) = f.write_all(line.as_bytes()) {
                     tracing::warn!(error = %e, path = ?path, "写审计日志失败，这条记录已丢弃");
@@ -732,6 +842,76 @@ mod tests {
         assert_eq!(
             file_mode, 0o600,
             "文件权限应该收紧到 0600，实际 {file_mode:o}"
+        );
+    }
+
+    // --- R93/R94（Task 12 复审发现）：目录权限收紧不能有 TOCTOU 窗口，
+    // 也不能在目录已存在时每次写入都强制覆盖运维的调整。 ---
+
+    // R94：目录一旦已经存在，`record()` 不该在每次成功写入前把它强制
+    // `chmod` 回 `0700`——运维可能故意把它放宽给日志采集账号读，且没有
+    // 开关能关掉"每行日志都覆盖回去"这个行为。
+    //
+    // 会让这条测试变红的实现改法：在 `record()` 里恢复对已存在目录
+    // 无条件调用 `harden_dir_permissions` 的旧代码（本次修复之前的
+    // 版本）——运维放宽到 `0750` 之后的第二次 `record()` 会把它立刻
+    // 收紧回 `0700`，下面的 `assert_eq!(mode, 0o750, ...)` 会看到
+    // `0o700`。**已做过变异验证**：临时改回旧代码后本地跑过，确认
+    // 这条测试会按上述方式变红；改完已还原。
+    #[cfg(unix)]
+    #[test]
+    fn record_does_not_re_harden_an_already_existing_directory_every_call() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir();
+        let a = Audit::open(dir.path().to_path_buf()).unwrap();
+        a.record(Level::Info, "第一行");
+
+        // 模拟运维把目录权限放宽给日志采集账号读。
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o750);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        a.record(Level::Info, "第二行");
+
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o750,
+            "record() 不该把运维放宽的目录权限强制收紧回去，实际 {mode:o}"
+        );
+    }
+
+    // R93：目录/文件创建那一刻就该带上目标权限（`DirBuilderExt::mode`/
+    // `OpenOptionsExt::mode`），不是先用默认权限创建、再靠一次独立的
+    // `chmod` 补救——后者中间存在一个同机其他用户能抢先打开宽权限 fd
+    // 的窗口。这条测试钉住"创建函数本身直接产出正确的最终权限"这个
+    // 更强的性质：just-created 的目录/文件在**没有**任何后续
+    // `harden_*` 调用参与的情况下，权限已经是对的。
+    //
+    // 会让这条测试变红的实现改法：把 `create_dir_all_hardened`/
+    // `open_log_file_hardened` 里的 `.mode(...)` 删掉，退回裸的
+    // `create_dir_all`/`OpenOptions::create`——新建出来的目录/文件会
+    // 停留在默认的 `0755`/`0644`。
+    #[cfg(unix)]
+    #[test]
+    fn newly_created_dir_and_file_are_hardened_by_creation_itself() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir();
+        let sub = dir.path().join("fresh-subdir");
+        create_dir_all_hardened(&sub).unwrap();
+        let dir_mode = std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "新建目录创建那一刻就该是 0700：{dir_mode:o}"
+        );
+
+        let file = sub.join("f.log");
+        let _f = open_log_file_hardened(&file).unwrap();
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "新建文件创建那一刻就该是 0600：{file_mode:o}"
         );
     }
 }

@@ -2953,6 +2953,16 @@ mod tests {
     // 会让这条测试变红的实现改法：删掉 `begin()`/`handle_msg` 里
     // `ForwardRegistered`/`RemoteSessionOpened`/`RemoteSessionClosed`
     // 对应的任意一行 `ctx.audit.record(...)`。
+    //
+    // R92（Task 12 复审追加）：这条测试本身当时也漏了 host key 指纹行
+    // ——最后一条 `assert!` 是本次追加的，见该处注释。「干了多久」
+    // （`record_session_closed` 的时长）与「远程会话 N 连接一体机
+    // 失败」两处缺口分别在
+    // `record_session_closed_writes_the_real_elapsed_seconds`（本文件
+    // 后面）与 `appliance_dial_failure_is_recorded_with_its_reason`
+    // 里补上——前者必须绕开 `start_paused`（它只虚拟化 tokio 的时钟，
+    // 管不到 `record_session_closed` 用的 `std::time::SystemTime`），
+    // 所以直接对私有函数写单元测试，不走这条集成测试。
     #[tokio::test(start_paused = true)]
     async fn remote_sessions_are_reported_with_traffic_and_removed_on_close() {
         guard(async {
@@ -3013,6 +3023,111 @@ mod tests {
             assert!(
                 text.contains("100 字节") && text.contains("200 字节"),
                 "字节数没记全：{text}"
+            );
+            // R92（Task 12 复审发现）：host key 指纹行（`§3.8` 明确要求
+            // 留痕的安全要素）此前没有任何测试断言过内容，删掉整行也
+            // 全绿——补上。会让这条断言变红的实现改法：把 `handle_msg`
+            // 里 `TunnelMsg::Authenticated` 分支对应的
+            // `ctx.audit.record(...)` 那一行删掉。
+            assert!(
+                text.contains("host key SHA256:aaa"),
+                "「host key 指纹」这条账目丢了：{text}"
+            );
+        })
+        .await;
+    }
+
+    // R92（Task 12 复审发现，HIGH）：`record_session_closed` 里的时长
+    // 此前零覆盖——评审把 `secs` 改成恒定的 `0`，整套 `cargo test`
+    // （197 个用例）全绿。「干了多久」是 Task 11 自己定义的四个追责
+    // 要素之一（模块文档第一段），一次重构就能悄悄变成常数 0 而无人
+    // 报警。
+    //
+    // 直接给这个私有函数写单元测试，不走 `Supervisor` 那一整套异步
+    // 状态机：`#[tokio::test(start_paused = true)]` 的虚拟时钟只加速
+    // `tokio::time`，管不到 `record_session_closed` 用的
+    // `std::time::SystemTime`——把这条断言塞进一条 `start_paused` 的
+    // 集成测试，量出来的真实耗时永远接近 0 秒，测不出"时长是不是真的
+    // 按 `opened_at` 算出来的"这件事。这里用一个纯同步的 `#[test]`
+    // （不需要 tokio），把 `opened_at` 直接写成 90 秒前。
+    //
+    // 会让这条测试变红的实现改法：把 `record_session_closed` 里
+    // `SystemTime::now().duration_since(info.opened_at).map(|d|
+    // d.as_secs())` 换成恒定的 `0`（或任何跟 `opened_at` 无关的固定
+    // 值）。**已做过变异验证**：临时改成 `let secs = 0u64;` 本地跑过，
+    // 确认这条测试会在 `assert!` 上失败（日志里看到的是"用时 0 秒"，
+    // 不含"用时 90 秒"）；改完已还原。
+    #[test]
+    fn record_session_closed_writes_the_real_elapsed_seconds() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmc-audit-duration-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = Audit::open(dir.clone()).unwrap();
+        let info = RemoteSessionInfo {
+            id: 42,
+            opened_at: SystemTime::now() - Duration::from_secs(90),
+            to_appliance: 1,
+            from_appliance: 2,
+        };
+
+        record_session_closed(&audit, 42, &info);
+
+        let text = std::fs::read_to_string(audit.current_path()).unwrap();
+        assert!(text.contains("用时 90 秒"), "{text}");
+    }
+
+    // R92（Task 12 复审发现）：`TunnelMsg::ApplianceDialFailed` 对应的
+    // "远程会话 N 连接一体机失败：{原因}"这一行此前也没有任何测试断言
+    // 过内容，删掉整行同样全绿。
+    //
+    // 会让这条测试变红的实现改法：把 `handle_msg` 里
+    // `TunnelMsg::ApplianceDialFailed` 分支对应的
+    // `ctx.audit.record(...)` 那一行删掉。
+    #[tokio::test(start_paused = true)]
+    async fn appliance_dial_failure_is_recorded_with_its_reason() {
+        guard(async {
+            let dir = std::env::temp_dir().join(format!(
+                "rmc-audit-dialfail-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut cfg = config();
+            cfg.log_dir = dir.clone();
+
+            let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
+                TunnelMsg::Authenticated {
+                    host_key_fp: "SHA256:aaa".into(),
+                    first_seen: false,
+                },
+                TunnelMsg::ForwardRegistered { port: 22001 },
+                TunnelMsg::ApplianceDialFailed {
+                    id: 9,
+                    reason: "TEMP-MUTATION-CHECK-拒绝连接".into(),
+                },
+            ])]);
+            let (tx, mut rx) =
+                Supervisor::spawn(cfg, deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+
+            states_until(&mut rx, |s| {
+                matches!(s, State::Connected { degraded: true })
+            })
+            .await;
+
+            let a = Audit::open(dir).unwrap();
+            let text = std::fs::read_to_string(a.current_path()).unwrap();
+            assert!(
+                text.contains("远程会话 9 连接一体机失败")
+                    && text.contains("TEMP-MUTATION-CHECK-拒绝连接"),
+                "{text}"
             );
         })
         .await;
