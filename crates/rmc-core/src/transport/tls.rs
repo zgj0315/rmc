@@ -2,6 +2,8 @@
 
 use crate::error::{Error, Result};
 use crate::platform::Io;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use std::sync::Arc;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -20,10 +22,15 @@ impl TlsRoots {
     }
 
     /// 追加一个 PEM 根，只用于集成测试信任 docker 环境的自签证书。
+    ///
+    /// R——依赖审计（Task 12）：原来用 `rustls_pemfile::certs`，该 crate
+    /// 已被 RUSTSEC-2025-0134 标记为 unmaintained（见 `Cargo.toml` 里
+    /// `rustls-pki-types` 依赖上的说明）。`CertificateDer::pem_slice_iter`
+    /// 是同一份解析代码在 `rustls-pki-types` 里的原生入口，直接吃
+    /// `&[u8]`，不用再手动包一层 `BufReader`。
     pub fn with_extra_pem(&mut self, pem: &[u8]) -> Result<()> {
-        let mut reader = std::io::BufReader::new(pem);
         let mut added = 0usize;
-        for cert in rustls_pemfile::certs(&mut reader) {
+        for cert in CertificateDer::pem_slice_iter(pem) {
             let cert = cert.map_err(|e| Error::Config(format!("PEM 解析失败：{e}")))?;
             self.store
                 .add(cert)
@@ -256,12 +263,11 @@ xlcoJ4CKlST85mlZ9Fl2Un3fPCYFwtRi0eEJ4jAh5cf6WHGmEM9gZlsV\n\
     async fn untrusted_self_signed_certificate_is_rejected_as_fatal() {
         use tokio::net::TcpListener;
 
-        let certs: Vec<_> = rustls_pemfile::certs(&mut UNTRUSTED_CERT_PEM.as_bytes())
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(UNTRUSTED_CERT_PEM.as_bytes())
             .collect::<std::result::Result<_, _>>()
             .expect("测试证书应该能被解析");
-        let key = rustls_pemfile::private_key(&mut UNTRUSTED_KEY_PEM.as_bytes())
-            .expect("测试私钥应该能被解析")
-            .expect("测试私钥不应该缺失");
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(UNTRUSTED_KEY_PEM.as_bytes())
+            .expect("测试私钥应该能被解析");
         let server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)

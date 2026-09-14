@@ -6,6 +6,13 @@ members = ["crates/rmc-core"]
 edition = "2021"
 rust-version = "1.89"
 license = "UNLICENSED"
+# 不发布到 crates.io——内部专有代码，`UNLICENSED` 不是合法的 SPDX
+# 表达式，`cargo deny check licenses` 会把这个字段本身判成
+# "unlicensed" 错误。`publish = false` 配合 `deny.toml` 里的
+# `[licenses.private]` 让 cargo-deny 跳过对本 workspace 自己代码的
+# 许可证检查——审计要看的是"编译进二进制、对外分发的第三方依赖用了
+# 什么许可证"，不是这份从不对外发布的私有源码本身叫什么许可证。
+publish = false
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }

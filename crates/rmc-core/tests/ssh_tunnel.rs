@@ -84,24 +84,38 @@ async fn establishes_and_reports_first_seen_host_key() {
     // 观察它的行为。sshd 收到反向端口上的连接后，会先 accept() 这个
     // TCP 连接，再通过 SSH 会话发 forwarded-tcpip 请求给客户端；
     // - 如果 `reply.accept()` 真的被调用，这条 TCP 连接会保持打开——
-    //   Task 8 还没实现字节转发，读不到任何字节，也读不到 EOF，
-    //   读操作应该超时。
+    //   一体机自己的 sshd 会立刻发一句 SSH banner，字节转发（Task 8，
+    //   `ssh::pump`）会把它原样转发过来，读操作会在超时前拿到非零
+    //   字节。
     // - 如果 `reply` 被悄悄丢弃（等效于自动拒绝），sshd 会在通道被拒绝后
     //   立刻把这条已经 accept 过的 TCP 连接关掉，读操作会几乎立即返回
-    //   `Ok(0)`（EOF），而不是超时。
+    //   `Ok(0)`（EOF）。
     //
-    // 会让这部分变红的改法：把 handler.rs 里 `reply.accept().await;`
-    // 删掉或者换成 drop(reply)（等效于把参数命名成 `_reply`）。
+    // R——Task 12 首次让这条 `#[ignore]` 用例真的在 CI 里跑起来时抓到：
+    // brief 原文这里断言"应该超时"，写这句话的时候字节转发还没接上
+    // （模块顶部第二段的历史注释）；转发接上之后，一体机的 SSH banner
+    // 会在 3 秒超时之前就到，`read_result` 变成 `Ok(Ok(1))`，原来那句
+    // `assert!(read_result.is_err(), ...)` 反倒会把"转发工作正常"这个
+    // 好结果误判成失败——这条 `#[ignore]` 从未被自动化跑过，这个假阳性
+    // 一直没被发现。真正该守住的性质是"没有读到 EOF"（`Ok(Ok(0))` 才
+    // 是通道被悄悄拒绝的信号），超时（尚未转发任何字节）与读到非零字节
+    // （转发已经在正常工作）都是"通道确实被 accept 了"的证据，两者都
+    // 该算通过。
+    //
+    // 会让这条测试变红的实现改法：把 handler.rs 里
+    // `reply.accept().await;` 删掉或者换成 `drop(reply)`（等效于把参数
+    // 命名成 `_reply`）——sshd 会立刻把探测连接关掉，下面的读操作会
+    // 几乎立即返回 `Ok(Ok(0))`。
     let mut probe = tokio::net::TcpStream::connect(("127.0.0.1", REVERSE_PORT))
         .await
         .expect("连接反向端口失败");
     let mut buf = [0u8; 1];
     let read_result = tokio::time::timeout(Duration::from_secs(3), probe.read(&mut buf)).await;
-    assert!(
-        read_result.is_err(),
-        "期待读超时（forwarded-tcpip 通道被 accept、保持打开），\
-         实际 {read_result:?}——说明通道被悄悄拒绝了"
-    );
+    match read_result {
+        Err(_) => {} // 超时：通道被 accept，还没有字节流过。
+        Ok(Ok(n)) => assert_ne!(n, 0, "读到 EOF——说明通道被悄悄拒绝了"),
+        Ok(Err(e)) => panic!("读取探测连接失败：{e}"),
+    }
 
     handle.shutdown().await;
 }

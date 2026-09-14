@@ -1,0 +1,122 @@
+name: core
+
+# R——CI（Task 12）：这份工作流要还的债是"本仓库至今没有任何 CI 会构建
+# Rust"——`gateway.yml` 的 paths 过滤器从来没包含 `crates/**`，改
+# rmc-core 一个字都不会触发任何工作流。下面的过滤器必须覆盖
+# `crates/**`、workspace 级 `Cargo.*`、`deny.toml` 与这份文件自己。
+on:
+  push:
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/core.yml"]
+  pull_request:
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/core.yml"]
+
+jobs:
+  # 普通 `cargo test -p rmc-core` 覆盖的部分：格式、clippy（-D
+  # warnings，本 crate 一贯的验证标准）、lib 单元测试与不需要 docker
+  # 的假隧道集成测试。213 条非 ignored 测试全部在这里跑。
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy -p rmc-core --all-targets -- -D warnings
+
+      - name: 单元与假隧道测试
+        # 这个 crate 已经被"失败路径报不出错、只会一直挂着"坑过不止一次
+        # （见 ssh::test_support 模块文档、Task 7 报告）——外层 timeout
+        # 保证卡死时报一条清楚的"超时被杀"，而不是干等到 GitHub Actions
+        # 自己的 job 级超时、什么诊断信息都没有。
+        run: timeout 600 cargo test -p rmc-core
+
+  # 17 条 `#[ignore]` 集成测试，需要 gateway/test-env 这套 docker 夹具。
+  #
+  # 用容器内跑测试进程 + `--network host` + `--add-host` 绕开
+  # "gateway.test 需要能解析"这个前提，不用 sudo、不用写宿主的
+  # /etc/hosts：
+  #
+  # - `--network host` 让这个临时容器与宿主共享网络栈，docker compose
+  #   发布到 127.0.0.1 的端口（8443/2322/22001）在容器里原样可达，
+  #   `tests/*.rs` 里现有的地址字面量（`"127.0.0.1:8443"`、
+  #   `"127.0.0.1:2322"`、反向端口 22001）不用改一个字符。
+  # - `--add-host gateway.test:127.0.0.1` 只给这一个临时容器自己的
+  #   /etc/hosts 加一行别名——内核在容器创建那一刻写好，不影响宿主，
+  #   容器退出（`--rm`）后这行别名跟着消失，不留任何痕迹。
+  #
+  # 已经本地实测过这个组合成立：起 gateway/test-env 之后，一个
+  # `--network host --add-host gateway.test:127.0.0.1` 的临时容器能
+  # 用 SNI gateway.test 完成 TLS 握手（拿到自签证书 CN=gateway.test）、
+  # 也能连上发布出来的一体机端口——细节见 task-12-report.md。
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 拉起测试环境
+        # --build 不能省：早于某个提交的缓存镜像里还是有问题的旧证书
+        # （见 fetch-harness-cert.sh 与 tests/transport.rs 顶部的说明）。
+        run: |
+          cd gateway/test-env
+          docker compose up -d --build
+
+      - name: 生成 harness 证书
+        run: ./crates/rmc-core/tests/fetch-harness-cert.sh
+
+      - name: 运行 --ignored 集成测试
+        # 这一步必须显式传 --ignored 并且以非零退出让构建失败——普通的
+        # `cargo test -p rmc-core` 对这 17 条只会报一行 "17 ignored"、
+        # 以 0 退出收场，混在别的测试步骤里等于没跑。--test-threads=1
+        # 是必须的：establishes_and_reports_first_seen_host_key 之类的
+        # 用例会真的把反向端口 22001 绑起来，并发跑会互相抢占。
+        # `--no-fail-fast`：这 4 个测试二进制（forwarding/preflight/
+        # ssh_tunnel/transport）里任何一个失败，cargo test 默认会立刻
+        # 停下、不跑剩下的——本地验证过这个默认行为会把后面几个二进制
+        # 的真实结果盖住，一次只看得到一条失败。同一次 CI 跑出全部结果，
+        # 比"改一条、重跑、再改一条"来回更快。
+        run: |
+          timeout 1200 docker run --rm \
+            --network host \
+            --add-host gateway.test:127.0.0.1 \
+            -v "$PWD":/work -w /work \
+            -e CARGO_TERM_COLOR=always \
+            rust:1.89 \
+            bash -euxc '
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends openssh-client
+              cargo test -p rmc-core --no-fail-fast -- --ignored --test-threads=1
+            '
+
+      - name: 失败时导出容器日志
+        if: failure()
+        run: cd gateway/test-env && docker compose logs --no-color
+
+      - name: 清理测试环境
+        if: always()
+        run: cd gateway/test-env && docker compose down -v
+
+  # 依赖审计：许可证、安全公告、被禁止的 TLS 实现、多版本重复。裁定与
+  # 理由见 deny.toml 本身的注释。
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2

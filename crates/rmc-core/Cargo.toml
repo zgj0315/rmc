@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 tokio.workspace = true
@@ -17,9 +18,34 @@ async-trait = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
-rustls-pemfile = "2"
+# R——依赖审计（Task 12）发现：`rustls-pemfile` 已被 RUSTSEC-2025-0134
+# 标记为 unmaintained（仓库 2025-08 起归档），`cargo deny check
+# advisories` 会因此变红，且公告本身说明"没有安全的升级路径"——它已经
+# 是 `rustls-pki-types` 里同一份 PEM 解析代码的薄包装，直接依赖
+# `rustls-pki-types` 的 `PemObject` trait 即可，不用等上游发新版本。
+# `pem` 模块只挂在 `alloc` feature 后面（这个版本没有单独的 `pem`
+# feature），`std`（隐含 `alloc`）已经够用。
+rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 # default-features 会拉 aws-lc-rs，其 aws-lc-sys 需要 cmake 做一次数分钟的 C
 # 编译，CI 超时预算扛不住；ring 是纯 Rust 实现，编译快得多。
+#
+# R——依赖审计（Task 12）：这一行同时也关掉了 default-features 里的
+# `rsa`（`Cargo.lock` 里确实没有 `rsa`/`pkcs1` crate），但
+# `russh::negotiation::Preferred::DEFAULT.key`（协商时向服务端广播的
+# 可接受 host key 算法列表）在 russh 0.63.3 源码里没有对这个数组做
+# `#[cfg(feature = "rsa")]` 门控——没开 `rsa` feature 时，客户端仍然会
+# 在 KEXINIT 里广播 `rsa-sha2-512`/`rsa-sha2-256`/`ssh-rsa`。如果对端
+# 真的选中其中一个并回一张 RSA host key，本 crate 到 `parse_public_
+# key` 那一步会因为缺 `rsa` feature 解析失败，这条失败经
+# `SshTransport` 归类到 `ErrorClass::Network`——对一台完全正常、只是
+# 恰好用 RSA host key 的 Gateway，客户端会无限退避重连，而不是报一条
+# "host key 类型不受支持"。**当前无害**：`gateway/sshd_tunnel_config`
+# 钉死 `HostKey /etc/ssh/tunnel_host_ed25519_key`，服务端只有这一个
+# host key，永远不会被协商选中 RSA。但这是 rmc-core 与 gateway 两个
+# repo 之间的隐性耦合，不是 rmc-core 自己能保证的性质——gateway 那边
+# 一旦改动 `sshd_tunnel_config` 加回 RSA host key（或者接了另一台
+# 用别的 sshd 实现的 Gateway），这里会在完全不知情的情况下从"能连"
+# 变成"无限重连"。
 russh = { version = "0.63", default-features = false, features = ["ring"] }
 # 只开 local-offset：审计日志的时间戳想显示现场笔记本的本地时间，不是
 # UTC。不开 formatting/macros——本模块自己手写 format! 拼时间戳，不用
@@ -31,3 +57,10 @@ time = { version = "0.3", default-features = false, features = ["local-offset"] 
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 filetime = "0.2"
+# 只给 tests/ci_workflow.rs 解析 .github/workflows/core.yml 用——那份
+# 测试要盯住工作流 YAML 的结构（哪一步在哪个 job、顺序、if 条件），
+# 手写一个只覆盖当前文件形状的迷你解析器风险更大：解析器自己的 bug
+# 会悄悄掩盖它本该盯住的工作流回归。dev-only，不影响发布的二进制；
+# `cargo deny check` 验证过它与其全部传递依赖都落在现有许可证允许
+# 列表内，不需要改 deny.toml。
+yaml-rust2 = "0.10"

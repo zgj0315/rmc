@@ -1,0 +1,39 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+# rmc-core 自己的 `license = "UNLICENSED"`（workspace 内部专有代码的
+# 惯例写法）不是合法的 SPDX 表达式，会被判成 "unlicensed" 错误——这
+# 不是第三方依赖的问题，是我们自己这份从不对外发布的源码。配合
+# `Cargo.toml` 里的 `publish = false`，让 cargo-deny 跳过对它自己的
+# 许可证检查，只审计真正会被编译进二进制、对外分发的第三方依赖。
+private = { ignore = true }
+
+# 之前的核查确认：依赖图里除下面这一条之外，所有不在这份 allow 列表
+# 里的许可证标识符都只出现在带允许项的 `OR` 表达式里（cargo-deny 判定
+# 只要 `OR` 的任意一侧被允许即算通过），不需要逐个列出。
+#
+# `webpki-roots` 是这份列表里唯一的例外：它的许可证是裸的
+# `CDLA-Permissive-2.0`（Community Data License Agreement，不是
+# `OR` 表达式的一部分），且不在 brief 原始草稿给的列表里——`cargo deny
+# check licenses` 会因此变红。这是一次刻意拍板，不是被 CI 逼红之后
+# 顺手糊过去：`webpki-roots` 打包的是 Mozilla 维护的 CA 根证书集合，
+# CDLA-Permissive-2.0 是一份宽松型的**数据**许可（允许自由使用、修改、
+# 分发，不要求开源衍生作品），性质上类似 CC-BY，用来给"这一批证书数据
+# 能不能被打进闭源客户端"这件事发许可，不是给可执行代码发许可；
+# 允许它进这份列表不会把任何 copyleft 义务带进这个 crate。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+# 明确禁止把 OpenSSL 拖进来，TLS 只用 rustls。
+deny = [{ name = "openssl-sys" }, { name = "native-tls" }]

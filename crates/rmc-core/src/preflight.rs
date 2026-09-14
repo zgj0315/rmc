@@ -664,12 +664,18 @@ xlcoJ4CKlST85mlZ9Fl2Un3fPCYFwtRi0eEJ4jAh5cf6WHGmEM9gZlsV\n\
         use crate::platform::{NoProxy, NoProxyAuth};
         use crate::transport::tls::TlsRoots;
 
-        let certs: Vec<_> = rustls_pemfile::certs(&mut TEST_TLS_CERT_PEM.as_bytes())
+        // R——依赖审计（Task 12）：`rustls_pemfile` 已被 RUSTSEC-2025-0134
+        // 标记为 unmaintained，改用 `rustls-pki-types` 原生的
+        // `PemObject`，见 `transport/tls.rs` 里 `TlsRoots::with_extra_pem`
+        // 上的同款说明。
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(TEST_TLS_CERT_PEM.as_bytes())
             .collect::<std::result::Result<_, _>>()
             .expect("测试证书应该能被解析");
-        let key = rustls_pemfile::private_key(&mut TEST_TLS_KEY_PEM.as_bytes())
-            .expect("测试私钥应该能被解析")
-            .expect("测试私钥不应该缺失");
+        let key = PrivateKeyDer::from_pem_slice(TEST_TLS_KEY_PEM.as_bytes())
+            .expect("测试私钥应该能被解析");
         let server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
