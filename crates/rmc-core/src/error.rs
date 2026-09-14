@@ -45,8 +45,17 @@ pub enum Error {
     // 假设——方案设计.md §3.4 明确要求这个判定耗时必须等 rmc-core 建出来后
     // 实测，不能从算式直接推定：Gateway 侧同样的乘法算法实测偏了约 2.7 倍
     // （真实值约 80 秒，不是算出来的 30 秒），客户端用 russh 而非 OpenSSH，
-    // 偏差可能不同。真实数字由后续任务测出后回填到方案文档，这里的 Display
-    // 文案先不出现数字，避免重犯同一个错误。
+    // 偏差可能不同。
+    //
+    // Task 10 已经测出来了：约 40 秒（4 次 10 秒间隔的 keepalive 未获应答，
+    // 不是 10×3=30 秒那个乘法——`keepalive_max = 3` 意味着第 4 次才越界），
+    // 测法见 `supervisor.rs` 里
+    // `keepalive_disconnect_is_measured_end_to_end_from_a_real_ssh_session`，
+    // 数字已回填到方案设计.md §3.4。即便如此，这里的 Display 文案依然不写
+    // 数字——它是这一个 russh 版本在这份测试夹具下量出来的观察值，不是协议
+    // 承诺的契约，写进面向用户的文案里，一旦哪天数字变了就会跟着过期，
+    // 不如干脆不出现，避免重犯 Gateway 侧同一个错误（把一次性的实测值
+    // 当成可以到处引用的常量）。
     #[error("Gateway 长时间未响应 keepalive，判定连接已断开")]
     KeepaliveTimeout,
 
