@@ -20,11 +20,25 @@
 //!    统一用同一套口令注入方式，避免这个仓库里同时存在两种连法），改用
 //!    OpenSSH 8.4+ 的 `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE=force`，做法照抄
 //!    `gateway/tests/conftest.py` 里的 `askpass_env`。
+//!
+//! # 上一轮评审的两处小修（R51/R53）
+//!
+//! - **R51**：`reports_session_open_bytes_and_close` 原来驱动流量的命令是
+//!   `head -c 65536 /dev/zero | base64 | wc -c`——整条管道在一体机的 shell
+//!   里本地跑完，只有 `wc -c` 数出来的那几个字节真的经过 SSH 通道，评审
+//!   实跑两次量出 `from_appliance` 稳定是 3777，在一个完全正确的实现上
+//!   这条测试也会红。去掉 `| wc -c`，让 base64 的输出（约 87KB，
+//!   `ceil(65536/3)*4` 加上换行）真的推过通道。
+//! - **R53**：`unreachable_appliance_reports_dial_failure_and_keeps_the_tunnel`
+//!   原来用固定的 `127.0.0.1:9` 模拟不可达，改成跟
+//!   `ssh/pump.rs` 里同名进程内测试一样的手法：绑一个端口立刻释放，
+//!   保证空置，不依赖某个固定端口号"大概率没人监听"。
 
 use rmc_core::tunnel::{TunnelFactory, TunnelMsg};
 use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -116,7 +130,13 @@ async fn reports_session_open_bytes_and_close() {
     while !matches!(next_msg(&mut rx).await, TunnelMsg::ForwardRegistered { .. }) {}
 
     // 传一段可观测大小的数据，确保两个方向的计数都非零。
-    let out = engineer_runs("head -c 65536 /dev/zero | base64 | wc -c").await;
+    //
+    // R51：原来这里还接了 `| wc -c`——整条管道在一体机的 shell 里本地跑
+    // 完，只有 `wc -c` 数出来的那几个字节（个位数）真的经过 SSH 通道，
+    // `from_appliance > 60_000` 在一个完全正确的实现上也会红。去掉
+    // `| wc -c`，让 base64 编码后的输出（约 87KB）真的经过通道被 pump
+    // 计入 `from_appliance`。
+    let out = engineer_runs("head -c 65536 /dev/zero | base64").await;
     assert!(
         out.status.success(),
         "{}",
@@ -186,8 +206,12 @@ async fn two_concurrent_sessions_get_distinct_ids() {
 #[ignore = "需要 gateway/test-env 在运行"]
 async fn unreachable_appliance_reports_dial_failure_and_keeps_the_tunnel() {
     let mut p = params(TUNNEL_PW, REVERSE_PORT);
-    // 指向一个没人监听的端口，模拟一体机不可达。
-    p.appliance = "127.0.0.1:9".parse().unwrap();
+    // R53：绑一个端口立刻释放，保证空置——比固定端口号 9（赌它"大概率
+    // 没人监听"）更可靠，跟 `ssh/pump.rs` 里同名进程内测试的手法一致。
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = probe.local_addr().unwrap();
+    drop(probe);
+    p.appliance = format!("127.0.0.1:{}", dead_addr.port()).parse().unwrap();
 
     let (tx, mut rx) = mpsc::channel(64);
     let handle = factory(tmp_known_hosts()).establish(p, tx).await.unwrap();

@@ -511,4 +511,179 @@ mod tests {
 
         handle.shutdown().await;
     }
+
+    // --- R52（上一轮评审）：全 crate 没有任何测试锁住"转发内容一个字节
+    // 都不许进日志"这条硬约束——本模块顶部文档写了这句承诺，但完全靠
+    // 人工看代码里没有哪行 `tracing::` 碰到缓冲区。这条测试用一个最小的
+    // `tracing::Subscriber`（`tracing` facade 自带
+    // `subscriber::set_default`，不需要新引入 `tracing-subscriber` 这个
+    // 依赖）捕获事件文本，跑一次带特征字节的真实转发，断言捕获到的日志
+    // 里不含那些特征字节。这条约束是产品级的：那是远程工程师与一体机
+    // 之间的 SSH 明文。
+
+    /// 只把 event 的字段格式化进一个字符串，够用来做"包不包含某段文本"
+    /// 的判断——不需要时间戳、级别这些 `tracing-subscriber::fmt` 才关心
+    /// 的排版。
+    struct CaptureVisitor(String);
+
+    impl tracing::field::Visit for CaptureVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    /// 只关心 `event`（日志里的一行）本身，span 相关方法全是空实现——这个
+    /// crate 目前没有用 `#[instrument]`/`span!`，就算将来加了，我们也只
+    /// 关心"最终有没有字节被打进某一行事件"，不需要真的维护 span 树。
+    struct CaptureSubscriber(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = CaptureVisitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// 会让这条测试变红的实现改法：在 `run()` 的读写循环里加一行
+    /// `tracing::debug!(?data, ...)`（或者把 `ch_buf`/`up_buf` 的切片
+    /// 原样传给任何 `tracing::` 宏）——不管加在哪个方向、哪个级别，这里
+    /// 的特征字节断言都会当场抓到。
+    ///
+    /// 测试本身不是靠"pump.rs 现在没有任何 tracing 调用"这件事空转过
+    /// 关：先故意触发 handler.rs 里唯一一处真实存在的
+    /// `tracing::warn!`（端口不匹配的 forwarded-tcpip 请求），断言 capture
+    /// 机制确实拦到了这一条——证明"日志里没有特征字节"不是在一个从未
+    /// 真正捕获过任何事件的空缓冲区上自证。
+    #[tokio::test]
+    async fn forwarded_payload_bytes_never_reach_a_tracing_event() {
+        const TO_APPLIANCE_MARKER: &str = "RMC-TO-APPLIANCE-89f2a1c7-DO-NOT-LOG";
+        const FROM_APPLIANCE_MARKER: &str = "RMC-FROM-APPLIANCE-3e5b9d02-DO-NOT-LOG";
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(CaptureSubscriber(captured.clone()));
+
+        let appliance_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let appliance_addr = appliance_listener.local_addr().unwrap();
+        let appliance = HostPort::new("127.0.0.1", appliance_addr.port()).unwrap();
+
+        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let known_hosts = Arc::new(tmp_known_hosts());
+        let (tx, mut rx) = mpsc::channel(64);
+        let handle = with_timeout(
+            "establish_over",
+            establish_over(
+                conn,
+                &test_gateway_hostport(),
+                &known_hosts,
+                params_with_appliance(appliance),
+                tx,
+            ),
+        )
+        .await
+        .unwrap();
+        drain_authenticated_and_forward_registered(&mut rx).await;
+        let server_handle = pending.get().await;
+
+        // 先触发一次真实存在的 tracing::warn!（端口不匹配），证明下面的
+        // capture 机制不是在空转——不然"日志里没有特征字节"这句断言在一个
+        // 从来没捕获到任何事件的空缓冲区上永远成立，测试名字声称验证的
+        // 事情其实一次都没被验证过。
+        let rejected = with_timeout(
+            "端口不匹配的 channel_open_forwarded_tcpip",
+            server_handle.channel_open_forwarded_tcpip("127.0.0.1", 22002, "203.0.113.5", 1),
+        )
+        .await;
+        assert!(rejected.is_err(), "端口不匹配应该被拒绝");
+
+        // 真正的转发：两个方向各推一段带特征字节的 payload。
+        let mut engineer_channel = with_timeout(
+            "channel_open_forwarded_tcpip",
+            server_handle.channel_open_forwarded_tcpip("127.0.0.1", 22001, "203.0.113.5", 2),
+        )
+        .await
+        .unwrap();
+        let (mut appliance_sock, _peer) =
+            with_timeout("一体机 accept", appliance_listener.accept())
+                .await
+                .unwrap();
+        let _id = match next_msg(&mut rx).await {
+            TunnelMsg::RemoteSessionOpened { id } => id,
+            other => panic!("期望 RemoteSessionOpened，实际 {other:?}"),
+        };
+
+        let to_appliance_payload = TO_APPLIANCE_MARKER.repeat(50).into_bytes();
+        with_timeout(
+            "写入 engineer_channel",
+            engineer_channel.data_bytes(to_appliance_payload.clone()),
+        )
+        .await
+        .unwrap();
+        let mut got_at_appliance = vec![0u8; to_appliance_payload.len()];
+        with_timeout(
+            "一体机读取工程师数据",
+            appliance_sock.read_exact(&mut got_at_appliance),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got_at_appliance, to_appliance_payload);
+
+        let from_appliance_payload = FROM_APPLIANCE_MARKER.repeat(50).into_bytes();
+        with_timeout(
+            "一体机写回",
+            appliance_sock.write_all(&from_appliance_payload),
+        )
+        .await
+        .unwrap();
+        let mut got_at_engineer = Vec::new();
+        with_timeout("engineer_channel 读取一体机数据", async {
+            while got_at_engineer.len() < from_appliance_payload.len() {
+                match engineer_channel.wait().await {
+                    Some(russh::ChannelMsg::Data { data }) => {
+                        got_at_engineer.extend_from_slice(&data);
+                    }
+                    other => panic!("期望 ChannelMsg::Data，实际 {other:?}"),
+                }
+            }
+        })
+        .await;
+        assert_eq!(got_at_engineer, from_appliance_payload);
+
+        drop(appliance_sock);
+        loop {
+            if let TunnelMsg::RemoteSessionClosed { .. } = next_msg(&mut rx).await {
+                break;
+            }
+        }
+
+        handle.shutdown().await;
+
+        let captured = captured.lock().unwrap();
+        assert!(
+            !captured.is_empty(),
+            "capture 机制应该至少拦到 handler.rs 里那一次 tracing::warn!，\
+             不然下面「没有特征字节」的断言是在空缓冲区上自证"
+        );
+        for line in captured.iter() {
+            assert!(
+                !line.contains(TO_APPLIANCE_MARKER),
+                "转发去一体机方向的内容出现在日志里：{line}"
+            );
+            assert!(
+                !line.contains(FROM_APPLIANCE_MARKER),
+                "转发回工程师方向的内容出现在日志里：{line}"
+            );
+        }
+    }
 }
