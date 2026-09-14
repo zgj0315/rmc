@@ -18,9 +18,9 @@
 //!    同理，量的是真实时间，虚拟时间里恒为 0，120 秒预算永远到不了。
 //!    两者叠加的后果不是测试失败，是**挂死**。
 //! 3. **`port_busy_since` 在任何非 `PortBusy` 错误发生时都会被清空**——
-//!    不止在 `attempt()` 成功和 `Command::Start` 时清。否则"端口占用→
-//!    网络错误→五分钟后全新的端口占用"这个序列会在第三步被误判成
-//!    "预算已经用完"，一次重试都不给就直接 `Failed`。
+//!    不止在建连成功和 `Command::Start` 时清。否则"端口占用→网络错误
+//!    →五分钟后全新的端口占用"这个序列会在第三步被误判成"预算已经用
+//!    完"，一次重试都不给就直接 `Failed`。
 //! 4. **`ErrorClass::ApplianceUnreachable` 不与 `Network` 共用退避分支**
 //!    ——方案 §3.6 要的是"隧道保持、转 degraded、每 30 秒探测"，跟
 //!    `Network` 类"整条隧道拆了重建、指数退避"是两种完全不同的处置。
@@ -52,7 +52,44 @@
 //!    "enum variants and their fields always share the visibility of the
 //!    enum they are in"），所以这条内部入口不是 `Command` 的又一个
 //!    变体，而是一个独立的、`#[cfg(test)]` 门控的构造函数。
+//!
+//! # 评审第二轮追加的修复（R58-R70），逐条写明理由
+//!
+//! 8. **[R58] Preflight/Connecting 期间 `Cancel`/`Stop` 现在真的会立刻
+//!    生效**。上一版把预检 + 建隧道整段 `.await` 在处理
+//!    `Command::Start` 的那一个 `select!` 分支里，期间 `select!`
+//!    不会再去看下一条命令——预检卡住多久，`Cancel` 就要等多久才生效。
+//!    现在预检 + 建隧道被拆进独立的后台任务
+//!    [`run_connect_sequence`]，主循环靠 [`ConnectEvent`] 通道跟踪
+//!    进度，`Cancel`/`Stop` 到达时如果这个任务还在跑，直接
+//!    `JoinHandle::abort()`。见 `Ctx::connect_task`。
+//! 9. **[R61] 迟到的 `TunnelMsg`/`ConnectEvent` 不会污染新的一次尝试**
+//!    ——[`spawn_connect`] 每次都新建一对 `msg_tx`/`msg_rx` 与
+//!    `connect_tx`/`connect_rx`，主循环里的 `msg_rx`/`connect_rx`
+//!    局部变量随之整体替换，旧的接收端直接被丢弃。旧的后台任务
+//!    （已经被 `abort()`，或者已经跑完但对应的隧道已经被拆掉）手里还
+//!    攥着的发送端只要 `.send()`，会因为对应的接收端已经不存在而直接
+//!    返回 `Err`（已经用 `let _ = ...` 忽略），不可能被"新"的这一次
+//!    尝试听到。不需要给消息加会话代号/世代号，channel 的生命周期本身
+//!    就是唯一性凭证。
+//! 10. **[R62] `Command::Start` 地址校验失败时会清空 `ctx.creds`**——
+//!     否则用户改错地址后点"重试"（`Failed` 状态下允许 `RetryNow`）
+//!     会拿旧地址旧口令去连，界面刚报的地址错误跟实际连接的目标对
+//!     不上。
+//! 11. **[R58 附带] `Command::Cancel`/`Command::Stop` 现在处理路径
+//!     完全一致，但行为不再等价**——上一版由于 Preflight/Connecting
+//!     不可中断，两者在那两个阶段实际上都要等到建连流程结束才生效，
+//!     观察不出差异；现在 `Cancel`/`Stop` 在 Preflight/Connecting 期间
+//!     都会真的中断在建立中的连接，差异只体现在**响应速度**上（见
+//!     `cancel_during_preflight_takes_effect_immediately_not_after_
+//!     the_whole_sequence`），命令语义本身仍按 brief 原样合并，等
+//!     后续任务如果需要更细的区分再拆。
+//!
+//! 与状态机行为无关、纯粹是测试基础设施/文档的修复（R59/R63/R69/R70）
+//! 分别记在 `ssh/pump.rs`、本文件测试模块对应测试上方、以及
+//! `docs/方案设计.md` §3.4。
 
+use crate::addr::HostPort;
 use crate::backoff::{Backoff, Jitter};
 use crate::config::{Config, ValidatedAddresses};
 use crate::error::{Error, ErrorClass};
@@ -65,6 +102,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -74,6 +112,7 @@ pub const APPLIANCE_PROBE: Duration = Duration::from_secs(30);
 
 const EVENT_CAPACITY: usize = 256;
 const MSG_CAPACITY: usize = 256;
+const CONNECT_EVENT_CAPACITY: usize = 8;
 
 pub struct Deps {
     pub factory: Arc<dyn TunnelFactory>,
@@ -85,7 +124,8 @@ pub struct Deps {
 
 /// 一次 Start 之后持有的凭据，断线重连时复用，不需要界面再问一遍口令。
 /// R——第九条：`Credentials` 只在本文件内部构造与消费（唯一的构造点在
-/// `begin_start`，唯一的输入是一份 `ValidatedAddresses`），换成直接持有
+/// 处理 `Command::Start` 与 `Supervisor::spawn_with_validated_start` 的
+/// 初始化逻辑，唯一的输入是一份 `ValidatedAddresses`），换成直接持有
 /// `ValidatedAddresses` 而不是拆开的 `gateway`/`appliance: HostPort`
 /// 在这里是"免费"的——不像 `tunnel::TunnelParams`/`ssh::SshTunnelFactory`
 /// 那样有外部集成测试（`tests/ssh_tunnel.rs`，用 127.0.0.1 一体机地址）
@@ -148,6 +188,20 @@ impl Supervisor {
     }
 }
 
+/// 一次"开启"过程中，后台连接任务（[`run_connect_sequence`]）往主循环
+/// 上报的进度/结果。见模块顶部第 8 条（R58）：Preflight/Connecting 这
+/// 两步现在跑在独立的 tokio 任务里，主循环靠这个通道拿到进度，同时
+/// 仍然能继续处理命令——尤其是 `Cancel`/`Stop`，能在任务跑到一半时把
+/// 它 `abort()` 掉，不用等整个序列（预检 + 建隧道）跑完。
+enum ConnectEvent {
+    EnteredPreflight,
+    PreflightReport(preflight::PreflightReport),
+    PreflightFailed { class: ErrorClass, message: String },
+    EnteredConnecting,
+    Established(Box<dyn TunnelHandle>),
+    Failed(Error),
+}
+
 struct Ctx {
     cfg: Config,
     deps: Deps,
@@ -155,6 +209,10 @@ struct Ctx {
     state: State,
     creds: Option<Credentials>,
     handle: Option<Box<dyn TunnelHandle>>,
+    /// 当前正在跑的"预检 + 建隧道"后台任务；`Some` 意味着状态是
+    /// `Preflight` 或 `Connecting`。`Cancel`/`Stop` 会 `.abort()` 它——
+    /// 见模块顶部第 8 条（R58）。
+    connect_task: Option<JoinHandle<()>>,
     sessions: BTreeMap<u64, RemoteSessionInfo>,
     /// 网络类错误的指数退避序列状态。
     backoff: Backoff,
@@ -178,7 +236,15 @@ impl Ctx {
         let _ = self.ev.send(TunnelEvent::RemoteSessions(list));
     }
 
+    /// 停掉当前的一切：先取消还在跑的连接任务（如果有——对应
+    /// Preflight/Connecting 阶段），再关掉已经建立的隧道（如果有——
+    /// 对应 Connected/degraded 阶段）。两者互斥（连接任务跑完才会有
+    /// `handle`），但都检查一遍，不假设调用方已经知道当前处于哪个
+    /// 阶段。
     async fn teardown(&mut self) {
+        if let Some(task) = self.connect_task.take() {
+            task.abort();
+        }
         if let Some(h) = self.handle.take() {
             h.shutdown().await;
         }
@@ -187,6 +253,103 @@ impl Ctx {
             self.publish_sessions();
         }
     }
+}
+
+/// 在独立任务里跑"预检 + 建隧道"，通过 `connect_tx` 把每一步的结果送回
+/// 主循环。`do_preflight = false` 用于断线重连之后的重试——预检只在
+/// 一次 `Start` 里做一次，不是每次重试都重新探测一遍。
+///
+/// 这个函数本身不碰 `Ctx`——拿到的都是 `Arc`/拷贝出来的值，这正是它能
+/// 被 `tokio::spawn` 成一个独立任务、被 `JoinHandle::abort()` 取消的
+/// 前提：`Ctx` 留在主循环那一侧，两者只通过 `connect_tx`/`msg_tx`
+/// 通信。
+/// [`run_connect_sequence`] 需要的一切输入，打包成一个结构体纯粹是为了
+/// 躲开 `clippy::too_many_arguments`（8 个参数超过默认上限 7）——拆开
+/// 传没有任何行为上的理由，合并成结构体也不改变每个字段各自的含义。
+struct ConnectRequest {
+    do_preflight: bool,
+    preflight: Arc<dyn Preflight>,
+    factory: Arc<dyn TunnelFactory>,
+    gateway: HostPort,
+    appliance: HostPort,
+    params: TunnelParams,
+}
+
+async fn run_connect_sequence(
+    req: ConnectRequest,
+    msg_tx: mpsc::Sender<TunnelMsg>,
+    connect_tx: mpsc::Sender<ConnectEvent>,
+) {
+    let ConnectRequest {
+        do_preflight,
+        preflight,
+        factory,
+        gateway,
+        appliance,
+        params,
+    } = req;
+    if do_preflight {
+        let _ = connect_tx.send(ConnectEvent::EnteredPreflight).await;
+        let report = preflight.run(&gateway, &appliance).await;
+        let passed = report.passed();
+        let failure = report.first_failure().cloned();
+        let _ = connect_tx.send(ConnectEvent::PreflightReport(report)).await;
+        if !passed {
+            let (class, message) = match failure.map(|s| s.outcome) {
+                Some(preflight::StepOutcome::Fail { class, detail }) => (class, detail),
+                _ => (ErrorClass::Network, "预检未通过".to_string()),
+            };
+            let _ = connect_tx
+                .send(ConnectEvent::PreflightFailed { class, message })
+                .await;
+            return;
+        }
+    }
+    let _ = connect_tx.send(ConnectEvent::EnteredConnecting).await;
+    match factory.establish(params, msg_tx).await {
+        Ok(handle) => {
+            let _ = connect_tx.send(ConnectEvent::Established(handle)).await;
+        }
+        Err(e) => {
+            let _ = connect_tx.send(ConnectEvent::Failed(e)).await;
+        }
+    }
+}
+
+/// 发起一次新的连接尝试：为这次尝试创建全新的 `TunnelMsg`/`ConnectEvent`
+/// 通道（见模块顶部第 9 条，R61——不复用旧通道，杜绝一条已经被取消/被
+/// 取代的旧尝试的迟到消息污染新尝试的状态），把后台任务的
+/// `JoinHandle` 记进 `ctx.connect_task`。
+///
+/// 没有凭据时返回 `None`、什么都不做——这是防止 `retry_at`/网络事件
+/// 之类的定时器在 `ctx.creds` 已经被清空之后还误触发一次连接尝试的
+/// 最后一道防线：真正挡住"停止之后还会重试"的是这里（没有凭据就不会
+/// 有任何后续动作），不是调用方有没有记得同时清 `retry_at`——两者都做
+/// 了，但这里才是决定性的那一层。
+fn spawn_connect(
+    ctx: &mut Ctx,
+    do_preflight: bool,
+) -> Option<(mpsc::Receiver<TunnelMsg>, mpsc::Receiver<ConnectEvent>)> {
+    let creds = ctx.creds.as_ref()?;
+    let gateway = creds.addrs.gateway().clone();
+    let appliance = creds.addrs.appliance().clone();
+    let params = creds.params(ctx.cfg.reverse_port);
+    let preflight = ctx.deps.preflight.clone();
+    let factory = ctx.deps.factory.clone();
+
+    let (msg_tx, msg_rx) = mpsc::channel(MSG_CAPACITY);
+    let (connect_tx, connect_rx) = mpsc::channel(CONNECT_EVENT_CAPACITY);
+    let req = ConnectRequest {
+        do_preflight,
+        preflight,
+        factory,
+        gateway,
+        appliance,
+        params,
+    };
+    let task = tokio::spawn(run_connect_sequence(req, msg_tx, connect_tx));
+    ctx.connect_task = Some(task);
+    Some((msg_rx, connect_rx))
 }
 
 async fn run(
@@ -205,28 +368,47 @@ async fn run(
         state: State::Idle,
         creds: None,
         handle: None,
+        connect_task: None,
         sessions: BTreeMap::new(),
         backoff: Backoff::new(jitter()),
         port_busy_attempt: 0,
         port_busy_since: None,
     };
-    let (msg_tx, mut msg_rx) = mpsc::channel::<TunnelMsg>(MSG_CAPACITY);
 
-    // R——注意这里不调用 `ctx.set_state(State::Idle)`：`ctx.state` 在上面
+    // 初始都指向"不会有任何发送端"的哨兵通道——sender 在这条语句结束时
+    // 就被丢弃，`recv()` 恒定返回 `None`。这两个分支分别用
+    // `if ctx.connect_task.is_some()`（connect_rx）与
+    // `if ctx.handle.is_some() || ctx.connect_task.is_some()`（msg_rx）
+    // 挡住，平时根本不会被 poll 到，哨兵通道只是给局部变量一个初始值。
+    let mut msg_rx: mpsc::Receiver<TunnelMsg> = mpsc::channel(1).1;
+    let mut connect_rx: mpsc::Receiver<ConnectEvent> = mpsc::channel(1).1;
+
+    // 下一次尝试连接的时刻。None 表示不在重试中。
+    let mut retry_at: Option<Instant> = None;
+    // degraded 时下一次探测一体机的时刻。None 表示不在探测中。
+    let mut probe_at: Option<Instant> = None;
+
+    // 注意这里不调用 `ctx.set_state(State::Idle)`：`ctx.state` 在上面
     // 的结构体字面量里已经初始化成 `Idle`，这里只是"进程刚起来，状态
     // 还没变过"，不是一次真正的状态转移。如果这里也广播一次，`rx` 会在
     // 测试第一次 `recv()` 之前就已经缓冲到这条 `Idle` 事件（`broadcast`
     // 的缓冲不需要接收端先调用过 `recv`），导致 `happy_path_reaches_
     // connected` 断言 `seen[0]` 是 `Preflight` 时失败——实际
     // `seen[0]` 会是这条多余的 `Idle`。只在状态真的发生变化时才广播。
-    //
-    // 下一次尝试连接的时刻。None 表示不在重试中。
-    let mut retry_at: Option<Instant> = None;
-    // degraded 时下一次探测一体机的时刻。None 表示不在探测中。
-    let mut probe_at: Option<Instant> = None;
 
     if let Some((username, password, addrs)) = initial {
-        retry_at = begin_start(&mut ctx, username, password, addrs, &msg_tx).await;
+        ctx.creds = Some(Credentials {
+            username,
+            password,
+            addrs,
+        });
+        ctx.backoff = Backoff::new((ctx.deps.jitter)());
+        ctx.port_busy_since = None;
+        ctx.port_busy_attempt = 0;
+        if let Some((new_msg_rx, new_connect_rx)) = spawn_connect(&mut ctx, true) {
+            msg_rx = new_msg_rx;
+            connect_rx = new_connect_rx;
+        }
     }
 
     loop {
@@ -234,7 +416,46 @@ async fn run(
         let sleep_until = retry_at.unwrap_or(idle);
         let probe_until = probe_at.unwrap_or(idle);
 
+        // R58/R61：`biased` 把 `connect_rx` 排在最前——同一次
+        // `establish()` 调用里，"建隧道成功"（`Established`，经
+        // `connect_rx`）与"隧道建成后的第一条 `TunnelMsg`"（例如
+        // `Authenticated`/`ApplianceDialFailed`，经 `msg_rx`）来自两个
+        // **不同**的后台任务（`run_connect_sequence` 送 `Established`；
+        // 测试用的 `Scripted` 假工厂在 `establish()` 返回前另起一个
+        // 任务把脚本消息发去 `msg_rx`，生产用的 `ssh::establish_over`
+        // 则是在返回前用同一个任务顺序发送），谁先被调度到、消息谁先
+        // 抵达没有保证。如果 `msg_rx` 先被处理，`handle_msg` 里检查
+        // `ctx.state` 是否已经 `Connected` 的分支
+        // （`ApplianceDialFailed`/`RemoteSessionOpened`）会在
+        // `ctx.state` 还是 `Connecting` 的时候被跑到，判断失误——
+        // `degraded` 转移会被悄悄漏掉。
+        //
+        // 这条 race 只有在**真正多线程**执行时才会被逼出来：本文件
+        // 其余测试全部用默认的 `current_thread` 运行时
+        // （`#[tokio::test]` 不带 `flavor = "multi_thread"`），单线程
+        // 协作式调度下本地实测过——去掉 `biased` 且把 `msg_rx` 排到
+        // `connect_rx` 前面，`appliance_dial_failure_turns_degraded_
+        // and_recovers` 依然全绿，不会暴露这条 race；换成
+        // `flavor = "multi_thread"` 反复跑同样的场景，同样的"去掉
+        // `biased`、颠倒顺序"的改法几百次迭代内几乎必现。真正钉住这
+        // 条 race 的是下面
+        // `connect_event_ordering_is_race_free_under_true_parallelism`
+        // 这条用 `multi_thread` 运行时跑的测试，不是这条注释本身，也
+        // 不是任何一条 `current_thread` 测试。
+        //
+        // `cmd_rx` 排在 `connect_rx` 之后——如果 `Stop`/`Cancel` 与
+        // `Established` 恰好同时就绪，优先处理 `Established` 能让
+        // 隧道先进入 `ctx.handle`，随后的 `Stop` 走正常的
+        // `teardown()` 把它关掉，而不是让一个已经建立、但还没来得及
+        // 被主循环认领的隧道被 `Cancel`/`Stop` 直接丢弃、从未调用过
+        // `shutdown()`。
         tokio::select! {
+            biased;
+
+            Some(event) = connect_rx.recv(), if ctx.connect_task.is_some() => {
+                handle_connect_event(&mut ctx, event, &mut retry_at);
+            }
+
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { ctx.teardown().await; return };
                 match cmd {
@@ -244,14 +465,28 @@ async fn run(
                         }
                         match ValidatedAddresses::validate(gateway, appliance) {
                             Ok(addrs) => {
-                                retry_at = begin_start(&mut ctx, username, password, addrs, &msg_tx).await;
+                                ctx.creds = Some(Credentials { username, password, addrs });
+                                ctx.backoff = Backoff::new((ctx.deps.jitter)());
+                                ctx.port_busy_since = None;
+                                ctx.port_busy_attempt = 0;
+                                retry_at = None;
                                 probe_at = None;
+                                if let Some((new_msg_rx, new_connect_rx)) = spawn_connect(&mut ctx, true) {
+                                    msg_rx = new_msg_rx;
+                                    connect_rx = new_connect_rx;
+                                }
                             }
                             Err(e) => {
                                 // 地址关系本身不合法（一体机等于 Gateway、
                                 // 一体机是本机回环）：这是配置错误，不是
                                 // 网络问题，重试无意义，且这一步必须发生在
                                 // 触达 Deps::factory 之前——见模块顶部第 7 条。
+                                //
+                                // R62：连同凭据一起清空——否则改错地址后点
+                                // RetryNow（Failed 状态下允许）会拿旧地址
+                                // 旧口令去连，界面刚报的错跟实际连的地方
+                                // 对不上。
+                                ctx.creds = None;
                                 ctx.set_state(State::Failed { class: e.class(), message: e.to_string() });
                             }
                         }
@@ -272,7 +507,11 @@ async fn run(
                             ctx.backoff.reset();
                             ctx.port_busy_since = None;
                             ctx.port_busy_attempt = 0;
-                            retry_at = attempt(&mut ctx, &msg_tx).await;
+                            retry_at = None;
+                            if let Some((new_msg_rx, new_connect_rx)) = spawn_connect(&mut ctx, false) {
+                                msg_rx = new_msg_rx;
+                                connect_rx = new_connect_rx;
+                            }
                         }
                     }
                     Command::DisconnectRemoteSession { id } => {
@@ -283,22 +522,30 @@ async fn run(
                 }
             }
 
+            Some(msg) = msg_rx.recv(), if ctx.handle.is_some() || ctx.connect_task.is_some() => {
+                handle_msg(&mut ctx, msg, &mut retry_at, &mut probe_at).await;
+            }
+
             Ok(event) = sys.recv() => {
                 // 网络变化与休眠恢复都清零退避并立刻重试。
                 if matches!(ctx.state, State::Backoff { .. })
                     && matches!(event, SystemEvent::NetworkChanged | SystemEvent::ResumedFromSleep)
                 {
                     ctx.backoff.reset();
-                    retry_at = attempt(&mut ctx, &msg_tx).await;
+                    retry_at = None;
+                    if let Some((new_msg_rx, new_connect_rx)) = spawn_connect(&mut ctx, false) {
+                        msg_rx = new_msg_rx;
+                        connect_rx = new_connect_rx;
+                    }
                 }
             }
 
-            Some(msg) = msg_rx.recv() => {
-                handle_msg(&mut ctx, msg, &mut retry_at, &mut probe_at).await;
-            }
-
             _ = tokio::time::sleep_until(sleep_until), if retry_at.is_some() => {
-                retry_at = attempt(&mut ctx, &msg_tx).await;
+                retry_at = None;
+                if let Some((new_msg_rx, new_connect_rx)) = spawn_connect(&mut ctx, false) {
+                    msg_rx = new_msg_rx;
+                    connect_rx = new_connect_rx;
+                }
             }
 
             _ = tokio::time::sleep_until(probe_until), if probe_at.is_some() => {
@@ -308,78 +555,34 @@ async fn run(
     }
 }
 
-/// `Command::Start`（校验通过后）与
-/// `Supervisor::spawn_with_validated_start`（跳过校验，仅测试）共用的
-/// "开始一次开启"逻辑：记下凭据、重置退避与端口占用计时、跑预检、
-/// 预检通过就发起第一次连接尝试。
-async fn begin_start(
-    ctx: &mut Ctx,
-    username: String,
-    password: Zeroizing<String>,
-    addrs: ValidatedAddresses,
-    msg_tx: &mpsc::Sender<TunnelMsg>,
-) -> Option<Instant> {
-    ctx.creds = Some(Credentials {
-        username,
-        password,
-        addrs,
-    });
-    ctx.backoff = Backoff::new((ctx.deps.jitter)());
-    ctx.port_busy_since = None;
-    ctx.port_busy_attempt = 0;
-    if run_preflight(ctx).await {
-        attempt(ctx, msg_tx).await
-    } else {
-        None
-    }
-}
-
-async fn run_preflight(ctx: &mut Ctx) -> bool {
-    let Some(creds) = ctx.creds.as_ref() else {
-        return false;
-    };
-    let gateway = creds.addrs.gateway().clone();
-    let appliance = creds.addrs.appliance().clone();
-    ctx.set_state(State::Preflight);
-    // 见模块顶部第 6 条：经 `Deps::preflight` 注入的 trait 调用，不是
-    // `preflight::run` 自由函数。生产实现 `TransportPreflight` 内部才会
-    // 真的碰网络；测试注入的假实现立即返回脚本化的报告，`start_paused`
-    // 虚拟时钟因此不会被一次真实的 `TcpStream::connect` 卡住。
-    let report = ctx.deps.preflight.run(&gateway, &appliance).await;
-    let passed = report.passed();
-    let failure = report.first_failure().cloned();
-    let _ = ctx.ev.send(TunnelEvent::Preflight(report));
-    if !passed {
-        let (class, message) = match failure.map(|s| s.outcome) {
-            Some(preflight::StepOutcome::Fail { class, detail }) => (class, detail),
-            _ => (ErrorClass::Network, "预检未通过".to_string()),
-        };
-        // 预检失败没有 Backoff 分支——见方案 3.5 的状态图：Preflight 只有
-        // "通过"/"失败"两个出口，失败恒定直接进 Failed，不自动重试，
-        // 用户需要 RetryNow 或一次新的 Start。
-        ctx.set_state(State::Failed { class, message });
-        return false;
-    }
-    true
-}
-
-/// 尝试建立一次隧道。返回下一次重试的时刻，`None` 表示不再自动重试。
-async fn attempt(ctx: &mut Ctx, msg_tx: &mpsc::Sender<TunnelMsg>) -> Option<Instant> {
-    let creds = ctx.creds.as_ref()?;
-    let params = creds.params(ctx.cfg.reverse_port);
-    ctx.set_state(State::Connecting);
-
-    match ctx.deps.factory.establish(params, msg_tx.clone()).await {
-        Ok(handle) => {
+/// 处理后台连接任务上报的一步进度/结果。
+fn handle_connect_event(ctx: &mut Ctx, event: ConnectEvent, retry_at: &mut Option<Instant>) {
+    match event {
+        ConnectEvent::EnteredPreflight => ctx.set_state(State::Preflight),
+        ConnectEvent::PreflightReport(report) => {
+            let _ = ctx.ev.send(TunnelEvent::Preflight(report));
+        }
+        ConnectEvent::PreflightFailed { class, message } => {
+            ctx.connect_task = None;
+            // 预检失败没有 Backoff 分支——见方案 3.5 的状态图：Preflight
+            // 只有"通过"/"失败"两个出口，失败恒定直接进 Failed，不自动
+            // 重试，用户需要 RetryNow 或一次新的 Start。
+            ctx.set_state(State::Failed { class, message });
+        }
+        ConnectEvent::EnteredConnecting => ctx.set_state(State::Connecting),
+        ConnectEvent::Established(handle) => {
+            ctx.connect_task = None;
             ctx.handle = Some(handle);
             ctx.port_busy_since = None;
             ctx.port_busy_attempt = 0;
             ctx.backoff.reset();
             let _ = ctx.ev.send(TunnelEvent::ConnectedSince(SystemTime::now()));
             ctx.set_state(State::Connected { degraded: false });
-            None
         }
-        Err(e) => schedule_retry(ctx, e),
+        ConnectEvent::Failed(e) => {
+            ctx.connect_task = None;
+            *retry_at = schedule_retry(ctx, e);
+        }
     }
 }
 
@@ -406,15 +609,15 @@ async fn probe_appliance(ctx: &mut Ctx) -> Option<Instant> {
 /// 按错误分类决定是否以及何时重试。
 ///
 /// 见模块顶部第 4 条：`ErrorClass::ApplianceUnreachable` 目前没有任何
-/// 生产调用点会传到这里——`attempt()` 只会失败于 Gateway 侧的握手/认证/
-/// 端口注册（`SshTunnelFactory::establish` 根本不拨号一体机），一体机
-/// 不可达在已连接状态下经 `TunnelMsg::ApplianceDialFailed` 单独处理
-/// （见 `handle_msg`），从不经过这个函数。但 `schedule_retry` 是按
-/// `e.class()` 泛化处理的，如果把这个分类默认并进 `Network`，一旦未来
-/// 某个调用点真的传入这个类别，会把"隧道保持、转 degraded、每 30 秒
-/// 探测"错误地处理成"整条隧道拆了重建、指数退避"——这里单独给一条分支，
-/// 用固定的 [`APPLIANCE_PROBE`] 节奏，不套用网络类的指数退避表，也不
-/// 推进 `ctx.backoff` 的计数。
+/// 生产调用点会传到这里——`run_connect_sequence` 只会失败于 Gateway 侧
+/// 的握手/认证/端口注册（`SshTunnelFactory::establish` 根本不拨号一体
+/// 机），一体机不可达在已连接状态下经 `TunnelMsg::ApplianceDialFailed`
+/// 单独处理（见 `handle_msg`），从不经过这个函数。但 `schedule_retry`
+/// 是按 `e.class()` 泛化处理的，如果把这个分类默认并进 `Network`，
+/// 一旦未来某个调用点真的传入这个类别，会把"隧道保持、转 degraded、
+/// 每 30 秒探测"错误地处理成"整条隧道拆了重建、指数退避"——这里单独
+/// 给一条分支，用固定的 [`APPLIANCE_PROBE`] 节奏，不套用网络类的指数
+/// 退避表，也不推进 `ctx.backoff` 的计数。
 fn schedule_retry(ctx: &mut Ctx, e: Error) -> Option<Instant> {
     let class = e.class();
     // 见模块顶部第 3 条：除端口占用外的任何结果都清空端口占用的计时，
@@ -432,7 +635,9 @@ fn schedule_retry(ctx: &mut Ctx, e: Error) -> Option<Instant> {
             None
         }
         ErrorClass::Auth => {
-            // 回到 Idle 让界面提示重新输入，凭据同时清掉——不自动重试。
+            // R65：回到 Idle 让界面提示重新输入，凭据同时清掉（方案
+            // §3.8 要求口令认证之后即清除，认证失败也不例外）——不
+            // 自动重试。
             ctx.creds = None;
             ctx.set_state(State::Idle);
             None
@@ -550,7 +755,6 @@ mod tests {
     //! 定时器，脚本化的假隧道压根不会触发它。
 
     use super::*;
-    use crate::addr::HostPort;
     use crate::backoff::FixedJitter;
     use crate::platform::{NoProxy, NoProxyAuth, NoSystemEvents, SystemEvent, SystemEvents};
     use crate::transport::tls::TlsRoots;
@@ -583,6 +787,9 @@ mod tests {
     struct Scripted {
         outcomes: Mutex<VecDeque<Outcome>>,
         calls: Arc<Mutex<Vec<TunnelParams>>>,
+        /// R68：每次 `establish()` 被调用的时刻，供测试断言"真的经过了
+        /// 这么久的虚拟时间"，不只是"上报的数值对不对"。
+        call_times: Mutex<Vec<Instant>>,
     }
 
     impl Scripted {
@@ -591,8 +798,13 @@ mod tests {
             let me = Arc::new(Self {
                 outcomes: Mutex::new(outcomes.into()),
                 calls: calls.clone(),
+                call_times: Mutex::new(Vec::new()),
             });
             (me, calls)
+        }
+
+        fn call_times(&self) -> Vec<Instant> {
+            self.call_times.lock().unwrap().clone()
         }
     }
 
@@ -622,6 +834,7 @@ mod tests {
             tx: mpsc::Sender<TunnelMsg>,
         ) -> crate::error::Result<Box<dyn TunnelHandle>> {
             self.calls.lock().unwrap().push(params);
+            self.call_times.lock().unwrap().push(Instant::now());
             let outcome = self
                 .outcomes
                 .lock()
@@ -669,6 +882,30 @@ mod tests {
                     pass(preflight::STEP_GATEWAY_DNS),
                     pass(preflight::STEP_GATEWAY_TLS),
                 ],
+            }
+        }
+    }
+
+    /// R66：恒定失败的假预检，用来证明预检失败这条出口真的走的是
+    /// `State::Failed`，不是被误改成 `State::Backoff`——`AlwaysPassPreflight`
+    /// 永远不会让这条出口被执行到。
+    struct FailingPreflight;
+
+    #[async_trait::async_trait]
+    impl Preflight for FailingPreflight {
+        async fn run(
+            &self,
+            _gateway: &HostPort,
+            _appliance: &HostPort,
+        ) -> preflight::PreflightReport {
+            preflight::PreflightReport {
+                steps: vec![preflight::PreflightStep {
+                    name: preflight::STEP_APPLIANCE_TCP,
+                    outcome: preflight::StepOutcome::Fail {
+                        detail: "一体机连接被拒绝".into(),
+                        class: ErrorClass::ApplianceUnreachable,
+                    },
+                }],
             }
         }
     }
@@ -807,6 +1044,14 @@ mod tests {
         .await;
     }
 
+    // R68：不仅报告的 delay 数值要对，重试之间真实经过的虚拟时间也要
+    // 对——否则把 `schedule_retry` 的返回值换成
+    // `Some(tokio::time::Instant::now())`（照样按序上报 1/2/5/10 秒，
+    // 但下一次尝试立刻发生，不真的等）这条测试原来只看 `delays`
+    // 列表，会照样绿。加上 `Scripted::call_times()` 之后，
+    // 用相邻两次 `establish()` 调用之间真实经过的虚拟秒数二次验证同一
+    // 件事，任何"上报了正确数字但没真的等那么久"的实现都会在
+    // `gaps` 断言上落网。
     #[tokio::test(start_paused = true)]
     async fn network_failure_backs_off_along_the_documented_sequence() {
         guard(async {
@@ -821,6 +1066,7 @@ mod tests {
                 ])))
                 .collect();
             let (factory, _calls) = Scripted::new(outcomes);
+            let timing = factory.clone();
             let (tx, mut rx) =
                 Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
             tx.send(start()).await.unwrap();
@@ -834,6 +1080,23 @@ mod tests {
                 })
                 .collect();
             assert_eq!(delays, vec![1, 2, 5, 10]);
+
+            let times = timing.call_times();
+            assert_eq!(
+                times.len(),
+                5,
+                "应有 5 次 establish 调用（4 次失败 + 1 次成功）"
+            );
+            let gaps: Vec<u64> = times
+                .windows(2)
+                .map(|w| w[1].duration_since(w[0]).as_secs())
+                .collect();
+            assert_eq!(
+                gaps,
+                vec![1, 2, 5, 10],
+                "重试之间真实经过的虚拟时间应该等于上报的 delay，而不只是\
+                 上报的数字碰巧对"
+            );
         })
         .await;
     }
@@ -916,6 +1179,69 @@ mod tests {
         .await;
     }
 
+    // R58/R61：`connect_rx`/`msg_rx` 的处理顺序必须是 `connect_rx` 优先
+    // ——见 `run()` 主循环里 `biased` 声明上方的说明。这条 race 只有在
+    // 真正多线程（`flavor = "multi_thread"`）下才会被逼出来，本文件
+    // 其余测试全部用默认的单线程 `current_thread` 运行时，观察不到它
+    // ——单独钉在这里，用真正的多核并行反复跑同一个"建隧道成功 + 隧道
+    // 建成后一体机立刻拨号失败"场景，断言 `degraded` 转移每一次都真的
+    // 发生。
+    //
+    // 会让这条测试变红的实现改法：删掉 `run()` 里 `tokio::select!` 的
+    // `biased;` 声明，或者把 `msg_rx` 分支排到 `connect_rx` 分支前面
+    // ——本地验证过：两种改法叠加后，这条测试在几百次迭代内几乎必现
+    // "从未见过 degraded=true"的 panic（`ApplianceDialFailed` 在
+    // `ctx.state` 还是 `Connecting` 时被处理，guard 没通过，degraded
+    // 转移被悄悄漏掉）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_event_ordering_is_race_free_under_true_parallelism() {
+        for _ in 0..300 {
+            let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
+                TunnelMsg::Authenticated {
+                    host_key_fp: "SHA256:aaa".into(),
+                    first_seen: false,
+                },
+                TunnelMsg::ForwardRegistered { port: 22001 },
+                TunnelMsg::ApplianceDialFailed {
+                    id: 1,
+                    reason: "refused".into(),
+                },
+                TunnelMsg::RemoteSessionOpened { id: 2 },
+            ])]);
+            let (tx, mut rx) =
+                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+
+            // 这条测试不能用 `start_paused`（`multi_thread` 下时间控制
+            // 语义复杂，也没必要——不涉及任何退避/延时），所以这里的
+            // 5 秒预算是真实挂钟时间，跟 `guard`（虚拟时钟）的 300 秒
+            // 预算是两回事：单次迭代应该在毫秒级完成，5 秒对 300 次
+            // 迭代来说仍然是很宽的单次上限。
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut saw_degraded = false;
+            let mut saw_recovered = false;
+            while std::time::Instant::now() < deadline && !saw_recovered {
+                match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                    Ok(Ok(TunnelEvent::State(State::Connected { degraded: true }))) => {
+                        saw_degraded = true;
+                    }
+                    Ok(Ok(TunnelEvent::State(State::Connected { degraded: false })))
+                        if saw_degraded =>
+                    {
+                        saw_recovered = true;
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+            assert!(
+                saw_degraded && saw_recovered,
+                "connect_rx/msg_rx 处理顺序出现竞态：degraded={saw_degraded}，\
+                 recovered={saw_recovered}"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn degraded_probe_recovers_when_the_appliance_comes_back() {
         guard(async {
@@ -968,6 +1294,24 @@ mod tests {
         .await;
     }
 
+    // R63：重写。旧版有两层问题：
+    // 1. `match ... { Ok(Ok(TunnelEvent::State(s))) => {...}, _ => break }`
+    //    把"收到一条非 State 事件"（例如 `Preflight`/`RemoteSessions`）
+    //    也当成"结束观察，退出循环"——一次探测周期里只要混进一条不相干
+    //    的事件就会提前收工，根本没验证到后面的周期。
+    // 2. `probe_appliance` 打的是真实 TCP（`Transport::probe_tcp`），
+    //    探测失败时（`Err` 分支）完全不广播任何事件——120 秒窗口内一次
+    //    "探测失败也清 degraded"的变异如果发生在某次探测的 `Ok` 分支
+    //    上才会被看见，如果窗口内探测本身没有再失败/成功产生新事件，
+    //    这条测试会在第一次 35 秒超时后就 `break`，什么都没验证到就
+    //    "通过"了。评审实测过：这个变异并行跑 6/6 全绿、单独跑 3/4 红，
+    //    典型的检测力不稳。
+    //
+    // 改法：不再用"等事件或超时"的消极观察，而是主动推进虚拟时钟越过
+    // 三个完整的探测周期（`APPLIANCE_PROBE` = 30 秒 一个周期），每个
+    // 周期结束后用 `try_recv()` 排空这段时间里产生的所有事件——任何一条
+    // `State` 事件都必须仍是 `degraded: true`，非 `State` 事件直接忽略
+    // 而不是当成"观察结束"的信号。
     #[tokio::test(start_paused = true)]
     async fn degraded_stays_degraded_while_the_appliance_is_still_down() {
         guard(async {
@@ -982,10 +1326,14 @@ mod tests {
                     reason: "refused".into(),
                 },
             ])]);
-            // 端口 1 上没人监听，探测一直失败。同样走
-            // spawn_with_validated_start——见上一条测试的说明。
+            // 绑一个端口立刻释放：这个地址在探测时必然被拒绝（比裸写
+            // 127.0.0.1:1 更明确地表达"这个端口现在没有人监听"）。
+            let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dead_port = dead.local_addr().unwrap().port();
+            drop(dead);
+
             let gateway: HostPort = "gateway.company.com:443".parse().unwrap();
-            let appliance: HostPort = "127.0.0.1:1".parse().unwrap();
+            let appliance: HostPort = format!("127.0.0.1:{dead_port}").parse().unwrap();
             let (_tx, mut rx) = Supervisor::spawn_with_validated_start(
                 config(),
                 deps(factory, Arc::new(NoSystemEvents::default())),
@@ -998,17 +1346,16 @@ mod tests {
                 matches!(s, State::Connected { degraded: true })
             })
             .await;
-            // 连续几个探测周期内都不应转回，也不应断开隧道。
-            let deadline = Instant::now() + Duration::from_secs(120);
-            while Instant::now() < deadline {
-                match tokio::time::timeout(Duration::from_secs(35), rx.recv()).await {
-                    Ok(Ok(TunnelEvent::State(s))) => {
+
+            for cycle in 0..3 {
+                tokio::time::sleep(APPLIANCE_PROBE + Duration::from_secs(2)).await;
+                while let Ok(ev) = rx.try_recv() {
+                    if let TunnelEvent::State(s) = ev {
                         assert!(
                             matches!(s, State::Connected { degraded: true }),
-                            "一体机仍不可达时状态不该变成 {s:?}"
+                            "第 {cycle} 个探测周期内状态不该变成 {s:?}"
                         );
                     }
-                    _ => break,
                 }
             }
         })
@@ -1178,8 +1525,8 @@ mod tests {
     /// 一旦被调用就 panic 的工厂——跟 Task 9 那条 Pass 测试证明"预检
     // 失败时 establish 一次都不会被调用"用的是同一个手法：如果
     /// `Command::Start` 的处理跳过了 `ValidatedAddresses::validate`、
-    /// 直接拿裸 `HostPort` 拼 `Credentials` 去 `attempt()`，这个工厂会
-    /// 被调用到，测试当场 panic（红）。
+    /// 直接拿裸 `HostPort` 拼 `Credentials` 去建连，这个工厂会被调用
+    /// 到，测试当场 panic（红）。
     struct PanicsIfEstablishIsCalled;
 
     #[async_trait::async_trait]
@@ -1196,9 +1543,8 @@ mod tests {
     // 会让这条测试变红的实现改法：把 `Command::Start` 处理里的
     // `ValidatedAddresses::validate(gateway, appliance)` 删掉，直接用
     // 命令携带的裸 `gateway`/`appliance` 构造 `Credentials`——那样
-    // `run_preflight` 会照常通过（`AlwaysPassPreflight` 不检查地址），
-    // `attempt()` 会调用 `PanicsIfEstablishIsCalled::establish`，测试
-    // panic。
+    // 预检会照常通过（`AlwaysPassPreflight` 不检查地址），后台连接任务
+    // 会调用 `PanicsIfEstablishIsCalled::establish`，测试 panic。
     #[tokio::test(start_paused = true)]
     async fn start_rejects_appliance_equal_to_gateway_before_touching_the_factory() {
         guard(async {
@@ -1265,6 +1611,73 @@ mod tests {
         .await;
     }
 
+    // R62：地址校验失败必须清空凭据——不然改错地址之后点 RetryNow
+    // （Failed 状态下允许）会拿旧地址旧口令重新连接。这里直接钉住
+    // "校验失败之后凭据确实是 None"这件事本身，不通过端到端的
+    // RetryNow 行为间接验证（间接验证还得再造一个不会 panic 的工厂，
+    // 且没有直接指向"到底是不是 creds 的问题"）。
+    //
+    // 会让这条测试变红的实现改法：删掉 `Command::Start` 校验失败分支里
+    // 新加的 `ctx.creds = None;`。
+    #[tokio::test(start_paused = true)]
+    async fn start_validation_failure_clears_stale_credentials() {
+        guard(async {
+            // 第一版这条测试有缺陷：只发过一次会校验失败的 `Start`，
+            // `ctx.creds` 从一开始就是 `None`（唯一会把它设成 `Some`
+            // 的分支是校验*通过*那条路），不管 R62 的
+            // `ctx.creds = None;` 那一行在不在，这条测试都会通过——
+            // 根本没有"陈旧凭据"可清。改正：先用一组合法地址真的把
+            // `ctx.creds` 填上（借道一次会被判 Fatal 的握手失败，
+            // Fatal 分支本来就不清凭据，为的是让 RetryNow 能用原地址
+            // 重试——这不是 bug，是 R62 之外的另一条既有行为），状态
+            // 停在 `Failed` 但凭据仍是"第一次"那一份；再发一条地址
+            // 非法的 `Start`（校验失败），断言这一步把那份"陈旧"的
+            // 凭据也清掉了——不然随后的 `RetryNow` 会悄悄拿着已经被
+            // 界面否决的旧地址重新建连。
+            let (factory, calls) = Scripted::new(vec![Outcome::Err(Error::HostKeyMismatch {
+                expected: "SHA256:aaa".into(),
+                actual: "SHA256:bbb".into(),
+            })]);
+            let (tx, mut rx) =
+                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Failed { .. })).await;
+            assert_eq!(calls.lock().unwrap().len(), 1);
+
+            // 换一组非法地址（一体机等于 Gateway）——校验会失败，
+            // `ctx.state` 停在 Failed 允许再发 Start，这条命令能被
+            // 处理到。
+            let gw: HostPort = "gateway.company.com:443".parse().unwrap();
+            tx.send(Command::Start {
+                username: "tunnel-zhang".into(),
+                password: Zeroizing::new("pw".into()),
+                gateway: gw.clone(),
+                appliance: gw,
+            })
+            .await
+            .unwrap();
+            // 校验失败不产生新的 establish 调用，也不经过 Preflight/
+            // Connecting，直接停在（新的）Failed。
+            states_until(&mut rx, |s| matches!(s, State::Failed { .. })).await;
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                1,
+                "校验失败不该触发任何建连尝试"
+            );
+
+            tx.send(Command::RetryNow).await.unwrap();
+            // 给状态机一点虚拟时间处理这条命令。
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                1,
+                "地址校验失败之后 RetryNow 不该拿第一次的陈旧凭据去重新建连"
+            );
+        })
+        .await;
+    }
+
     // --- 第三条：port_busy_since 必须在非 PortBusy 错误时清零 ---
 
     fn test_ctx() -> Ctx {
@@ -1287,6 +1700,7 @@ mod tests {
                 .unwrap(),
             }),
             handle: None,
+            connect_task: None,
             sessions: BTreeMap::new(),
             backoff: Backoff::new(Box::new(FixedJitter(1.0))),
             port_busy_attempt: 0,
@@ -1386,6 +1800,448 @@ mod tests {
                     other => panic!("{other:?}"),
                 }
             }
+        })
+        .await;
+    }
+
+    // --- R65：认证失败必须清空凭据 ---
+    //
+    // 方案 §3.8 要求口令认证之后即清除；认证失败同样不该继续攥着这份
+    // 口令。之前只有端到端的
+    // `auth_failure_returns_to_idle_and_does_not_retry` 覆盖这条路径，
+    // 但它只断言"不自动重试"，不重试的真正原因是 `schedule_retry` 的
+    // `Auth` 分支返回 `None`（压根不安排下一次尝试），跟 `ctx.creds`
+    // 是否被清空无关——就算 `ctx.creds = None;` 这一行被删掉，那条端到
+    // 端测试也照样绿。这里直接检查字段本身。
+    //
+    // 会让这条测试变红的实现改法：删掉 `schedule_retry` 的 `Auth`
+    // 分支里 `ctx.creds = None;` 这一行。
+    #[tokio::test(start_paused = true)]
+    async fn auth_rejected_clears_credentials_so_a_stale_password_cannot_be_reused() {
+        guard(async {
+            let mut ctx = test_ctx();
+            assert!(ctx.creds.is_some());
+            let _ = schedule_retry(&mut ctx, Error::AuthRejected);
+            assert!(
+                ctx.creds.is_none(),
+                "认证失败后必须清空凭据，方案 §3.8 要求口令认证后即清除"
+            );
+        })
+        .await;
+    }
+
+    // --- R66：预检失败必须直接进 Failed，不是 Backoff ---
+    //
+    // `AlwaysPassPreflight` 恒定 Pass，这条出口在其余所有测试里一次都
+    // 没被走到过——如果 `run_connect_sequence`/`handle_connect_event`
+    // 把 `ConnectEvent::PreflightFailed` 的处理错误地改成走
+    // `schedule_retry`（安排一次 Backoff 重试），没有任何现有测试会
+    // 变红。
+    //
+    // 会让这条测试变红的实现改法：把 `handle_connect_event` 里
+    // `ConnectEvent::PreflightFailed { class, message } => { ...
+    // ctx.set_state(State::Failed { class, message }); }` 改成调用
+    // `schedule_retry(ctx, ...)` 或者直接 `ctx.set_state(State::Backoff
+    // { .. })`。
+    #[tokio::test(start_paused = true)]
+    async fn preflight_failure_goes_straight_to_failed_not_backoff() {
+        guard(async {
+            let mut d = deps(
+                Arc::new(PanicsIfEstablishIsCalled),
+                Arc::new(NoSystemEvents::default()),
+            );
+            d.preflight = Arc::new(FailingPreflight);
+            let (tx, mut rx) = Supervisor::spawn(config(), d);
+            tx.send(start()).await.unwrap();
+
+            let seen = states_until(&mut rx, |s| {
+                matches!(s, State::Failed { .. } | State::Backoff { .. })
+            })
+            .await;
+            match seen.last().unwrap() {
+                State::Failed { class, .. } => assert_eq!(*class, ErrorClass::ApplianceUnreachable),
+                other => panic!("预检失败应该直接进 Failed，不是 {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    // --- R67：ConnectedSince / HostKey 事件确实会被广播 ---
+    //
+    // 生产代码里这两处 `ctx.ev.send(...)` 调用此前没有任何测试直接
+    // 断言过——之前的测试都只订阅 `TunnelEvent::State`，`HostKey`/
+    // `ConnectedSince` 两种事件即使被送出，也从来没人检查过内容或者
+    // "有没有被送出"这件事本身。
+    //
+    // 会让这条测试变红的实现改法：删掉 `handle_connect_event` 里
+    // `Established` 分支的 `ctx.ev.send(TunnelEvent::ConnectedSince(...))`
+    // 那一行，或者删掉 `handle_msg` 里 `Authenticated` 分支的
+    // `ctx.ev.send(TunnelEvent::HostKey { .. })` 那一行。
+    #[tokio::test(start_paused = true)]
+    async fn established_session_reports_connected_since_and_host_key_events() {
+        guard(async {
+            let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
+                TunnelMsg::Authenticated {
+                    host_key_fp: "SHA256:aaa".into(),
+                    first_seen: true,
+                },
+                TunnelMsg::ForwardRegistered { port: 22001 },
+            ])]);
+            let (tx, mut rx) =
+                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+
+            let mut saw_host_key = false;
+            let mut saw_connected_since = false;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline && !(saw_host_key && saw_connected_since) {
+                match rx.recv().await {
+                    Ok(TunnelEvent::HostKey {
+                        fingerprint,
+                        first_seen,
+                    }) => {
+                        assert_eq!(fingerprint, "SHA256:aaa");
+                        assert!(first_seen);
+                        saw_host_key = true;
+                    }
+                    Ok(TunnelEvent::ConnectedSince(_)) => saw_connected_since = true,
+                    Ok(_) => {}
+                    Err(e) => panic!("事件通道异常：{e}"),
+                }
+            }
+            assert!(
+                saw_host_key,
+                "Authenticated 消息应该转成 HostKey 事件广播出去"
+            );
+            assert!(saw_connected_since, "连接成功应该广播 ConnectedSince");
+        })
+        .await;
+    }
+
+    // --- R64：Stop 必须真的关掉 SSH 会话，不能只是"忘掉"它 ---
+    //
+    // `teardown()` 目前确实调用了 `h.shutdown().await`，但在这条测试
+    // 之前没有任何测试验证过这一点——把 `teardown()` 改成只
+    // `self.handle.take()`、不调用 `.shutdown()`，之前的 19 条测试会
+    // 继续全绿（它们都只观察状态变迁，不关心 `TunnelHandle` 有没有被
+    // 真的关掉）。不真的关掉会话，Gateway 侧的反向端口监听不会被回收，
+    // 正是方案 §3.6"端口占用"那条故障的成因。
+    //
+    // 会让这条测试变红的实现改法：把 `Ctx::teardown` 里
+    // `h.shutdown().await;` 删掉，只留 `self.handle.take();`。
+    #[tokio::test(start_paused = true)]
+    async fn stop_actually_shuts_down_the_ssh_session_not_just_forgets_it() {
+        guard(async {
+            struct TrackedHandle(Arc<std::sync::atomic::AtomicBool>);
+            #[async_trait::async_trait]
+            impl TunnelHandle for TrackedHandle {
+                async fn close_remote_session(
+                    &self,
+                    _id: u64,
+                ) -> std::result::Result<(), crate::tunnel::UnknownSessionId> {
+                    Ok(())
+                }
+                async fn shutdown(self: Box<Self>) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            struct TracksShutdown(Arc<std::sync::atomic::AtomicBool>);
+            #[async_trait::async_trait]
+            impl TunnelFactory for TracksShutdown {
+                async fn establish(
+                    &self,
+                    _params: TunnelParams,
+                    tx: mpsc::Sender<TunnelMsg>,
+                ) -> crate::error::Result<Box<dyn TunnelHandle>> {
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(TunnelMsg::Authenticated {
+                                host_key_fp: "SHA256:aaa".into(),
+                                first_seen: false,
+                            })
+                            .await;
+                        let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
+                    });
+                    Ok(Box::new(TrackedHandle(self.0.clone())))
+                }
+            }
+
+            let shutdown_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let factory = Arc::new(TracksShutdown(shutdown_called.clone()));
+            let (tx, mut rx) =
+                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Connected { .. })).await;
+            assert!(
+                !shutdown_called.load(std::sync::atomic::Ordering::SeqCst),
+                "隧道还没停止就已经 shutdown"
+            );
+
+            tx.send(Command::Stop).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Idle)).await;
+            assert!(
+                shutdown_called.load(std::sync::atomic::Ordering::SeqCst),
+                "Stop 之后必须真的关掉 SSH 会话，不能只是 take() 忘掉它——\
+                 否则 Gateway 侧会留下僵尸监听"
+            );
+        })
+        .await;
+    }
+
+    // --- R61：迟到的 Disconnected 不能污染一次更新的尝试 ---
+    //
+    // 场景：Stop 之后，旧隧道的 watcher（真实实现里是
+    // `ssh::spawn_disconnect_watcher`，200ms 轮询一次）还没来得及发现
+    // 会话已经关闭；用户几乎立刻又发起一次新的 Start，新隧道建立成功；
+    // 这时旧 watcher 才终于发现旧会话已经死了，往它手里那份旧的
+    // `msg_tx` 送一条 `Disconnected`。这条消息不该有机会拆掉刚建好的
+    // 新隧道。
+    //
+    // 直接验证机制本身：`spawn_connect` 每次都建一对全新的
+    // `msg_tx`/`msg_rx`，所以"旧" `tx` 对应的接收端在 Stop 之后、新的
+    // `Start` 触发 `spawn_connect` 时就已经被换掉、丢弃——旧 `tx` 再
+    // `.send()` 必然返回 `Err`（对应的接收端不存在了），这条消息物理
+    // 上不可能被新会话的主循环看到，不需要会话代号/世代号这类额外
+    // 状态去分辨"这条消息是不是当前这一次尝试的"。
+    //
+    // 会让这条测试变红的实现改法：把 `spawn_connect` 改成复用调用方
+    // 传入的旧 `msg_tx`/`msg_rx`（而不是每次新建一对）——那样
+    // `stale_tx.send(...)` 会成功投递到新会话正在用的同一个
+    // `msg_rx`，`handle_msg` 的 `Disconnected` 分支会把刚建好的新隧道
+    // 也拆掉。
+    #[tokio::test(start_paused = true)]
+    async fn stale_disconnected_from_a_torn_down_session_cannot_affect_a_newer_one() {
+        guard(async {
+            // 工厂只返回句柄，把 establish() 收到的 tx 存起来，供测试
+            // 稍后手动模拟"迟到的 Disconnected"。
+            struct CapturesTx(Mutex<Vec<mpsc::Sender<TunnelMsg>>>);
+            #[async_trait::async_trait]
+            impl TunnelFactory for CapturesTx {
+                async fn establish(
+                    &self,
+                    _params: TunnelParams,
+                    tx: mpsc::Sender<TunnelMsg>,
+                ) -> crate::error::Result<Box<dyn TunnelHandle>> {
+                    self.0.lock().unwrap().push(tx.clone());
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(TunnelMsg::Authenticated {
+                                host_key_fp: "SHA256:aaa".into(),
+                                first_seen: false,
+                            })
+                            .await;
+                        let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
+                    });
+                    Ok(Box::new(FakeHandle))
+                }
+            }
+
+            let captured = Arc::new(CapturesTx(Mutex::new(Vec::new())));
+            let (tx, mut rx) = Supervisor::spawn(
+                config(),
+                deps(captured.clone(), Arc::new(NoSystemEvents::default())),
+            );
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Connected { .. })).await;
+
+            // 拿到第一条隧道用过的 tx——模拟它的 watcher 稍后才发现断线。
+            let stale_tx = captured.0.lock().unwrap()[0].clone();
+
+            tx.send(Command::Stop).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Idle)).await;
+
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Connected { .. })).await;
+
+            // 迟到的 Disconnected：这条 send 必须失败——旧隧道的接收端
+            // 已经在新一次 Start 触发的 spawn_connect 里被换掉、丢弃。
+            let send_result = stale_tx
+                .send(TunnelMsg::Disconnected {
+                    reason: "迟到的断线".into(),
+                })
+                .await;
+            assert!(
+                send_result.is_err(),
+                "旧隧道的 msg_tx 应该已经失效（接收端已被换成新隧道的）"
+            );
+
+            // 双重保险：就算侥幸没失败，也确认新隧道没有被牵连——排空
+            // 一段虚拟时间内的所有事件，不该出现 Backoff/Idle。
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            while let Ok(TunnelEvent::State(s)) = rx.try_recv() {
+                assert!(
+                    !matches!(s, State::Backoff { .. } | State::Idle),
+                    "迟到的 Disconnected 不该影响新隧道：{s:?}"
+                );
+            }
+        })
+        .await;
+    }
+
+    // --- R60：Cancel/RetryNow/DisconnectRemoteSession 各自的专属测试 ---
+
+    /// 见 R58：Preflight 现在跑在可以被 abort 的后台任务里，`Cancel`
+    /// 应该几乎立刻生效，不用等预检跑完。用一个故意卡 60 秒的假预检
+    /// 证明这一点——旧实现会让这条测试的 `elapsed` 断言失败（需要等满
+    /// 60 秒），新实现应该在几毫秒内看到 `Idle`。
+    ///
+    /// 会让这条测试变红的实现改法：回到"预检 + 建隧道整段内联 `.await`
+    /// 在处理 `Command::Start` 的分支里"的旧写法——`Cancel` 会被排在
+    /// `cmd_rx.recv()` 的下一次调用上，只有等 60 秒的假预检跑完才能被
+    /// 看到。
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_preflight_takes_effect_immediately_not_after_the_whole_sequence() {
+        guard(async {
+            // `reached_end` 用来区分"真的被 abort 掉"和"只是被主循环
+            // 忘掉、后台任务其实还在裸跑"——如果只是 `Ctx::teardown`
+            // 把 `JoinHandle` 丢掉但不调用 `.abort()`，主循环一样能立刻
+            // 转回 `Idle`（它不等待这个任务完成），下面前两条断言会
+            // 照样通过，测不出区别；只有真的把这段 60 秒 sleep 之后的
+            // 代码跑到、把 `reached_end` 置位，才说明任务没有被真正
+            // 取消。
+            let reached_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            struct SlowPreflight(Arc<std::sync::atomic::AtomicBool>);
+            #[async_trait::async_trait]
+            impl Preflight for SlowPreflight {
+                async fn run(
+                    &self,
+                    _gateway: &HostPort,
+                    _appliance: &HostPort,
+                ) -> preflight::PreflightReport {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                    preflight::PreflightReport { steps: vec![] }
+                }
+            }
+            let mut d = deps(
+                Arc::new(PanicsIfEstablishIsCalled),
+                Arc::new(NoSystemEvents::default()),
+            );
+            d.preflight = Arc::new(SlowPreflight(reached_end.clone()));
+            let (tx, mut rx) = Supervisor::spawn(config(), d);
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Preflight)).await;
+
+            let t0 = Instant::now();
+            tx.send(Command::Cancel).await.unwrap();
+            let seen = states_until(&mut rx, |s| matches!(s, State::Idle)).await;
+            let elapsed = Instant::now().duration_since(t0);
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "Cancel 应该几乎立刻生效，不该等预检跑完（60 秒），实际 {elapsed:?}"
+            );
+            assert!(
+                !seen
+                    .iter()
+                    .any(|s| matches!(s, State::Connecting | State::Connected { .. })),
+                "取消预检不该走到建连：{seen:?}"
+            );
+
+            // 再放虚拟时钟走 65 秒——如果后台任务只是被"忘掉"而不是真的
+            // `abort()`，这段 sleep 会在这段时间内跑完，`reached_end`
+            // 会被置位。
+            tokio::time::sleep(Duration::from_secs(65)).await;
+            assert!(
+                !reached_end.load(std::sync::atomic::Ordering::SeqCst),
+                "Cancel 必须真的 abort 掉后台的预检任务，不能只是让主循环\
+                 不再等它——否则一个取消了的预检仍会在后台裸跑到底"
+            );
+        })
+        .await;
+    }
+
+    // 会让这条测试变红的实现改法：`Command::RetryNow` 处理里不清
+    // `retry_at`、继续沿用旧的 `sleep_until` 定时器（那样即使发起了新
+    // 的连接尝试，旧定时器到期时还会再发一次多余的尝试）；或者
+    // `RetryNow` 压根不发起新的连接尝试，只是被动等旧定时器到期。
+    #[tokio::test(start_paused = true)]
+    async fn retry_now_skips_the_remaining_backoff_wait() {
+        guard(async {
+            let outcomes = vec![
+                Outcome::Err(Error::Tcp("refused".into())),
+                Outcome::Ok(vec![
+                    TunnelMsg::Authenticated {
+                        host_key_fp: "SHA256:aaa".into(),
+                        first_seen: false,
+                    },
+                    TunnelMsg::ForwardRegistered { port: 22001 },
+                ]),
+            ];
+            let (factory, calls) = Scripted::new(outcomes);
+            let (tx, mut rx) =
+                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Backoff { .. })).await;
+            assert_eq!(calls.lock().unwrap().len(), 1);
+
+            let t0 = Instant::now();
+            tx.send(Command::RetryNow).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Connected { .. })).await;
+            let elapsed = Instant::now().duration_since(t0);
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "RetryNow 应该立刻重试，不用等满 1 秒的退避，实际 {elapsed:?}"
+            );
+            assert_eq!(calls.lock().unwrap().len(), 2);
+        })
+        .await;
+    }
+
+    // 会让这条测试变红的实现改法：`Command::DisconnectRemoteSession`
+    // 处理里不调用 `ctx.handle.close_remote_session(id)`，或者把 `id`
+    // 传错。
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_remote_session_calls_close_remote_session_on_the_handle() {
+        guard(async {
+            struct TrackingHandle(mpsc::Sender<u64>);
+            #[async_trait::async_trait]
+            impl TunnelHandle for TrackingHandle {
+                async fn close_remote_session(
+                    &self,
+                    id: u64,
+                ) -> std::result::Result<(), crate::tunnel::UnknownSessionId> {
+                    let _ = self.0.send(id).await;
+                    Ok(())
+                }
+                async fn shutdown(self: Box<Self>) {}
+            }
+            struct ReturnsTrackingHandle(mpsc::Sender<u64>);
+            #[async_trait::async_trait]
+            impl TunnelFactory for ReturnsTrackingHandle {
+                async fn establish(
+                    &self,
+                    _params: TunnelParams,
+                    tx: mpsc::Sender<TunnelMsg>,
+                ) -> crate::error::Result<Box<dyn TunnelHandle>> {
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(TunnelMsg::Authenticated {
+                                host_key_fp: "SHA256:aaa".into(),
+                                first_seen: false,
+                            })
+                            .await;
+                        let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
+                    });
+                    Ok(Box::new(TrackingHandle(self.0.clone())))
+                }
+            }
+
+            let (closed_tx, mut closed_rx) = mpsc::channel(4);
+            let factory = Arc::new(ReturnsTrackingHandle(closed_tx));
+            let (tx, mut rx) =
+                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Connected { .. })).await;
+
+            tx.send(Command::DisconnectRemoteSession { id: 42 })
+                .await
+                .unwrap();
+            let closed = closed_rx
+                .recv()
+                .await
+                .expect("应该调用了 close_remote_session");
+            assert_eq!(closed, 42);
         })
         .await;
     }
