@@ -90,6 +90,64 @@ jobs:
           cd gateway/test-env
           docker compose up -d --build
 
+      # R96（最终复审发现，低）：`docker compose up -d` 只保证容器被
+      # 创建并启动，不保证里面的 haproxy/sshd 已经开始监听；紧接着的
+      # 17 条测试会立刻去连 8443/2322。这一步原来不存在，靠的是下面
+      # 容器里那句 `apt-get install openssh-client` 偶然多花的十几秒
+      # 兜住——镜像层缓存命中、或者 runner 磁盘快一点，这个偶然就没了。
+      # 一个刚建起来、偶发变红的 integration job，最危险的地方是下一个
+      # 人会直接去把它关掉，而不是来查为什么。
+      #
+      # 探测必须是"真的说上话"，不能只是 TCP 连得上：docker 的 userland
+      # proxy 在容器创建那一刻就把宿主的 8443/2322 绑好了，容器里的
+      # haproxy/sshd 还没起来时它照样 accept 再立刻关掉，一个裸的 TCP
+      # connect 于是永远成功，等于没等。（同一件事 docker-compose.yml
+      # 里对 22001 的注释已经写过：“宿主能连上 22001 证明不了绑定
+      # 地址”。）所以 Gateway 这一侧做一次真实 TLS 握手——拿到证书才算
+      # haproxy 起来了；一体机这一侧读 SSH 版本横幅的前四个字节——
+      # 收到 "SSH-" 才算 sshd 起来了。
+      #
+      # 22001 不在这里等：那是隧道在线时才会有人听的反向端口，由测试
+      # 自己建立，不是环境该先准备好的东西。
+      #
+      # 等待上限 120 秒，到点 `exit 1` 让这一步失败——不是打印一句警告
+      # 然后继续：那样只会把"环境没起来"伪装成"测试自己连不上"，排查
+      # 的人要从 17 条测试的失败信息倒推回 docker。
+      #
+      # 说明一律写成 YAML 注释放在 `run:` **外面**，跟这份文件其它步骤
+      # 的写法一致，不写进脚本体内——`ci_workflow.rs` 是按 `run` 的字符
+      # 串内容做断言的，把 "exit 1" 这类关键词写进脚本里的注释，会让
+      # 「超时真的会失败」这条断言被一句注释满足。这不是假想：这一步
+      # 第一版就把上面那段说明写在 `run:` 里，实测把代码里的 `exit 1`
+      # 换成 `echo` 之后 `ci_workflow.rs` 照样全绿。`run_code()` 现在会
+      # 剥掉注释行兜住这一类，但源头上别把关键词写进脚本注释更省事。
+      - name: 等待测试环境就绪
+        run: |
+          probe_gateway_tls() {
+            timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername gateway.test \
+              </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE"
+          }
+          probe_appliance_ssh() {
+            timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2322; head -c 4 <&3' 2>/dev/null \
+              | grep -q "^SSH-"
+          }
+          wait_for() {
+            what="$1"; probe="$2"
+            deadline=$((SECONDS + 120))
+            until "$probe"; do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "等待 $what 超过 120 秒仍未就绪，判定测试环境没起来" >&2
+                docker compose -f gateway/test-env/docker-compose.yml ps
+                docker compose -f gateway/test-env/docker-compose.yml logs --no-color
+                exit 1
+              fi
+              sleep 2
+            done
+            echo "$what 已就绪"
+          }
+          wait_for "Gateway TLS 前端 127.0.0.1:8443" probe_gateway_tls
+          wait_for "一体机 sshd 127.0.0.1:2322" probe_appliance_ssh
+
       - name: 生成 harness 证书
         run: ./crates/rmc-core/tests/fetch-harness-cert.sh
 

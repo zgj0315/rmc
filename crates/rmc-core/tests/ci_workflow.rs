@@ -111,6 +111,31 @@ fn run_text(step: &Yaml) -> &str {
     step["run"].as_str().unwrap_or("")
 }
 
+/// `run_text` 去掉整行的 shell 注释之后的**代码**部分。
+///
+/// R96 实测踩到的坑：`等待测试环境就绪` 这一步第一版把"到点 exit 1 让
+/// 这一步失败"这句说明写在 `run:` 脚本体内的 `#` 注释里，而
+/// `readiness_gate_really_waits_for_the_services_and_fails_on_timeout`
+/// 断言的是 `run.contains("exit 1")`——于是把代码里真正的 `exit 1` 换成
+/// `echo '继续往下跑'` 之后，这条断言被那句注释满足，测试照样全绿。
+/// 一条"守住超时会让 CI 失败"的断言，被自己要守的那段文字喂饱了。
+///
+/// 这份文件里别的步骤没有这个问题：它们的说明是写在 `run:` **外面**的
+/// YAML 注释，压根不进 `run` 字符串（已逐条核对）。但这条防线不该依赖
+/// "后人也记得把注释写在外面"，所以凡是断言"脚本里真的有某个东西"的
+/// 地方一律走这个函数。
+///
+/// 只剥整行注释（`^\s*#`），不碰行尾注释——行尾注释在这份工作流里不
+/// 存在，而要正确处理它就得分辨 `#` 是不是在引号里，那是一个真正的
+/// 词法分析问题，不值得为了一个不存在的形状引进来。
+fn run_code(step: &Yaml) -> String {
+    run_text(step)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn uses_text(step: &Yaml) -> Option<&str> {
     step["uses"].as_str()
 }
@@ -184,6 +209,7 @@ const STEP_FMT: &str = "格式检查";
 const STEP_CLIPPY: &str = "clippy";
 const STEP_UNIT_TESTS: &str = "单元与假隧道测试";
 const STEP_COMPOSE_UP: &str = "拉起测试环境";
+const STEP_WAIT_READY: &str = "等待测试环境就绪";
 const STEP_HARNESS_CERT: &str = "生成 harness 证书";
 const STEP_IGNORED_TESTS: &str = "运行 --ignored 集成测试";
 const STEP_LOG_EXPORT: &str = "失败时导出容器日志";
@@ -388,21 +414,92 @@ fn compose_up_step_always_rebuilds_the_images() {
     );
 }
 
-// 三步顺序必须是：拉起环境 → 生成证书 → 跑 --ignored 测试。
+// 四步顺序必须是：拉起环境 → 等就绪 → 生成证书 → 跑 --ignored 测试。
 //
 // 会让这条测试变红的实现改法：把"生成 harness 证书"挪到"拉起测试
 // 环境"前面（容器还没起，`docker compose exec` 会对着不存在的服务
 // 报错），或者把"运行 --ignored 集成测试"挪到"生成 harness 证书"
-// 前面（读不到证书文件，两条需要真实 TLS 的用例会连不上/验不过）。
+// 前面（读不到证书文件，两条需要真实 TLS 的用例会连不上/验不过），
+// 或者把"等待测试环境就绪"挪到"拉起测试环境"前面 / "运行 --ignored
+// 集成测试"后面（等的时机不对，等于没等）。
 #[test]
 fn integration_steps_run_in_the_documented_order() {
     let doc = load_workflow();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let compose_up = step_index_by_name(steps, STEP_COMPOSE_UP);
+    let ready = step_index_by_name(steps, STEP_WAIT_READY);
     let cert = step_index_by_name(steps, STEP_HARNESS_CERT);
     let ignored = step_index_by_name(steps, STEP_IGNORED_TESTS);
-    assert!(compose_up < cert, "拉起测试环境必须排在生成证书之前");
+    assert!(compose_up < ready, "等待就绪必须排在拉起测试环境之后");
+    assert!(ready < cert, "等待就绪必须排在生成证书之前");
     assert!(cert < ignored, "生成证书必须排在运行 --ignored 测试之前");
+}
+
+// R96（最终复审发现，低）：`docker compose up -d` 只保证容器被创建并
+// 启动，不保证里面的 haproxy/sshd 已经在监听——随后 17 条测试立刻就去
+// 连 8443/2322。这一步原来根本不存在，靠的是容器里那句 `apt-get
+// install openssh-client` 偶然多花的十几秒兜住；一个刚建起来、偶发变红
+// 的 integration job，最危险的地方是下一个人会直接去把它关掉。
+//
+// 三件事各自钉住：
+//
+// 1. 等的是 8443（Gateway 的 TLS 前端，17 条里 15 条第一步要连的端口）
+//    与 2322（一体机 sshd）。
+// 2. 等法是"真的说上话"，不是裸 TCP connect——docker 的 userland proxy
+//    在容器创建那一刻就把宿主端口绑好了，容器里的服务还没起来时它照样
+//    accept 再立刻关掉，裸连接永远成功、等于没等（docker-compose.yml
+//    里对 22001 的注释写的是同一件事）。所以必须看到真实 TLS 握手
+//    （`openssl s_client`）与 SSH 版本横幅（`SSH-`）。
+// 3. 等待有上限，且超时要让这一步**失败**（`exit 1`），不是打印一句
+//    警告继续往下走——那样只会把"环境没起来"伪装成"测试自己连不上"。
+//
+// 三条断言全部走 `run_code`（剥掉脚本里的整行注释）而不是 `run_text`
+// ——理由见 `run_code` 上的说明：这条测试的第一版栽在这里，把代码里的
+// `exit 1` 换成 `echo` 之后，断言被脚本注释里那句"到点 exit 1 让这一步
+// 失败"喂饱了，测试照样全绿。
+//
+// 会让这条测试变红的实现改法（四个探针，逐一实测过）：删掉这一步；把
+// 探测换成裸的 `/dev/tcp/127.0.0.1/8443` 连通性判断（拿掉
+// `openssl s_client`）；把超时分支的 `exit 1` 换成 `echo` 之后继续；
+// 或者把 `until` 循环换成一句无上限的死等。
+#[test]
+fn readiness_gate_really_waits_for_the_services_and_fails_on_timeout() {
+    let doc = load_workflow();
+    let steps = steps(job(&doc, INTEGRATION_JOB));
+    let step = step_by_name(steps, STEP_WAIT_READY);
+    let run = run_code(step);
+
+    for port in ["8443", "2322"] {
+        assert!(
+            run.contains(port),
+            "就绪探测必须覆盖端口 {port}，实际 {run:?}"
+        );
+    }
+    assert!(
+        run.contains("openssl s_client"),
+        "Gateway 侧必须做真实 TLS 握手，裸 TCP connect 会被 docker 的 \
+         userland proxy 永远放行、等于没等，实际 {run:?}"
+    );
+    assert!(
+        run.contains("SSH-"),
+        "一体机侧必须读到 SSH 版本横幅才算就绪，实际 {run:?}"
+    );
+    assert!(
+        run.contains("until "),
+        "必须是轮询等待，不是一次性探测，实际 {run:?}"
+    );
+    assert!(
+        run.contains("exit 1"),
+        "等待超时必须让这一步失败，不能打印警告继续，实际 {run:?}"
+    );
+    assert!(
+        !run.contains("|| true"),
+        "这一步不能用 || true 吞掉失败，实际 {run:?}"
+    );
+    assert!(
+        step["continue-on-error"].is_badvalue(),
+        "这一步不能带 continue-on-error，否则等待失败也不会让 job 变红"
+    );
 }
 
 // 这一步必须显式传 --ignored 并且以非零退出让构建失败——普通的
@@ -499,6 +596,7 @@ fn cleanup_step_always_tears_down_after_every_test_related_step() {
     );
     for other in [
         STEP_COMPOSE_UP,
+        STEP_WAIT_READY,
         STEP_HARNESS_CERT,
         STEP_IGNORED_TESTS,
         STEP_LOG_EXPORT,
