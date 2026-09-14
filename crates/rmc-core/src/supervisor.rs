@@ -229,7 +229,7 @@
 //!     后者在任何状态下可用符合直觉。两者受理之后的动作完全相同，
 //!     抽成了共享的 [`stop_everything`]，差别只在准入判断上。
 //!
-//! # Task 11（审计日志）复审顺手做掉的两条（R80/R81）
+//! # Task 11（审计日志）复审追加的修复（R80-R91）
 //!
 //! 19. **[R80] `retry_at` 收进 `Ctx`，抽出 [`in_backoff`]**——原来
 //!     `retry_at: Option<Instant>` 是 `run()` 的局部变量，靠
@@ -252,8 +252,18 @@
 //!     R71/R75 连栽三次的那类缺口一模一样。这里把
 //!     `!connecting_or_connected(&ctx)` 显式加成第二个 guard 条件——
 //!     不改变任何现有行为（不变量本来就成立，现有覆盖 Backoff/重试
-//!     路径的测试全部继续通过就是证据），只是把"为什么安全"从一条
-//!     隐性假设变成一处会在假设被打破时立刻炸掉的检查。
+//!     路径的测试全部继续通过就是证据）。
+//!
+//!     **R89（复审订正）**：上一版这里写的是"把隐性假设变成一处会在
+//!     假设被打破时立刻炸掉的检查"——这句话是反的。真实的失效模式
+//!     正相反：不变量一旦被打破，这个 `select!` 分支的 guard 会变成
+//!     `false`，分支被静默禁用，`retry_at` 会一直留在 `Some`、重试
+//!     定时器再也不会触发——**静默卡死在 Backoff**，没有断言、没有
+//!     日志、`cargo test` 也不会报错（除非正好有测试在等这一次重试，
+//!     那会在 300 秒虚拟超时后才报"等待状态超时"）。加固本身的方向
+//!     没错：把"双重建连"这一类更严重的后果（R71/R75 那三次真实
+//!     泄漏）换成了"卡住"这个更安全但更隐蔽的后果——只是不该用
+//!     "立刻炸掉"这种话来形容它，误导下一个人以为这里有主动报警。
 //! 20. **[R81] `SshTunnel::Drop` 兜底触发时补一条 `tracing::warn!`**
 //!     ——见 `ssh/mod.rs` 里 `impl Drop for SshTunnel` 上的说明。这条
 //!     兜底本身是 R76 加的纵深防御；上一轮实现者拒绝在 `Drop` 里打
@@ -265,6 +275,40 @@
 //!     `shutdown()`），这是给开发者/维护者看的实现缺陷信号，不是给
 //!     现场工程师或事后追责审计看的运维事件——审计日志的受众关心
 //!     "谁连到了哪台一体机"，不关心"哪一行 Rust 代码忘了收尾"。
+//! 21. **[R83，最要紧] `teardown()` 里残留的远程会话不再被静默丢弃**
+//!     ——评审用探针实证：`RemoteSessionOpened{7}` →
+//!     `RemoteSessionBytes{111,222}` → `Disconnected`（没有显式的
+//!     `RemoteSessionClosed`），审计日志原来到"远程会话 7 已开启"
+//!     为止，没有任何关闭记录。这正是最常见的收尾路径：远程工程师
+//!     正连着客户一体机，现场笔记本断网，或者现场人员点"停止"。
+//!     不是时序运气：`msg_rx` 的 guard 是 `ctx.handle.is_some()`，
+//!     `teardown()` 已经把 `self.handle` 取走，即使 pump 补发了
+//!     `RemoteSessionClosed` 也永远不会被 `handle_msg` 处理到，是
+//!     结构性的必然。修法：`teardown()` 现在对 `self.sessions` 里
+//!     残留的每一条都补一次收尾账，跟正常关闭共用抽出来的
+//!     [`record_session_closed`]，口径一致。
+//! 22. **[R84] 审计内容原来除了口令测试那四条粗断言之外零覆盖**——
+//!     评审把 `begin()` 的"Gateway，一体机"整段、
+//!     `RemoteSessionOpened`/`RemoteSessionClosed`/`ForwardRegistered`
+//!     四处审计行全删，183 个测试全绿。"连到了哪台一体机"这个
+//!     Task 11 自己定义的核心追责要素，一次重构就能悄悄消失，没有
+//!     任何测试会报警。补法：`remote_sessions_are_reported_with_
+//!     traffic_and_removed_on_close` 现在额外读回审计日志内容；
+//!     `schedule_retry` 那一行错误原文的覆盖在
+//!     `auth_failure_returns_to_idle_and_does_not_retry` 里补上。
+//! 23. **[R90] `audit.prune()` 不再只在启动时跑一次**——见
+//!     [`AUDIT_PRUNE_INTERVAL`] 上的说明：现场笔记本经常连续开机
+//!     运行数周不重启，`RETENTION_DAYS` 因此事实上失效。`run()` 主
+//!     循环现在每隔这么久重新清理一次。
+//! 24. **[R91] 四条零碎**：`TunnelMsg::Disconnected` 原来先记一行
+//!     "SSH 隧道断开"，`schedule_retry` 紧接着又记一行"SSH 链路
+//!     中断"——同一次断线连续两行几乎同义的记录，实测相邻，现在只在
+//!     `ctx.creds` 已经是 `None`（`schedule_retry` 不会被调用）这个
+//!     防御性分支里才补记一次；`Ctx::set_state` 原来用 `{:?}` 拼状态
+//!     迁移行，日志里会出现 `Connected { degraded: false }` 这类 Rust
+//!     结构体语法，改用 [`describe_state`] 写成人话；`docs/方案
+//!     设计.md` §3.5 表格下的说明与 `ssh/pump.rs` 里两处"全 crate
+//!     唯一那行 `warn!`"的注释都已经跟着 R81/R82 一并订正。
 
 use crate::addr::HostPort;
 use crate::audit::{Audit, Level};
@@ -287,6 +331,11 @@ use zeroize::Zeroizing;
 pub const PORT_BUSY_RETRY: Duration = Duration::from_secs(5);
 pub const PORT_BUSY_BUDGET: Duration = Duration::from_secs(120);
 pub const APPLIANCE_PROBE: Duration = Duration::from_secs(30);
+/// R90（复审发现）：`audit.prune()` 原来只在 `run()` 启动时调用一次。
+/// 现场笔记本经常连续开机运行数周不重启，`RETENTION_DAYS` 因此事实上
+/// 失效——保留期清理逻辑本身没坏，只是没有第二次被叫到的机会。这里
+/// 让 `run()` 的主循环每隔这么久重新清理一次，不需要重启进程。
+pub const AUDIT_PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 const EVENT_CAPACITY: usize = 256;
 const MSG_CAPACITY: usize = 256;
@@ -440,6 +489,39 @@ fn in_backoff(ctx: &Ctx) -> bool {
     ctx.retry_at.is_some()
 }
 
+/// 把 `State` 写成人话，不是 Rust 的结构体 Debug 语法——R91（复审
+/// 发现）：审计日志面向事后追责，读的人未必是开发者，`Connected {
+/// degraded: false }`/`Backoff { attempt: 1, delay: 1s }` 这类语法
+/// 对非开发者不友好。`delay` 那个 `Duration` 仍然用 `{:?}`（`5s`/
+/// `500ms` 这种，本身已经是人能读的形式），不额外重新实现一遍时长
+/// 格式化。
+fn describe_state(s: &State) -> String {
+    match s {
+        State::Idle => "空闲".to_string(),
+        State::Preflight => "预检中".to_string(),
+        State::Connecting => "建立连接中".to_string(),
+        State::Connected { degraded: false } => "已连接".to_string(),
+        State::Connected { degraded: true } => "已连接（一体机不可达，降级）".to_string(),
+        State::Backoff { attempt, delay } => {
+            format!("退避重连中（第 {attempt} 次，{delay:?} 后重试）")
+        }
+        State::Stopping => "正在停止".to_string(),
+        State::Failed { class, message } => {
+            format!("失败（{}）：{message}", describe_class(*class))
+        }
+    }
+}
+
+fn describe_class(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Fatal => "致命错误",
+        ErrorClass::Auth => "认证失败",
+        ErrorClass::PortBusy => "端口占用",
+        ErrorClass::Network => "网络问题",
+        ErrorClass::ApplianceUnreachable => "一体机不可达",
+    }
+}
+
 impl Ctx {
     fn set_state(&mut self, s: State) {
         let level = match &s {
@@ -447,8 +529,14 @@ impl Ctx {
             State::Backoff { .. } | State::Connected { degraded: true } => Level::Warn,
             _ => Level::Info,
         };
-        self.audit
-            .record(level, &format!("状态 {:?} → {:?}", self.state, s));
+        self.audit.record(
+            level,
+            &format!(
+                "状态：{} → {}",
+                describe_state(&self.state),
+                describe_state(&s)
+            ),
+        );
         self.state = s.clone();
         let _ = self.ev.send(TunnelEvent::State(s));
     }
@@ -509,7 +597,23 @@ impl Ctx {
         if let Some(h) = self.handle.take() {
             h.shutdown().await;
         }
+        // R83（复审发现，中等严重）：隧道非正常结束时仍开着的远程会话
+        // 原来在这里被静默丢弃——`RemoteSessionOpened` 有审计记录，
+        // `RemoteSessionClosed`/用时/字节数永远没有，因为这条消息从此
+        // 不会再被处理到：`msg_rx` 的 guard 是 `ctx.handle.is_some()`
+        // （见 `run()` 主循环里那个分支上的说明），上面几行已经把
+        // `self.handle` 取走了，即使 pump 补发了 `RemoteSessionClosed`
+        // 也不会被 `handle_msg` 看到，不是时序运气，是结构性的必然。
+        //
+        // 而这正是最常见的收尾路径：远程工程师正连着客户一体机，现场
+        // 笔记本断网，或者现场人员点"停止"——事后追责问"他连了多久、
+        // 传了多少"，日志原来只能到"会话已开启"为止。这里补一次账,
+        // 跟 `TunnelMsg::RemoteSessionClosed`（正常关闭）共用同一份
+        // `record_session_closed`，口径一致。
         if !self.sessions.is_empty() {
+            for (id, info) in &self.sessions {
+                record_session_closed(&self.audit, *id, info);
+            }
             self.sessions.clear();
             self.publish_sessions();
         }
@@ -819,6 +923,9 @@ async fn run(
     // 下一次尝试连接的时刻现在随 `Ctx` 走（`ctx.retry_at`，R80）。
     // degraded 时下一次探测一体机的时刻。None 表示不在探测中。
     let mut probe_at: Option<Instant> = None;
+    // R90：下一次审计日志保留期清理的时刻，恒定 `Some`——跟 `retry_at`/
+    // `probe_at` 不同，这个定时器不依赖会话状态，进程活着就该一直转。
+    let mut prune_at = Instant::now() + AUDIT_PRUNE_INTERVAL;
 
     // 注意这里不调用 `ctx.set_state(State::Idle)`：`ctx.state` 在上面
     // 的结构体字面量里已经初始化成 `Idle`，这里只是"进程刚起来，状态
@@ -1018,7 +1125,10 @@ async fn run(
             // `!connecting_or_connected(&ctx)` 的——见模块顶部第 19 条。
             // 不变量本来就成立（`retry_at`/`connect_task`+`handle` 从不
             // 同时置位），这里补的是显式检查，不是修复一个当前能复现的
-            // 缺陷。
+            // 缺陷。R89：这条 guard 一旦被不变量打破就会变 `false`，
+            // 后果是这个分支被静默禁用、`retry_at` 卡在 `Some`、重试
+            // 定时器再也不触发——静默卡在 Backoff，不是报错，见模块
+            // 顶部第 19 条订正后的说明。
             _ = tokio::time::sleep_until(sleep_until), if in_backoff(&ctx) && !connecting_or_connected(&ctx) => {
                 ctx.retry_at = None;
                 if let Some((new_msg_rx, new_connect_rx, new_pending_handle)) = spawn_connect(&mut ctx, false) {
@@ -1030,6 +1140,16 @@ async fn run(
 
             _ = tokio::time::sleep_until(probe_until), if probe_at.is_some() => {
                 probe_at = probe_appliance(&mut ctx).await;
+            }
+
+            // R90：审计日志保留期清理不再只在启动时跑一次——见
+            // `AUDIT_PRUNE_INTERVAL` 上的说明。跟 `Audit::open` 那次
+            // 一样，失败不是 Fatal，只是错过这一轮，下一轮再试。
+            _ = tokio::time::sleep_until(prune_at) => {
+                if let Err(e) = ctx.audit.prune() {
+                    tracing::warn!(error = %e, "审计日志清理失败，忽略，下次到点再试");
+                }
+                prune_at = Instant::now() + AUDIT_PRUNE_INTERVAL;
             }
         }
     }
@@ -1189,6 +1309,28 @@ fn schedule_retry(ctx: &mut Ctx, e: Error) {
     }
 }
 
+/// 一个远程会话的收尾账目：用移除前记下的 `opened_at` 现场算一次时长，
+/// 连同累计字节数一起记一行——这是"谁、连到了哪台一体机、干了多久"这
+/// 四个问题里最后一个的落点。`handle_msg` 的 `TunnelMsg::
+/// RemoteSessionClosed`（正常关闭）与 `Ctx::teardown`（R83：隧道非
+/// 正常结束时 `ctx.sessions` 里还剩的那些，见该函数上的说明）共用
+/// 这一份实现，不能各写一份——否则两处measure用时/字节数的口径迟早会
+/// 长歪。
+fn record_session_closed(audit: &Audit, id: u64, info: &RemoteSessionInfo) {
+    let secs = SystemTime::now()
+        .duration_since(info.opened_at)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    audit.record(
+        Level::Info,
+        &format!(
+            "远程会话 {id} 已关闭，用时 {secs} 秒，工程师→一体机 {} 字节，\
+             一体机→工程师 {} 字节",
+            info.to_appliance, info.from_appliance
+        ),
+    );
+}
+
 /// `handle_msg` 的审计策略：**逐个变体手写要记的内容，不是
 /// `ctx.audit.record(Info, &format!("{msg:?}"))` 一把梭**——brief 那样
 /// 写有两个问题：
@@ -1267,20 +1409,10 @@ async fn handle_msg(
             // 连同关闭前最后一次 `RemoteSessionBytes` 报的累计字节数
             // 一起记——这一行是"谁连到了哪台一体机、干了多久"这四个
             // 问题里最后一个的落点，`RemoteSessionOpened`/这一行合起来
-            // 就是一次远程会话完整的起止记录。
+            // 就是一次远程会话完整的起止记录。跟 `teardown()`（隧道
+            // 非正常结束时残留会话的收尾账，见 R83）共用同一份计算。
             if let Some(s) = ctx.sessions.remove(&id) {
-                let secs = SystemTime::now()
-                    .duration_since(s.opened_at)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                ctx.audit.record(
-                    Level::Info,
-                    &format!(
-                        "远程会话 {id} 已关闭，用时 {secs} 秒，工程师→一体机 {} 字节，\
-                         一体机→工程师 {} 字节",
-                        s.to_appliance, s.from_appliance
-                    ),
-                );
+                record_session_closed(&ctx.audit, id, &s);
             }
             ctx.publish_sessions();
         }
@@ -1297,12 +1429,24 @@ async fn handle_msg(
             }
         }
         TunnelMsg::Disconnected { reason } => {
-            ctx.audit
-                .record(Level::Warn, &format!("SSH 隧道断开：{reason}"));
             ctx.teardown(connect_rx, pending_handle).await;
             *probe_at = None;
             if ctx.creds.is_some() {
+                // R91（复审发现）：这里原来先记一行"SSH 隧道断开：
+                // {reason}"，`schedule_retry` 紧接着又记一行"SSH 链路
+                // 中断：{reason}"（`Error::SshTransport` 的 `Display`）
+                // ——同一次断线连续两行几乎同义的记录，实测相邻，读的
+                // 人分不清这是两件事还是同一件事被记了两遍。不在这里
+                // 重复记，交给 `schedule_retry` 记一次就够。
                 schedule_retry(ctx, Error::SshTransport(reason));
+            } else {
+                // 目前没有已知的生产路径会走到这里（`ctx.creds` 在
+                // `ctx.handle.is_some()` 期间——也就是 `msg_rx` 会被
+                // 轮到的这段时间——理应恒为 `Some`），纯粹是防御：
+                // `schedule_retry` 不会被调用，这里补一行，不让这次
+                // 断线完全没有痕迹。
+                ctx.audit
+                    .record(Level::Warn, &format!("SSH 隧道断开：{reason}"));
             }
         }
     }
@@ -1580,12 +1724,32 @@ mod tests {
         .await;
     }
 
+    // R84（复审发现）：`schedule_retry` 顶部那行 `ctx.audit.record
+    // (audit_level_for(class), &e.to_string())` 是"为什么退避/回到
+    // Idle"这件事在审计日志里唯一的落点（`Ctx::set_state` 记的通用
+    // 状态迁移行看不出原因，`State::Idle` 不带任何字段）；原来 183 个
+    // 测试没有一条检查过它的内容，删掉这一行也能全绿。这里额外读回
+    // 审计日志，确认认证失败的错误原文真的留了痕。
+    //
+    // 会让这条测试变红的实现改法：删掉 `schedule_retry` 顶部那行
+    // `ctx.audit.record(...)`。
     #[tokio::test(start_paused = true)]
     async fn auth_failure_returns_to_idle_and_does_not_retry() {
         guard(async {
+            let dir = std::env::temp_dir().join(format!(
+                "rmc-audit-auth-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut cfg = config();
+            cfg.log_dir = dir.clone();
+
             let (factory, calls) = Scripted::new(vec![Outcome::Err(Error::AuthRejected)]);
             let (tx, mut rx) = Supervisor::spawn(
-                config(),
+                cfg,
                 deps(factory.clone(), Arc::new(NoSystemEvents::default())),
             );
             tx.send(start()).await.unwrap();
@@ -1597,6 +1761,13 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_secs(120)).await;
             assert_eq!(calls.lock().unwrap().len(), 1, "认证失败后不得自动重试");
+
+            let a = Audit::open(dir).unwrap();
+            let text = std::fs::read_to_string(a.current_path()).unwrap_or_default();
+            assert!(
+                text.contains("账号或口令不正确"),
+                "认证失败的原因没有留痕：{text}"
+            );
         })
         .await;
     }
@@ -2616,7 +2787,7 @@ mod tests {
                 "口令进了日志：{text}"
             );
             assert!(text.contains("tunnel-zhang"), "账号应当留痕：{text}");
-            assert!(text.contains("Connected"), "状态变迁未入日志：{text}");
+            assert!(text.contains("已连接"), "状态变迁未入日志：{text}");
         })
         .await;
     }
@@ -2672,6 +2843,70 @@ mod tests {
         .await;
     }
 
+    // --- R90（复审发现）：`prune()` 不能只在启动时跑一次。---
+    //
+    // 现场笔记本经常连续开机运行数周不重启，`RETENTION_DAYS` 因此
+    // 事实上失效——保留期清理逻辑本身没坏，只是没有第二次被叫到的
+    // 机会。造一个"启动之后才出现"的陈旧文件（启动那一次清理不可能
+    // 删过它），推进虚拟时钟一整个清理周期，确认它被周期性清理删掉。
+    //
+    // 会让这条测试变红的实现改法：把 `run()` 主循环里 R90 新加的
+    // `_ = tokio::time::sleep_until(prune_at) => { ... }` 分支删掉，
+    // 改回只在 `run()` 开头调一次 `audit.prune()`。
+    //
+    // 不用共享的 `guard()`：它固定 300 秒的死锁预算比这条测试本身
+    // 需要的 24 小时虚拟等待还短，会被自己的死锁哨兵误伤（`start_
+    // paused` 下这 24 小时是虚拟时间，近乎不花真实时间，但仍然长于
+    // 300 秒虚拟预算）。换一个更宽的预算，仍然是"卡死会报错，不是
+    // 挂住"，只是上限跟着这条测试自己的周期走。
+    #[tokio::test(start_paused = true)]
+    async fn prune_runs_periodically_not_only_at_startup() {
+        let fut = async {
+            let dir = std::env::temp_dir().join(format!(
+                "rmc-audit-periodic-prune-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut cfg = config();
+            cfg.log_dir = dir.clone();
+
+            let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
+                TunnelMsg::Authenticated {
+                    host_key_fp: "SHA256:aaa".into(),
+                    first_seen: true,
+                },
+                TunnelMsg::ForwardRegistered { port: 22001 },
+            ])]);
+            let (tx, mut rx) =
+                Supervisor::spawn(cfg, deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Connected { .. })).await;
+
+            // 启动时那次 prune 已经跑完（`Supervisor::spawn` 里同步
+            // 执行，早于主循环第一次 `select!`）。这个陈旧文件是启动
+            // 之后才写进去的，启动那一次清理不可能删过它。
+            let stale = dir.join("rmc-2000-01-01.log");
+            std::fs::write(&stale, "老日志\n").unwrap();
+            let long_ago =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+            filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(long_ago))
+                .unwrap();
+            assert!(stale.exists());
+
+            // 虚拟时钟推进一整个清理周期——如果 `prune()` 只在启动时
+            // 跑过一次，这个文件会一直留着。
+            tokio::time::sleep(AUDIT_PRUNE_INTERVAL + Duration::from_secs(1)).await;
+
+            assert!(!stale.exists(), "24 小时后陈旧日志应该被周期性清理删掉");
+        };
+        tokio::time::timeout(Duration::from_secs(25 * 3600), fut)
+            .await
+            .expect("测试超过 25 小时（虚拟）仍未完成，判定为死锁");
+    }
+
     // R78 的另一半：`Cancel` 在 `Failed` 下**保持**空操作，这个不对称
     // 是有意的。`Cancel` 的语义是"取消正在进行的这次开启"，`Failed`
     // 下没有任何正在进行的东西可取消；`Stop` 的语义是"我不玩了"，
@@ -2705,9 +2940,33 @@ mod tests {
         .await;
     }
 
+    // R84（复审发现，中等严重）：审计内容原来除了口令测试那四条粗
+    // 断言之外零覆盖——评审把 `begin()` 的"Gateway，一体机"整段、
+    // `RemoteSessionOpened`/`RemoteSessionClosed`/`ForwardRegistered`
+    // 四处审计行全删，183 个测试全绿。"连到了哪台一体机"这个 Task 11
+    // 自己定义的核心追责要素，一次重构就能悄悄消失，没有任何测试会
+    // 报警。这条测试现在额外读回审计日志文件、逐一断言这几处内容都
+    // 真的写进去了；`schedule_retry` 那一行错误原文的覆盖见
+    // `auth_failure_returns_to_idle_and_does_not_retry`（这条测试走的
+    // 是没有错误的正常路径，覆盖不到那一行）。
+    //
+    // 会让这条测试变红的实现改法：删掉 `begin()`/`handle_msg` 里
+    // `ForwardRegistered`/`RemoteSessionOpened`/`RemoteSessionClosed`
+    // 对应的任意一行 `ctx.audit.record(...)`。
     #[tokio::test(start_paused = true)]
     async fn remote_sessions_are_reported_with_traffic_and_removed_on_close() {
         guard(async {
+            let dir = std::env::temp_dir().join(format!(
+                "rmc-audit-sessions-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut cfg = config();
+            cfg.log_dir = dir.clone();
+
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
                     host_key_fp: "SHA256:aaa".into(),
@@ -2723,7 +2982,7 @@ mod tests {
                 TunnelMsg::RemoteSessionClosed { id: 7 },
             ])]);
             let (tx, mut rx) =
-                Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
+                Supervisor::spawn(cfg, deps(factory, Arc::new(NoSystemEvents::default())));
             tx.send(start()).await.unwrap();
 
             let mut with_traffic = false;
@@ -2741,6 +3000,91 @@ mod tests {
             }
             assert!(with_traffic, "没有收到带流量的会话列表");
             assert!(emptied, "会话关闭后列表未清空");
+
+            let a = Audit::open(dir).unwrap();
+            let text = std::fs::read_to_string(a.current_path()).unwrap_or_default();
+            assert!(
+                text.contains("192.168.100.10:22"),
+                "「连到了哪台一体机」这条账目丢了：{text}"
+            );
+            assert!(text.contains("22001 已注册"), "{text}");
+            assert!(text.contains("远程会话 7 已开启"), "{text}");
+            assert!(text.contains("远程会话 7 已关闭"), "{text}");
+            assert!(
+                text.contains("100 字节") && text.contains("200 字节"),
+                "字节数没记全：{text}"
+            );
+        })
+        .await;
+    }
+
+    // --- R83（复审发现，最要紧）：隧道非正常结束时残留的远程会话不能
+    // 被静默丢弃。---
+    //
+    // 评审用探针实证：`RemoteSessionOpened{7}` → `RemoteSessionBytes
+    // {111,222}` → `Disconnected`（没有显式的 `RemoteSessionClosed`），
+    // 日志原来到"远程会话 7 已开启"为止，没有任何关闭记录——而这正是
+    // 最常见的收尾路径：远程工程师正连着客户一体机，现场笔记本断网，
+    // 或者现场人员点"停止"。事后追责问"他连了多久、传了多少"，答案
+    // 原来止步于"开启过"。这不是时序运气：`msg_rx` 的 guard 是
+    // `ctx.handle.is_some()`（见 `run()` 主循环），`teardown()` 已经把
+    // `self.handle` 取走，即使 pump 补发了 `RemoteSessionClosed` 也
+    // 永远不会被 `handle_msg` 处理到，是结构性的必然（见 `Ctx::
+    // teardown` 上的说明）。
+    //
+    // 会让这条测试变红的实现改法：把 `Ctx::teardown` 里 R83 新加的那段
+    // （对 `self.sessions` 逐个调 `record_session_closed`）删掉，改回
+    // 原来那句单纯的 `self.sessions.clear()`。
+    #[tokio::test(start_paused = true)]
+    async fn residual_remote_sessions_are_recorded_as_closed_when_the_tunnel_ends_abnormally() {
+        guard(async {
+            let dir = std::env::temp_dir().join(format!(
+                "rmc-audit-residual-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut cfg = config();
+            cfg.log_dir = dir.clone();
+
+            let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
+                TunnelMsg::Authenticated {
+                    host_key_fp: "SHA256:aaa".into(),
+                    first_seen: true,
+                },
+                TunnelMsg::ForwardRegistered { port: 22001 },
+                TunnelMsg::RemoteSessionOpened { id: 7 },
+                TunnelMsg::RemoteSessionBytes {
+                    id: 7,
+                    to_appliance: 111,
+                    from_appliance: 222,
+                },
+                TunnelMsg::Disconnected {
+                    reason: "SSH 会话已断开".into(),
+                },
+            ])]);
+            let (tx, mut rx) =
+                Supervisor::spawn(cfg, deps(factory, Arc::new(NoSystemEvents::default())));
+            tx.send(start()).await.unwrap();
+
+            // 断线是网络类错误，会转 Backoff 等待重连；到这一步
+            // `teardown()` 已经跑完，正是我们要验证的时机。
+            states_until(&mut rx, |s| matches!(s, State::Backoff { .. })).await;
+
+            let a = Audit::open(dir).unwrap();
+            let text = std::fs::read_to_string(a.current_path()).unwrap_or_default();
+            assert!(text.contains("远程会话 7 已开启"), "{text}");
+            assert!(
+                text.contains("远程会话 7 已关闭"),
+                "隧道非正常结束时残留的会话被静默丢弃了，日志到「已\
+                 开启」为止：{text}"
+            );
+            assert!(
+                text.contains("111 字节") && text.contains("222 字节"),
+                "残留会话的字节数没记全：{text}"
+            );
         })
         .await;
     }
@@ -3657,5 +4001,30 @@ mod tests {
             );
         })
         .await;
+    }
+
+    // --- R91：审计日志里的状态描述是人话，不是 Rust 结构体 Debug
+    // 语法。---
+    //
+    // 会让这条测试变红的实现改法：把 `describe_state` 里任何一个分支
+    // 换回 `format!("{s:?}")`——`Backoff`/`Failed` 两个带字段的变体会
+    // 立刻在输出里带上 `{`。
+    #[test]
+    fn describe_state_produces_prose_not_rust_debug_syntax() {
+        assert_eq!(
+            describe_state(&State::Connected { degraded: false }),
+            "已连接"
+        );
+        assert!(!describe_state(&State::Connected { degraded: false }).contains('{'));
+        assert!(!describe_state(&State::Backoff {
+            attempt: 1,
+            delay: Duration::from_secs(5)
+        })
+        .contains('{'));
+        assert!(!describe_state(&State::Failed {
+            class: ErrorClass::Auth,
+            message: "账号或口令不正确".into()
+        })
+        .contains('{'));
     }
 }
