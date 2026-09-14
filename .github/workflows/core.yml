@@ -3,12 +3,28 @@ name: core
 # R——CI（Task 12）：这份工作流要还的债是"本仓库至今没有任何 CI 会构建
 # Rust"——`gateway.yml` 的 paths 过滤器从来没包含 `crates/**`，改
 # rmc-core 一个字都不会触发任何工作流。下面的过滤器必须覆盖
-# `crates/**`、workspace 级 `Cargo.*`、`deny.toml` 与这份文件自己。
+# `crates/**`、workspace 级 `Cargo.*`、`deny.toml`、`rust-toolchain.toml`
+# 与这份文件自己。
+#
+# R（复审发现，中）：`integration` job 的整套夹具（docker-compose.yml、
+# sshd_tunnel_config、haproxy.cfg 等）都住在 `gateway/test-env/` 与
+# `gateway/` 下——原来的过滤器漏了 `gateway/**`，改这套夹具（哪怕只是
+# 端口映射或 sshd 配置）只会触发 `gateway.yml`（不跑 cargo），17 条
+# 集成测试根本不会执行验证到这处改动，破坏要等到某次无关的
+# `crates/**` 提交才显形，现场看起来还像是 rmc-core 自己的回归——跟
+# 这个任务本身要还的债是同一个形状，`gateway/**` 也必须加进来。
+#
+# R（复审发现，中低）：`rust-toolchain.toml` 决定 CI 实际用的编译器
+# （目录级 override，优先级比 `dtolnay/rust-toolchain` 那一步的
+# `rustup default` 更高），原来没进过滤器——改它不会触发这份工作流，
+# "MSRV 1.89 真的够用"这件事就没人在验证。见下面
+# `unit_job_pins_the_toolchain_to_the_documented_msrv` 测试与
+# task-12-report.md。
 on:
   push:
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/core.yml"]
+    paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml"]
   pull_request:
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/core.yml"]
+    paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml"]
 
 jobs:
   # 普通 `cargo test -p rmc-core` 覆盖的部分：格式、clippy（-D
@@ -88,12 +104,26 @@ jobs:
         # 停下、不跑剩下的——本地验证过这个默认行为会把后面几个二进制
         # 的真实结果盖住，一次只看得到一条失败。同一次 CI 跑出全部结果，
         # 比"改一条、重跑、再改一条"来回更快。
+        #
+        # `RUSTUP_TOOLCHAIN=1.89.0`：`rust:1.89` 镜像预装的工具链叫
+        # `1.89.0-<triple>`，仓库根 `rust-toolchain.toml` 写的是
+        # `channel = "1.89"`（少一个 `.0`）——rustup 把这两个字符串当成
+        # 两个不同的工具链，每次 `docker run --rm` 都会为"1.89"这个
+        # 名字重新下载 cargo/rustc/rust-std/clippy/rustfmt 五个组件。
+        # 本地实测过：这一步能把 9 分钟的集成链路拖出将近 4 分钟的
+        # 纯下载耗时，而且这几个组件里有两个（clippy/rustfmt）这一步
+        # 根本用不上。显式钉死 `RUSTUP_TOOLCHAIN` 让 rustup 直接复用
+        # 镜像自带的那份，跳过 rust-toolchain.toml 的目录级 override，
+        # 零下载（本地实测：不设时这条命令跑 4 分钟，设了之后 0.02
+        # 秒）。这个值要跟 rust-toolchain.toml 的 channel 保持同一个
+        # MSRV，见 unit_job_pins_the_toolchain_to_the_documented_msrv。
         run: |
           timeout 1200 docker run --rm \
             --network host \
             --add-host gateway.test:127.0.0.1 \
             -v "$PWD":/work -w /work \
             -e CARGO_TERM_COLOR=always \
+            -e RUSTUP_TOOLCHAIN=1.89.0 \
             rust:1.89 \
             bash -euxc '
               apt-get update -qq

@@ -36,13 +36,28 @@ cargo test -p rmc-core -- --ignored --test-threads=1   # 真实链路，17 条
 
 `--test-threads=1` 是必须的：多个集成用例会争抢同一个反向端口。
 
-CI（`.github/workflows/core.yml`）跑这 17 条 `--ignored` 用例时，测试
-进程本身跑在一个临时容器里（`--network host` + `--add-host
-gateway.test:127.0.0.1`），不需要 sudo、不需要改宿主的
-`/etc/hosts`——本机手动复现时同理，不用先给自己账号加 `/etc/hosts` 的
-写权限。docker compose 发布到 `127.0.0.1` 的端口在 `--network host`
-下原样可达，上面第二行的裸 `docker compose up -d --build` 已经够用；
-只有在容器化 CI 的那种隔离网络里才需要 `--add-host`。
+17 条里有 15 条按主机名拨 `gateway.test:8443`（`tests/common/mod.rs`
+与 `tests/transport.rs`/`tests/preflight.rs` 各自的
+`gateway_tls()`/`gateway()`），需要这台机器能把 `"gateway.test"`
+解析到 `127.0.0.1`——本机手动跑上面最后一行，最直接的办法是在
+`/etc/hosts` 里加一行 `127.0.0.1 gateway.test`（需要能写这个文件的
+权限）。只有另外 2 条（`tests/transport.rs` 里的
+`wrap_tls_accepts_the_harness_cert_when_the_extra_root_is_trusted`/
+`wrap_tls_rejects_the_harness_cert_without_the_extra_root`）按 IP
+拨号、只把 `"gateway.test"` 当 TLS SNI 传，不摸 DNS，这两条在没有
+`/etc/hosts` 权限的机器上也能跑。
+
+CI（`.github/workflows/core.yml`）不写宿主的 `/etc/hosts`：跑这 17
+条测试的进程本身在一个临时容器里（`--network host` + `--add-host
+gateway.test:127.0.0.1`），`--add-host` 只给这一个容器自己的
+`/etc/hosts` 加一行、容器退出即消失。**需要它的原因是"要把
+`gateway.test` 解析到一个地址"这件事本身，跟这个容器用
+`--network host` 还是别的网络模式无关**——哪怕换成加入 docker
+compose 的隔离网络，一样需要给 `gateway.test` 一个主机名映射，只是
+映射到的地址不同（发布端口那台机器的 IP，而不是 `127.0.0.1`）。这台
+开发机没有 `/etc/hosts` 写权限时，最直接的本机复现方式就是照抄 CI
+那一步：起一个 `--network host --add-host gateway.test:127.0.0.1`
+的容器，在容器里跑 `cargo test`，不需要碰宿主的 `/etc/hosts`。
 
 ## 口令处理
 

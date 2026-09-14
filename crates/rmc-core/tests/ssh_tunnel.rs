@@ -18,6 +18,19 @@
 //! 进程内 russh 服务端跑在每一次普通 `cargo test` 里（见 R40），不依赖
 //! docker/DNS/hosts，是当前唯一真正被跑到的证据来源。
 //!
+//! **R（Task 12 订正）**：上面这段现在不是事实了——`.github/workflows/
+//! core.yml` 的 `integration` job 会在 `crates/**`/`gateway/**` 等
+//! 改动时自动跑这些用例（`cargo test -p rmc-core -- --ignored
+//! --test-threads=1`），已经用真实 docker 环境验证过 17 条全部真的
+//! 通过（细节见 task-12-report.md）。它不是靠往宿主 `/etc/hosts` 写
+//! 一行来满足上面"宿主要能解析 gateway.test"这条前提的——CI 里跑测试
+//! 的进程本身在一个跟宿主共享网络栈的临时容器里，`--add-host
+//! gateway.test:127.0.0.1` 只给这一个容器自己的 `/etc/hosts` 加一行，
+//! 容器退出即消失，宿主的 `/etc/hosts` 从头到尾没被碰过。本机手动
+//! 复现仍然需要某种方式让 `gateway.test` 能解析（本地写 `/etc/hosts`，
+//! 或者照抄 CI 那个容器手法），这条前提本身没有变，变的只是"自动化
+//! 会不会跑到这些用例"——见 `crates/rmc-core/README.md` 的"测试"一节。
+//!
 //! `--test-threads=1` 是必须的：`establishes_and_reports_first_seen_host_key`
 //! 与 `second_tunnel_on_the_same_port_is_port_busy` 都会真的把 22001 绑起来，
 //! 多个用例并发跑会互相抢这个端口。

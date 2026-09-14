@@ -34,6 +34,23 @@ allow = [
 ]
 
 [bans]
+# 只是警告，不 deny：`cargo deny check bans` 实测报出 12 组重复
+# 版本——`windows-sys`（`ring`/`errno` 等各自拉了不同的版本，Windows
+# 专用代码，不影响 Linux 构建）与 `syn`（proc-macro 构建期依赖，两个
+# 版本互不链接进最终产物）确实无害，但 `sha2`/`sha3`/`digest`/`rand`/
+# `rand_core`/`crypto-common`/`generic-array`/`block-buffer`/
+# `cpufeatures`/`getrandom` 这一批不是——本 crate 自己直接依赖
+# `sha2 = "0.10"`、`rand = "0.8"`（`sha2 0.10.9`/`rand_core 0.6.4`
+# 那条线），而 `russh` 生态（`ssh-key`/`aes-gcm`/`ml-kem` 等）拉的是
+# 更新的 `sha2 0.11`/`rand 0.10`/`rand_core 0.10`——这是两套同名密码学
+# 原语真的被编进同一个二进制，跟 Windows 完全无关。裁定仍然是
+# `"warn"`：这些版本分叉来自上游各自的发布节奏，不是本 crate 能单方面
+# 消掉的（`russh` 才是决定它用哪个 `sha2`/`rand` 大版本的一方），
+# 强行 `deny` 只会让 `cargo update` 稍微碰到这条线就直接把 CI 逼红，
+# 对二进制体积/编译时间的实际影响也小于强行对齐版本要付出的维护
+# 成本；但理由不能只举最无害的那条，免得下次有人以为"反正都是
+# windows-sys 那种小事"就把 `warn` 顺手改成 `allow` 甚至删掉整个
+# `[bans]` 段。
 multiple-versions = "warn"
 # 明确禁止把 OpenSSL 拖进来，TLS 只用 rustls。
 deny = [{ name = "openssl-sys" }, { name = "native-tls" }]

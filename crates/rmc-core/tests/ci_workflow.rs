@@ -22,6 +22,29 @@
 //! name 精确匹配"一节）：`step_by_name` 找不到、或撞上不止一个同名
 //! step，都直接 `panic`，不返回哨兵值——静默的查找失败会让后面的断言
 //! 在错误的 step 上稳定通过，等于没测。
+//!
+//! # 复审追加：守得住"某个 flag 被删掉"，也要守得住"整个 step/job 被
+//! # 静默关掉"
+//!
+//! 第一版的断言全部停在"这个 step 的 `run`/`if`/`uses` 内容对不对"这
+//! 一层——复审用探针实测过：给 `integration` job 加
+//! `continue-on-error: true`、给某个 step 加 `if: false`、给 `unit`
+//! job 加 `if: false`、把单测命令悄悄收窄成 `--lib`、给单测命令接
+//! `|| true`、把 `cargo-deny` 的检查范围收窄成只查 licenses——原来的
+//! 断言一条都不红。`no_job_has_a_continue_on_error_or_a_top_level_
+//! conditional`、`no_step_in_any_job_is_silently_disabled_with_if_
+//! false`、`unit_test_step_runs_the_complete_test_suite_not_a_
+//! narrowed_subset`、`cargo_deny_step_checks_all_four_categories_
+//! not_a_narrowed_subset` 四条补上这一层——跟 gateway 那次踩的坑
+//! （步骤排序对了，但"把它整个关掉"这条路没堵）是同一族退化。
+//!
+//! MSRV 的漂移是另一类没堵住的洞：`dtolnay/rust-toolchain` 那一步的
+//! 版本号字面量不是 CI 实际用的编译器版本——`rust-toolchain.toml` 的
+//! 目录级 override 优先级更高，而它原来不在 paths 过滤器里，改它不
+//! 触发这份工作流。`unit_job_pins_the_toolchain_to_the_documented_
+//! msrv`/`integration_job_container_toolchain_matches_the_documented_
+//! msrv` 现在直接读 `rust-toolchain.toml` 的 `channel` 字段做交叉
+//! 校验，不是把同一个版本号分别硬编码在两处。
 
 use std::path::PathBuf;
 use yaml_rust2::{Yaml, YamlLoader};
@@ -92,6 +115,66 @@ fn uses_text(step: &Yaml) -> Option<&str> {
     step["uses"].as_str()
 }
 
+/// `step["if"]` 在 YAML 里可能是字符串（`"failure()"`）也可能是没加
+/// 引号的布尔字面量（`false`/`true` 会被解析成 `Yaml::Boolean`，不是
+/// `Yaml::String`）——只查 `as_str()` 会让 `if: false` 这种写法完全
+/// 从视野里消失（`as_str()` 对 `Boolean` 返回 `None`，看起来跟"这一步
+/// 压根没有 if 字段"一样）。这个函数把两种写法都判成"这一步被静默
+/// 关掉了吗"。
+fn step_is_disabled(step: &Yaml) -> bool {
+    match &step["if"] {
+        Yaml::Boolean(b) => !*b,
+        Yaml::String(s) => s.trim() == "false",
+        _ => false,
+    }
+}
+
+/// 从 `rust-toolchain.toml` 里读 `channel` 字段的值——这份文件的格式
+/// 固定是三行的 `[toolchain]` 表，手写一个只找这一个字段的小函数比
+/// 引入一个通用 TOML 解析器依赖更划算：跟本文件用 `yaml-rust2` 解析
+/// `core.yml` 是两种不同的取舍——`core.yml` 的结构本身就是这份测试
+/// 要盯住的对象（手写解析器的 bug 会掩盖它该盯住的回归，见模块文档），
+/// 而这里只是读一个格式早就固定死的配置文件里的一个字段，不存在这层
+/// 风险。
+fn toolchain_channel() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rust-toolchain.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读取 {path:?} 失败：{e}"));
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("channel") {
+            if let Some(value) = rest.trim_start().strip_prefix('=') {
+                return value.trim().trim_matches('"').to_string();
+            }
+        }
+    }
+    panic!("{path:?} 里没找到 channel 字段");
+}
+
+/// 在一段 shell 脚本文本里找 `NAME=value` 这种环境变量赋值，取
+/// `value`（到下一个空白字符或 `\` 续行符为止）。用于从 `docker run`
+/// 命令里挖出 `-e RUSTUP_TOOLCHAIN=1.89.0` 这类参数的值。
+fn env_assignment_value<'a>(shell_text: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=");
+    let start = shell_text.find(&needle)? + needle.len();
+    let rest = &shell_text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '\\')
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// 取字符串版本号的 `major.minor` 前缀（`"1.89.0"` -> `"1.89"`，
+/// `"1.89"` -> `"1.89"`）——比较镜像标签/`RUSTUP_TOOLCHAIN` 的值跟
+/// `rust-toolchain.toml` 的 `channel` 是不是同一个 MSRV 时，只关心
+/// major.minor，不关心具体 patch 号（patch 号会随镜像更新而变，不是
+/// 这里要盯住的漂移）。
+fn major_minor(version: &str) -> String {
+    let mut parts = version.split('.');
+    let major = parts.next().unwrap_or("");
+    let minor = parts.next().unwrap_or("");
+    format!("{major}.{minor}")
+}
+
 const UNIT_JOB: &str = "unit";
 const INTEGRATION_JOB: &str = "integration";
 const DENY_JOB: &str = "deny";
@@ -130,22 +213,32 @@ fn workflow_file_parses_as_yaml_with_exactly_three_jobs() {
 // 这是整个任务要还的债的根：`gateway.yml` 的 paths 过滤器从来没覆盖过
 // `crates/**`，改 rmc-core 一个字都不会触发任何工作流。
 //
+// `gateway/**` 与 `rust-toolchain.toml` 是复审加的两条：`integration`
+// job 的整套夹具（docker-compose.yml、sshd_tunnel_config 等）住在
+// `gateway/test-env/` 与 `gateway/` 下，漏了这条路径，改夹具只会触发
+// `gateway.yml`（不跑 cargo），17 条集成测试根本验证不到这处改动；
+// `rust-toolchain.toml` 决定 CI 实际用的编译器（见下面
+// `unit_job_pins_the_toolchain_to_the_documented_msrv`），漏了这条
+// 路径，改工具链版本不会触发任何验证。
+//
 // 会让这条测试变红的实现改法：把 `on.push.paths`/`on.pull_request.
-// paths` 里的 `"crates/**"` 删掉，或者只写在 push 里、漏了
-// pull_request（反之亦然）——PR 上的检查和推到默认分支后的检查必须
-// 是同一套触发条件，少了任何一侧都会让一部分改动逃过 CI。
+// paths` 里的任意一条删掉，或者只写在 push 里、漏了 pull_request
+// （反之亦然）——PR 上的检查和推到默认分支后的检查必须是同一套触发
+// 条件，少了任何一侧都会让一部分改动逃过 CI。
 #[test]
-fn paths_filter_covers_crates_dir_on_both_push_and_pull_request() {
+fn paths_filter_covers_the_directories_and_files_this_workflow_depends_on() {
     let doc = load_workflow();
     for trigger in ["push", "pull_request"] {
         let paths = doc["on"][trigger]["paths"]
             .as_vec()
             .unwrap_or_else(|| panic!("on.{trigger}.paths 应该是一个序列"));
         let texts: Vec<&str> = paths.iter().filter_map(Yaml::as_str).collect();
-        assert!(
-            texts.contains(&"crates/**"),
-            "on.{trigger}.paths 必须包含 \"crates/**\"，实际 {texts:?}"
-        );
+        for required in ["crates/**", "gateway/**", "rust-toolchain.toml"] {
+            assert!(
+                texts.contains(&required),
+                "on.{trigger}.paths 必须包含 {required:?}，实际 {texts:?}"
+            );
+        }
     }
 }
 
@@ -169,21 +262,66 @@ fn unit_job_runs_clippy_with_deny_warnings_and_fmt_check() {
     );
 }
 
-// MSRV 是 1.89（workspace Cargo.toml 与 rust-toolchain.toml 都这么写）；
-// brief 原始草稿钉的是 1.82，比 MSRV 还低，工具链版本必须跟 MSRV 对齐，
-// 不能比它更旧。
+// MSRV 的唯一权威来源是 `rust-toolchain.toml`（目录级 override，
+// 优先级比 `dtolnay/rust-toolchain` 那一步做的 `rustup default` 更
+// 高——`unit` job 的 cargo 命令实际用哪个编译器，由它说了算，不是由
+// 这一步的版本号字面量说了算）；这条测试直接读那份文件，不是把 MSRV
+// 这个数字在两处分别硬编码——硬编码两份、只在其中一份上加断言，防不住
+// "改了 rust-toolchain.toml、忘了同步这一步"这类漂移（复审发现的
+// 原始问题）。
 //
 // 会让这条测试变红的实现改法：把 `dtolnay/rust-toolchain@1.89` 改成
-// 任何其他版本号（包含改回 brief 原文的 1.82）。
+// 跟 `rust-toolchain.toml` 的 `channel` 不一致的任何版本号（包含改回
+// brief 原文的 1.82），或者反过来只改 `rust-toolchain.toml` 的
+// `channel`、不动这一步。
 #[test]
 fn unit_job_pins_the_toolchain_to_the_documented_msrv() {
     let doc = load_workflow();
     let steps = steps(job(&doc, UNIT_JOB));
     let step = step_by_name(steps, STEP_INSTALL_TOOLCHAIN);
     let uses = uses_text(step).unwrap_or_else(|| panic!("{STEP_INSTALL_TOOLCHAIN} 没有 uses 字段"));
+    let channel = toolchain_channel();
     assert_eq!(
-        uses, "dtolnay/rust-toolchain@1.89",
-        "工具链版本必须钉在 1.89（MSRV），实际 {uses:?}"
+        uses,
+        format!("dtolnay/rust-toolchain@{channel}"),
+        "工具链版本必须跟 rust-toolchain.toml 的 channel（{channel}）一致，实际 {uses:?}"
+    );
+}
+
+// `integration` job 的 17 条 --ignored 测试跑在 `rust:<channel>`
+// 镜像的一个临时容器里，不是走 `dtolnay/rust-toolchain`——它自己的
+// MSRV 一致性要单独钉住，跟上一条测试是两个独立的漂移点。
+//
+// `RUSTUP_TOOLCHAIN` 那个环境变量存在的唯一理由是绕开 rust-toolchain.
+// toml 的 `channel = "1.89"` 与镜像预装工具链名 `1.89.0-<triple>` 之间
+// 因为少写一个 `.0` 而对不上号、导致每次都重新下载的问题（见该处注释
+// 与 task-12-report.md）——它的 major.minor 必须跟 `channel` 一致，
+// 否则这个环境变量本身就会指向一个镜像里不存在的工具链，`cargo test`
+// 直接失败；镜像标签的 major.minor 也要跟 `channel` 一致，否则是在用
+// 一个跟声明的 MSRV 不一样的编译器验证代码。
+//
+// 会让这条测试变红的实现改法：只改 `rust-toolchain.toml` 的
+// `channel`，不同步改这一步的镜像标签或 `RUSTUP_TOOLCHAIN`（复审发现
+// 的原始问题——今天两者都是 1.89 所以看不出来，但 CI 从不会因为这个
+// 漂移而变红）。
+#[test]
+fn integration_job_container_toolchain_matches_the_documented_msrv() {
+    let doc = load_workflow();
+    let steps = steps(job(&doc, INTEGRATION_JOB));
+    let run = run_text(step_by_name(steps, STEP_IGNORED_TESTS));
+    let channel = toolchain_channel();
+
+    assert!(
+        run.contains(&format!("rust:{channel}")),
+        "容器镜像标签必须跟 rust-toolchain.toml 的 channel（{channel}）一致，实际 run={run:?}"
+    );
+
+    let rustup_toolchain = env_assignment_value(run, "RUSTUP_TOOLCHAIN")
+        .unwrap_or_else(|| panic!("run 里没找到 RUSTUP_TOOLCHAIN= 这个环境变量赋值：{run:?}"));
+    assert_eq!(
+        major_minor(rustup_toolchain),
+        channel,
+        "RUSTUP_TOOLCHAIN（{rustup_toolchain}）的 major.minor 必须跟 channel（{channel}）一致"
     );
 }
 
@@ -203,6 +341,35 @@ fn unit_test_step_has_an_inner_timeout_wrapper() {
         "单元测试步骤必须用 timeout 包一层，实际 {run:?}"
     );
     assert!(run.contains("cargo test -p rmc-core"), "{run:?}");
+}
+
+// 复审发现：只查 `contains("cargo test -p rmc-core")` 挡不住"悄悄
+// 缩小范围"这类退化——把命令改成 `cargo test -p rmc-core --lib`
+// （少跑 35 条非 ignored 集成测试，包含 connect.rs 那 9 条代理用例）、
+// 或者在命令后面接 `|| true`，`contains` 对这两种改法都仍然是
+// `true`。这条测试要求 `timeout <N>` 之后的内容跟
+// `"cargo test -p rmc-core"` 完全相等，不多不少。
+//
+// 会让这条测试变红的实现改法：在 `cargo test -p rmc-core` 后面追加
+// 任何内容（`--lib`、`--test connect`、`-- --ignored`、`|| true` 等），
+// 或者在前面插入任何内容。
+#[test]
+fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
+    let doc = load_workflow();
+    let steps = steps(job(&doc, UNIT_JOB));
+    let run = run_text(step_by_name(steps, STEP_UNIT_TESTS));
+    let trimmed = run.trim();
+    let after_timeout = trimmed
+        .strip_prefix("timeout ")
+        .unwrap_or_else(|| panic!("run 应该以 `timeout <秒数>` 开头：{trimmed:?}"));
+    let after_seconds = after_timeout
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start();
+    assert_eq!(
+        after_seconds, "cargo test -p rmc-core",
+        "单元测试步骤必须是完整的 `cargo test -p rmc-core`，不能带 --lib、\
+         额外的 --test 过滤器，也不能接 || true 之类的尾巴，实际命令是 {trimmed:?}"
+    );
 }
 
 // --build 不能省：早于某个提交的缓存镜像里还是有问题的旧证书（见
@@ -264,11 +431,13 @@ fn ignored_tests_step_really_runs_the_ignored_tests_and_can_fail_the_build() {
 
 // 用容器内跑测试进程 + --network host + --add-host 绕开"gateway.test
 // 需要能解析"这个前提，不需要 sudo、不需要改宿主的 /etc/hosts——见
-// task-12-report.md 里对这个组合的本地验证。
+// task-12-report.md 里对这个组合的本地验证。MSRV 一致性单独由
+// `integration_job_container_toolchain_matches_the_documented_msrv`
+// 盯住，这里不重复硬编码版本号。
 //
 // 会让这条测试变红的实现改法：把 `--network host` 或
 // `--add-host gateway.test:127.0.0.1` 删掉（改回写宿主 /etc/hosts 之类
-// 需要特权的步骤），或者把镜像换成一个跟 MSRV（1.89）不一致的版本。
+// 需要特权的步骤）。
 #[test]
 fn ignored_tests_run_inside_a_container_with_network_host_and_add_host() {
     let doc = load_workflow();
@@ -276,7 +445,6 @@ fn ignored_tests_run_inside_a_container_with_network_host_and_add_host() {
     let run = run_text(step_by_name(steps, STEP_IGNORED_TESTS));
     assert!(run.contains("--network host"), "{run:?}");
     assert!(run.contains("--add-host gateway.test:127.0.0.1"), "{run:?}");
-    assert!(run.contains("rust:1.89"), "镜像版本应与 MSRV 一致：{run:?}");
 }
 
 // 卡死时要有清楚的诊断，理由与 unit_test_step_has_an_inner_timeout_
@@ -353,6 +521,74 @@ fn deny_job_uses_the_cargo_deny_action() {
         uses.starts_with("EmbarkStudios/cargo-deny-action@"),
         "{uses:?}"
     );
+}
+
+// 复审发现：`cargo-deny-action` 不带 `with:` 时，默认跑
+// `cargo deny check`（advisories/bans/licenses/sources 全查）——这条
+// 断言钉住"没人偷偷加一个 `with: command: check licenses` 之类的
+// 输入把检查范围收窄掉"，四类检查缺一类都不该悄悄发生。
+//
+// 会让这条测试变红的实现改法：给这一步加 `with:`，不管是
+// `command: check licenses` 这种直接窄化，还是任何其它收窄检查范围
+// 的输入。
+#[test]
+fn cargo_deny_step_checks_all_four_categories_not_a_narrowed_subset() {
+    let doc = load_workflow();
+    let steps = steps(job(&doc, DENY_JOB));
+    let step = step_by_name(steps, STEP_CARGO_DENY);
+    assert!(
+        step["with"].is_badvalue(),
+        "cargo-deny 步骤不该有 with 输入——留空才是跑完整的四类检查，实际 {step:?}"
+    );
+}
+
+// 复审用六个探针实测过：给 `integration` job 加
+// `continue-on-error: true`、给 `unit` job 加 `if: false`，
+// `ci_workflow.rs` 原来的 15 条断言一条都不红——它们全部在 step 内容
+// 层面盯 run/if/uses，没有一条管到"整个 job 被静默关掉"这件事本身。
+//
+// 会让这条测试变红的实现改法：给 unit/integration/deny 任意一个 job
+// 加上 `continue-on-error` 或 `if` 字段（哪怕值是 `true`——job 级
+// `if` 本来就不该出现在这三个 job 上，它们该始终按 paths 过滤器的
+// 结果无条件运行）。
+#[test]
+fn no_job_has_a_continue_on_error_or_a_top_level_conditional() {
+    let doc = load_workflow();
+    for name in [UNIT_JOB, INTEGRATION_JOB, DENY_JOB] {
+        let j = job(&doc, name);
+        assert!(
+            j["continue-on-error"].is_badvalue(),
+            "job {name} 不该有 continue-on-error，否则失败也不会让整条工作流变红"
+        );
+        assert!(
+            j["if"].is_badvalue(),
+            "job {name} 不该有 job 级 if 条件，否则可能被静默跳过"
+        );
+    }
+}
+
+// 复审用探针实测过：给"运行 --ignored 集成测试"这一步加 `if: false`，
+// 原来的断言一条都不红（`step_by_name` 还是能找到这一步、`run` 字段
+// 内容还是老样子，只是这一步压根不会被执行）。`ignored_tests_step_
+// really_runs_the_ignored_tests_and_can_fail_the_build` 只查过这一步
+// 的 `continue-on-error`，没查过 `if`；这条测试对**所有** job 的
+// **所有** step 都查一遍 `if: false`（不管是布尔字面量还是字符串
+// 形式，见 `step_is_disabled` 上的说明），覆盖面比只查一条 step 更宽。
+//
+// 会让这条测试变红的实现改法：给任意一个 job 的任意一个 step 加上
+// `if: false`。
+#[test]
+fn no_step_in_any_job_is_silently_disabled_with_if_false() {
+    let doc = load_workflow();
+    for job_name in [UNIT_JOB, INTEGRATION_JOB, DENY_JOB] {
+        for step in steps(job(&doc, job_name)) {
+            let name = step["name"].as_str().unwrap_or("<unnamed>");
+            assert!(
+                !step_is_disabled(step),
+                "job {job_name} 的 step {name:?} 带 if: false，会被静默跳过"
+            );
+        }
+    }
 }
 
 // 每个 job 都该有自己的 timeout-minutes，不依赖 GitHub Actions 默认的
