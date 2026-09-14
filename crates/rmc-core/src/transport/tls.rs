@@ -213,4 +213,84 @@ mod tests {
             assert!(matches!(err, Error::TlsHandshake(_)), "{msg}");
         }
     }
+
+    // --- Task 10 补的第十一条：未受信证书必须 Fail ---
+    //
+    // 上一轮复审做过一次实验：把 `TlsRoots::connector()` 换成一个三个方法
+    // 全部硬编码返回 `Ok` 的 `ServerCertVerifier`（等价于把证书校验整个
+    // 关掉），跑全量 lib 测试，没有任何现有测试变红——本模块上面的用例
+    // 全都直接调用 `classify_tls_error`（纯函数，输入是手写的错误文本），
+    // 根本不会经过真正的 `connector()`/`wrap_tls`，能揪出"证书校验被
+    // 静默关掉"这类回归的只有需要 docker 的 `tests/transport.rs`
+    // `#[ignore]` 用例，而本仓没有 CI 会跑它们。
+    //
+    // 这里在进程内起一个真正的 rustls TLS 服务端（自签证书，跟
+    // preflight.rs 里 `gateway_tls_step_passes_when_the_certificate_is_
+    // trusted` 用的是同一对固定证书/私钥——两条测试互为正反面：那一条把
+    // 证书加进 extra root 断言 Pass，这一条**不**加、断言必须 Fail 且是
+    // Fatal 类），证明客户端确实会拒绝一个自己不认识的自签证书。
+    //
+    // 会让这条测试变红的实现改法：把 `TlsRoots::connector()` 换成一个
+    // 总是接受任意证书的 `ServerCertVerifier`（例如三个校验方法全部硬编码
+    // 返回 `Ok`），或者把 `classify_tls_error` 里证书错误的分支从
+    // `Error::TlsInvalidCert`（Fatal）改判成 `Error::TlsHandshake`
+    // （Network，会被当成一次可重试的抖动）。
+
+    const UNTRUSTED_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBODCB36ADAgECAgkAr2yXAE+wDB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJ\n\
+bG9jYWxob3N0MCAXDTI2MDkxNDAzNDE1M1oYDzIxMjYwODIxMDM0MTUzWjAUMRIw\n\
+EAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ50frL\n\
+mLEPSa7z0sqCmmRXJQQxgTfzxlcoJ4CKlST85mlZ9Fl2Un3fPCYFwtRi0eEJ4jAh\n\
+5cf6WHGmEM9gZlsVoxgwFjAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0E\n\
+AwIDSAAwRQIgAQ1gD0AFOxtEdH0SRv1x7wvGDHHzEXsEqehSXayGKjcCIQCXRetW\n\
+I3vKyk+IVraIkoFtpwtyhck6zxYrkM07snH3iw==\n\
+-----END CERTIFICATE-----\n";
+
+    const UNTRUSTED_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqqQ6iAlPo7gj+MbM\n\
+Z5JHB/f/r1o7nt406+2/PKx/N1yhRANCAAQ50frLmLEPSa7z0sqCmmRXJQQxgTfz\n\
+xlcoJ4CKlST85mlZ9Fl2Un3fPCYFwtRi0eEJ4jAh5cf6WHGmEM9gZlsV\n\
+-----END PRIVATE KEY-----\n";
+
+    #[tokio::test]
+    async fn untrusted_self_signed_certificate_is_rejected_as_fatal() {
+        use tokio::net::TcpListener;
+
+        let certs: Vec<_> = rustls_pemfile::certs(&mut UNTRUSTED_CERT_PEM.as_bytes())
+            .collect::<std::result::Result<_, _>>()
+            .expect("测试证书应该能被解析");
+        let key = rustls_pemfile::private_key(&mut UNTRUSTED_KEY_PEM.as_bytes())
+            .expect("测试私钥应该能被解析")
+            .expect("测试私钥不应该缺失");
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("测试证书与私钥应该匹配");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                // 客户端会在校验证书这一步就失败，握手走不完——服务端这
+                // 一侧只需要尝试 accept，不关心结果。
+                let _ = acceptor.accept(sock).await;
+            }
+        });
+
+        // 关键：只用 webpki() 内置公共 CA 根，不调用 with_extra_pem 把这个
+        // 自签证书加进信任列表——这正是"未受信"这个场景本身。
+        let roots = TlsRoots::webpki();
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let err = wrap_tls(stream, "localhost", &roots).await.unwrap_err();
+
+        assert_eq!(
+            err.class(),
+            crate::error::ErrorClass::Fatal,
+            "未受信的自签证书必须归 Fatal，不能被当成一次可重试的网络抖动：{err}"
+        );
+        assert!(matches!(err, Error::TlsInvalidCert(_)), "{err:?}");
+    }
 }
