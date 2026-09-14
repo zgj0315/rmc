@@ -515,11 +515,33 @@ mod tests {
     // --- R52（上一轮评审）：全 crate 没有任何测试锁住"转发内容一个字节
     // 都不许进日志"这条硬约束——本模块顶部文档写了这句承诺，但完全靠
     // 人工看代码里没有哪行 `tracing::` 碰到缓冲区。这条测试用一个最小的
-    // `tracing::Subscriber`（`tracing` facade 自带
-    // `subscriber::set_default`，不需要新引入 `tracing-subscriber` 这个
-    // 依赖）捕获事件文本，跑一次带特征字节的真实转发，断言捕获到的日志
-    // 里不含那些特征字节。这条约束是产品级的：那是远程工程师与一体机
-    // 之间的 SSH 明文。
+    // `tracing::Subscriber`（`tracing` facade 自带订阅机制，不需要新引入
+    // `tracing-subscriber` 这个依赖）捕获事件文本，跑一次带特征字节的
+    // 真实转发，断言捕获到的日志里不含那些特征字节。这条约束是产品级
+    // 的：那是远程工程师与一体机之间的 SSH 明文。
+    //
+    // R59（评审）：之前用的是 `tracing::subscriber::set_default`（线程
+    // 局部），实测并行跑 `cargo test` 会间歇性失败——真因不是"被别的
+    // 测试的 tracing 事件干扰"，是 `tracing-core` 的 callsite `Interest`
+    // 缓存被毒化：`set_default` 只在当前线程生效，但 callsite 的
+    // `Interest` 缓存是**进程全局**的，且只有一个已注册 dispatcher 时会
+    // 走捷径（`Dispatchers::rebuilder()` 返回 `Rebuilder::JustOne`，
+    // `for_each` 直接调 `dispatcher::get_default(f)`，用的是"谁第一个
+    // 撞到这个 callsite"那条线程的 subscriber）。全 crate 唯一的
+    // `tracing::warn!` 在 `handler.rs`——如果本测试 `set_default` 之后、
+    // 自己触发这行 `warn!` 之前，另一条会触发同一处 `warn!` 的测试
+    // （`forwarded_channel_open_is_rejected_when_port_does_not_match`，
+    // 在 `test_support.rs`）先在别的线程撞上这个 callsite，
+    // `get_default` 拿到的是那条线程的 `NoSubscriber`，`Interest::
+    // never` 就会被**永久缓存**进这个全局 callsite——此后包括本测试在
+    // 内的任何线程再触发这一行 `warn!`，都会被这个缓存的 `Interest`
+    // 直接短路掉，`CaptureSubscriber::event` 一次都不会被调用。线程数
+    // 越多这个竞争窗口越容易被撞上。
+    //
+    // 换成 `set_global_default`（进程级，只能设置一次——本 crate 的测试
+    // 二进制里只有这一处调用，不会跟别的地方冲突）之后，第一个撞上这个
+    // callsite 的线程看到的就是这同一个全局 dispatcher，`Interest`
+    // 缓存与实际生效的 subscriber 不会再对不上。
 
     /// 只把 event 的字段格式化进一个字符串，够用来做"包不包含某段文本"
     /// 的判断——不需要时间戳、级别这些 `tracing-subscriber::fmt` 才关心
@@ -572,7 +594,13 @@ mod tests {
         const FROM_APPLIANCE_MARKER: &str = "RMC-FROM-APPLIANCE-3e5b9d02-DO-NOT-LOG";
 
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let _guard = tracing::subscriber::set_default(CaptureSubscriber(captured.clone()));
+        // R59：见上面的说明，必须是 set_global_default，不能是线程局部
+        // 的 set_default——callsite 的 Interest 缓存是进程全局的。这是
+        // 本 crate 测试二进制里唯一一处调用，预期总能成功；如果失败
+        // （意味着别处也调用了 set_global_default），直接 panic 比"悄悄
+        // 忽略、然后在一个空缓冲区上得到一条不知所云的失败"更诚实。
+        tracing::subscriber::set_global_default(CaptureSubscriber(captured.clone()))
+            .expect("这是测试二进制里唯一一次 set_global_default 调用，预期总能成功");
 
         let appliance_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let appliance_addr = appliance_listener.local_addr().unwrap();
