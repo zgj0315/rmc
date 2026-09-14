@@ -2,9 +2,21 @@
 //! 运行前先执行 crates/rmc-core/tests/fetch-harness-cert.sh。
 //!
 //! 宿主要能把 "gateway.test" 解析到 127.0.0.1——方案约定是在 /etc/hosts
-//! 里加一行 `127.0.0.1 gateway.test`（CI 由工作流写入），跟
-//! tests/transport.rs 里 `#[ignore]` 的 `connect_wraps_tls_and_delivers_the_ssh_banner`
-//! 依赖的是同一个前提，不是本文件新引入的要求。
+//! 里加一行 `127.0.0.1 gateway.test`，跟 tests/transport.rs 里
+//! `#[ignore]` 的 `connect_wraps_tls_and_delivers_the_ssh_banner` 依赖的是
+//! 同一个前提，不是本文件新引入的要求。
+//!
+//! R46（第二轮评审发现）：上一版这里写"CI 由工作流写入"，不是事实——
+//! `.github/workflows/gateway.yml` 只在 `paths: ["gateway/**", ...]`
+//! 变化时触发，`crates/**` 底下的改动不会触发任何工作流；这个仓库目前
+//! 没有任何工作流会跑 `cargo build`/`cargo test`，自然也没有一步写
+//! `/etc/hosts`。这意味着本文件下面十条 `#[ignore]` 用例（连同
+//! tests/transport.rs 的那四条）事实上从未被任何自动化跑过，只能靠人
+//! 手动在配好 /etc/hosts、起好 gateway/test-env 的机器上跑
+//! `-- --ignored` 才会执行——在这一天到来之前，如实说：这些用例哪里都
+//! 不会跑。协议级别的等价行为改由 `crate::ssh::test_support` 里那个
+//! 进程内 russh 服务端跑在每一次普通 `cargo test` 里（见 R40），不依赖
+//! docker/DNS/hosts，是当前唯一真正被跑到的证据来源。
 //!
 //! `--test-threads=1` 是必须的：`establishes_and_reports_first_seen_host_key`
 //! 与 `second_tunnel_on_the_same_port_is_port_busy` 都会真的把 22001 绑起来，

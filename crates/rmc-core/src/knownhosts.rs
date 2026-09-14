@@ -572,6 +572,33 @@ mod tests {
         assert_eq!(fingerprint_of(blob), via_new);
     }
 
+    /// R44（第二轮评审发现）：上面那条测试的两边都是本模块自己的函数
+    /// （`fingerprint_of` 与 `fingerprint_sha256`），只要哪天两边同时改坏
+    /// （比如都换成别的哈希算法、都少截一段），断言照样相等，运维手册要求
+    /// 的"跟 `ssh-keygen -lf` 肉眼核对"这条现实世界的性质却已经悄悄碎了，
+    /// 没有任何测试会变红。
+    ///
+    /// 这里的 blob 和期望指纹都不是本模块算出来的：blob 是
+    /// `gateway/test-env` 里 `tunnel_host_ed25519_key.pub` 的公钥字段
+    /// （原始 OpenSSH base64，标准填充），期望指纹是对着同一把 key 跑
+    /// `ssh-keygen -lf` 读出来的，两者都是从 harness 里复制出来的固定值，
+    /// 不经过本模块任何函数计算。
+    #[test]
+    fn fingerprint_of_matches_a_golden_vector_from_the_harness_host_key() {
+        use base64::Engine;
+        // gateway/test-env 里 tunnel_host_ed25519_key.pub 的公钥字段：
+        //   ssh-ed25519 <这一串> root@buildkitsandbox
+        const HARNESS_HOST_KEY_BASE64: &str =
+            "AAAAC3NzaC1lZDI1NTE5AAAAIBEJjzpvcneu1b/9vNy6VGfPT4e4fI3VuHI4ZmmMxCvl";
+        // `docker exec ... ssh-keygen -lf tunnel_host_ed25519_key.pub` 的输出。
+        const EXPECTED: &str = "SHA256:6gVA/NoPLo9zNp8Ch4uQW0Ieu3Nk10kJxCxLdidvQTM";
+
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(HARNESS_HOST_KEY_BASE64)
+            .expect("测试夹具里的 base64 常量本身必须合法");
+        assert_eq!(fingerprint_of(&blob).as_str(), EXPECTED);
+    }
+
     // --- 以下是本任务补的用例 ---
 
     // 这是最关键的一条：只用同一个 KnownHosts 实例前后调用两次 check，

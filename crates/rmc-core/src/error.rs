@@ -251,8 +251,15 @@ mod tests {
         // Handler trait 要求的 From<russh::Error>：这两个变体说明这条连接
         // 压根没有能力完成认证，落 Auth 而不是 Network——退避重连解决不了
         // "密钥格式不对"或"没有可用认证方法"。
+        //
+        // R45（第二轮评审发现）：上一版这里只喂了 NoAuthMethod 一个变体，
+        // `Keys(_) |` 那半条分支删掉测试也照样绿——两个变体都要单独喂一遍。
         assert_eq!(
             Error::from(russh::Error::NoAuthMethod).class(),
+            ErrorClass::Auth
+        );
+        assert_eq!(
+            Error::from(russh::Error::Keys(russh::keys::Error::CouldNotReadKey)).class(),
             ErrorClass::Auth
         );
     }

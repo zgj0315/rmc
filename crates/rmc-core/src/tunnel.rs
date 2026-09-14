@@ -27,6 +27,43 @@
 //! `SshTunnelFactory`/`TunnelParams`；这里拿到的应当已经是校验过的值，
 //! 这道契约没有编译期强制力，只能算文档承诺，读到这段注释的人（包括
 //! Task 10 的作者）应当把它当成前置条件对待。
+//!
+//! ## R48（第二轮评审）：加了进程内 russh 服务端（`ssh::test_support`，
+//! 见 R40）之后，这条决定要不要翻过来？
+//!
+//! 评审的论点是对的，而且指向了一个我最初没意识到的机会：
+//! `ssh::test_support` 这份新证据全部活在 `src/` 里，是
+//! `#[cfg(test)] mod`，天然能看见 `ValidatedAddresses::for_test`（跟
+//! `config.rs` 自己的单测是同一个可见性）——如果只看这份新证据要不要
+//! 校验过的地址，答案是"不需要动 R20"，因为它压根不经过
+//! `TunnelParams`/`SshTunnelFactory`（`establish_over` 是
+//! `pub(crate)`，测试直接拿裸 `HostPort` 调它）。真正的问题是：这份新
+//! 证据的存在，有没有让"把 `ValidatedAddresses` 塞进
+//! `TunnelParams`/`SshTunnelFactory`"这件事本身变得免费？
+//!
+//! 答案仍然是没有，而且现在可以摆出比第一轮更具体的代价：
+//! `tests/ssh_tunnel.rs`——docker 版集成测试，不是 `ssh::test_support`
+//! ——依然是外部 crate，依然用 `127.0.0.1:2322` 当一体机地址（docker
+//! 端口映射决定的，不是能改的测试选择），`ValidatedAddresses::validate`
+//! 依然会拒绝这个地址，`for_test` 依然是它唯一的旁路且依然
+//! `pub(crate)`。真把 `TunnelParams.appliance` 换成
+//! `ValidatedAddresses`，后果不是"那十条 `#[ignore]` 用例又多验证不了
+//! 一点"（R40 已经说明它们本来就没人自动跑），而是`tests/ssh_tunnel.rs`
+//! 整个文件**编译不过**——`cargo test -p rmc-core` 会在编译阶段直接
+//! 失败，连那 1 条没有 `#[ignore]` 的
+//! `password_never_appears_in_debug_output` 也带着一起挂掉。这比"少一份
+//! 冗余覆盖"重得多，是把一个当前编译通过、部分可用的文件变成完全不能用
+//! 的文件。评审明确拒绝的两条旁路（`test-harness` feature、让一体机
+//! 主机名解析到回环）都是想绕开这堵墙，而不是真的把墙拆掉——照办只会
+//! 制造新的口子，不会让代价消失。
+//!
+//! 所以：**权衡过，仍然不采用**。`ssh::test_support` 的价值是独立的——
+//! 它不需要 `ValidatedAddresses` 就已经把 host key 校验、认证、端口
+//! 注册这些安全关键路径钉进了每一次 `cargo test`（R40），这份收益已经
+//! 拿到手，不依赖这里的决定。如果将来 `tests/ssh_tunnel.rs` 被换掉或者
+//! 不再需要真的对着 docker 里那个 127.0.0.1 一体机跑，这堵墙就会自己
+//! 消失，到时候应该重新算一遍这笔账，而不是现在就为了凑成"进程内证据
+//! 有了，所以类型约束也该跟上"这个直觉去拆一个还在用的外部测试文件。
 
 use crate::addr::HostPort;
 use crate::error::Result;

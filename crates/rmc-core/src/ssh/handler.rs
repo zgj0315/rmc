@@ -17,9 +17,12 @@
 //! `accept()`/`reject()`，等效于自动拒绝这条通道。把它随手命名成
 //! `_reply` 能让代码编译通过、隧道正常连上、认证成功、反向端口也注册
 //! 成功，但只要真的有人连进反向端口，通道会被悄悄拒绝，什么都转发不了
-//! ——编译器抓不出这个问题，只能靠真的对着 gateway/test-env 跑一次
-//! （见 tests/ssh_tunnel.rs 里的
-//! `forwarded_channel_is_accepted_not_silently_rejected`）。
+//! ——编译器抓不出这个问题。`crate::ssh::test_support` 里的进程内 russh
+//! 服务端在协议层面直接验证这一点（服务端主动开一个
+//! forwarded-tcpip 通道，断言收到的是 CHANNEL_OPEN_CONFIRMATION 而不是
+//! CHANNEL_OPEN_FAILURE，见 R40），`tests/ssh_tunnel.rs` 里
+//! `establishes_and_reports_first_seen_host_key` 末尾另有一段对着真实
+//! gateway/test-env 的原始 TCP 探测作为补充。
 
 use crate::addr::HostPort;
 use crate::error::Error;
@@ -66,7 +69,20 @@ impl russh::client::Handler for ClientHandler {
         // knownhosts::fingerprint_of 的文档——直接产出 Fingerprint，不
         // 在这个安全关键路径上留一个本可以避免的 expect（R35）。
         let key = server_public_key.public_key();
-        let fp = fingerprint_of(&key.public_key_bytes());
+        let blob = key.public_key_bytes();
+        // R47（第二轮评审发现）：`public_key_bytes()` 上游实现是
+        // `key_data().encoded().unwrap_or_default()`——编码失败时悄悄
+        // 退化成空 `Vec`，而不是返回错误。空 blob 的指纹是一个固定值
+        // （`SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU`，空字符串
+        // 的 SHA256），会匹配**任何**同样触发了编码失败的服务端——这在
+        // 实践中触发不了（当前支持的 key 类型都能正常编码），但拒绝它
+        // 只要两行，没有理由留着这个口子。
+        if blob.is_empty() {
+            return Err(Error::SshTransport(
+                "服务端公钥编码为空，无法计算指纹".into(),
+            ));
+        }
+        let fp = fingerprint_of(&blob);
         match self.known_hosts.check(&self.gateway, &fp)? {
             Verdict::FirstSeen => {
                 *self.verdict.lock().unwrap() = Some((fp.as_str().to_string(), true));
@@ -94,17 +110,27 @@ impl russh::client::Handler for ClientHandler {
         reply: russh::client::ChannelOpenHandle,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
-        // 只接受自己注册过的端口和地址，防止服务端把别处的通道塞进来——
-        // 全局约束：客户端请求的监听地址恒为 "127.0.0.1"，Gateway 的
-        // forwarded-tcpip 消息按 OpenSSH 的实现会原样回显这个地址（跟
-        // 实际绑定在哪个地址无关，GatewayPorts yes 之下实际绑定恒为
-        // 通配、由服务端决定），所以这里比较的是"跟我们请求时说的一致"，
-        // 不是在断言真实绑定地址。
-        if connected_port as u16 != self.reverse_port || connected_address != "127.0.0.1" {
+        // 只接受自己注册过的端口，防止服务端把别处的通道塞进来。
+        //
+        // R42（第二轮评审发现）：上一版这里还比较了
+        // `connected_address != "127.0.0.1"`，已经删掉——两个字段都是
+        // 服务端自己决定填什么的（这条消息报的是 Gateway 认为的"连接
+        // 目标"，不是客户端能验证的东西），而这个账号只注册了一个端口，
+        // 端口比对已经把范围收得够窄了，地址比对不能再排除任何攻击者
+        // 服务端能满足的情况——不划走一分风险。它划走的是可用性：任何
+        // 一个把这个字段回显成别的写法的 Gateway（不同的 sshd 实现、
+        // Dropbear、IPv6 规整化写法、未来某个 OpenSSH 版本改了回显格式）
+        // 会导致**全部**转发通道被拒绝，而 `establish()` 前面几步毫无
+        // 异常——`Ok`、`Authenticated`、`ForwardRegistered` 照样发出去，
+        // 界面显示隧道健康，实际什么都转发不了。这正是 R4 说的"通道被
+        // 悄悄拒绝"那个后果，只是触发路径从"代码写错 `_reply`"换成了
+        // "服务端回显的字符串跟预期不一样"，两条路径殊途同归，加这个
+        // 检查反而是在制造它，不是在防它。
+        if connected_port as u16 != self.reverse_port {
             tracing::warn!(
                 connected_address,
                 connected_port,
-                "拒绝未注册的 forwarded-tcpip 通道"
+                "拒绝未注册端口的 forwarded-tcpip 通道"
             );
             reply
                 .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
