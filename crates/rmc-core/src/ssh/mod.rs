@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::knownhosts::KnownHosts;
 use crate::platform::Conn;
 use crate::transport::Transport;
-use crate::tunnel::{TunnelFactory, TunnelHandle, TunnelMsg, TunnelParams};
+use crate::tunnel::{TunnelFactory, TunnelHandle, TunnelMsg, TunnelParams, UnknownSessionId};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +35,7 @@ impl SshTunnelFactory {
 
 pub struct SshTunnel {
     session: russh::client::Handle<handler::ClientHandler>,
-    channels: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, pump::Closer>>>,
+    channels: pump::SharedChannels,
 }
 
 /// 生产用的 russh 客户端 `Config`。单列成函数有两个理由：
@@ -105,6 +105,7 @@ pub(crate) async fn establish_over(
     let config = client_config();
 
     let verdict = Arc::new(std::sync::Mutex::new(None));
+    let channels = pump::new_shared_channels();
     let handler = handler::ClientHandler {
         gateway: gateway.clone(),
         known_hosts: known_hosts.clone(),
@@ -113,6 +114,7 @@ pub(crate) async fn establish_over(
         tx: tx.clone(),
         next_session_id: Arc::new(AtomicU64::new(1)),
         verdict: verdict.clone(),
+        channels: channels.clone(),
     };
 
     // R3（预扫描已发现）：不在这里 `.map_err(...)` 包一层。
@@ -174,19 +176,22 @@ pub(crate) async fn establish_over(
         })
         .await;
 
-    Ok(Box::new(SshTunnel {
-        session,
-        channels: Arc::new(tokio::sync::Mutex::new(Default::default())),
-    }))
+    Ok(Box::new(SshTunnel { session, channels }))
 }
 
 #[async_trait::async_trait]
 impl TunnelHandle for SshTunnel {
-    async fn close_remote_session(&self, id: u64) -> Result<()> {
-        if let Some(closer) = self.channels.lock().await.remove(&id) {
-            closer.close();
+    async fn close_remote_session(&self, id: u64) -> std::result::Result<(), UnknownSessionId> {
+        // 锁是 std::sync::Mutex：这里只做一次哈希表移除，不跨越任何
+        // `.await`，没有理由为了这一步引入 tokio::sync::Mutex 的异步开销
+        // ——见 pump::SharedChannels 上关于插入/移除时机的说明。
+        match self.channels.lock().unwrap().remove(&id) {
+            Some(closer) => {
+                closer.close();
+                Ok(())
+            }
+            None => Err(UnknownSessionId(id)),
         }
-        Ok(())
     }
 
     async fn shutdown(self: Box<Self>) {

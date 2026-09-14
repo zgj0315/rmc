@@ -22,87 +22,29 @@
 //! 与 `second_tunnel_on_the_same_port_is_port_busy` 都会真的把 22001 绑起来，
 //! 多个用例并发跑会互相抢这个端口。
 
-use rmc_core::addr::HostPort;
 use rmc_core::error::{Error, ErrorClass};
 use rmc_core::knownhosts::{Fingerprint, KnownHosts};
-use rmc_core::platform::{NoProxy, NoProxyAuth};
-use rmc_core::ssh::SshTunnelFactory;
-use rmc_core::transport::tls::TlsRoots;
-use rmc_core::transport::Transport;
-use rmc_core::tunnel::{TunnelFactory, TunnelMsg, TunnelParams};
-use std::sync::Arc;
+use rmc_core::tunnel::{TunnelFactory, TunnelMsg};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
-use zeroize::Zeroizing;
 
-const TUNNEL_USER: &str = "tunnel-zhang";
-const TUNNEL_PW: &str = "tunnel-init-pw";
-const REVERSE_PORT: u16 = 22001;
-
-fn tmp_known_hosts() -> KnownHosts {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    KnownHosts::open(std::env::temp_dir().join(format!("rmc-kh-{n}/known_hosts")))
-}
-
-fn gateway() -> HostPort {
-    "gateway.test:8443".parse().unwrap()
-}
-
-fn appliance() -> HostPort {
-    // 一体机在测试环境里对宿主发布为 127.0.0.1:2322，但转发目标由
-    // 客户端自己拨号，所以这里用宿主可达的地址。
-    "127.0.0.1:2322".parse().unwrap()
-}
-
-fn factory(known_hosts: KnownHosts) -> SshTunnelFactory {
-    let mut roots = TlsRoots::webpki();
-    roots
-        .with_extra_pem(
-            &std::fs::read(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/data/harness-ca.pem"
-            ))
-            .expect("先运行 tests/fetch-harness-cert.sh"),
-        )
-        .unwrap();
-    let transport = Arc::new(Transport::new(
-        Arc::new(NoProxy),
-        Arc::new(NoProxyAuth),
-        roots,
-    ));
-    SshTunnelFactory::new(transport, Arc::new(known_hosts), gateway())
-}
-
-fn params(password: &str, port: u16) -> TunnelParams {
-    TunnelParams {
-        username: TUNNEL_USER.into(),
-        password: Zeroizing::new(password.to_string()),
-        reverse_port: port,
-        appliance: appliance(),
-    }
-}
+mod common;
+use common::*;
 
 /// `Box<dyn TunnelHandle>` 上没有 `Debug`（`TunnelHandle` trait 本身没有
 /// 也不该有这个约束），`Result::unwrap_err` 要求 `Ok` 分支实现 `Debug`，
 /// 直接 `unwrap_err()` 编译不过——跟 tests/transport.rs 里 `expect_err`
 /// 是同一个原因，用一次 `match` 换掉它。
+///
+/// 这个辅助只有这个文件需要（`forwarding.rs` 里没有一条测试断言
+/// `establish()` 本身失败），所以留在本地，不搬进 `tests/common`——搬过去
+/// 会在 `forwarding.rs` 那个二进制里变成没人调用的 dead_code。
 fn expect_err(r: Result<Box<dyn rmc_core::tunnel::TunnelHandle>, Error>) -> Error {
     match r {
         Ok(_) => panic!("期望建立隧道失败，实际却成功了"),
         Err(e) => e,
     }
-}
-
-async fn next_msg(rx: &mut mpsc::Receiver<TunnelMsg>) -> TunnelMsg {
-    tokio::time::timeout(Duration::from_secs(20), rx.recv())
-        .await
-        .expect("等待隧道消息超时")
-        .expect("隧道消息通道已关闭")
 }
 
 #[tokio::test]

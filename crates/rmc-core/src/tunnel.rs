@@ -134,10 +134,25 @@ pub trait TunnelFactory: Send + Sync {
     ) -> Result<Box<dyn TunnelHandle>>;
 }
 
+/// 关闭一条"当前不存在"的远程会话——可能是这个 id 从未被分配过，也可能是
+/// 会话已经自然结束、实现已经把它从账本里摘掉。这两种情况在调用方看来都
+/// 不该被误判成"隧道出问题了"，所以不走 `crate::error::Error` 那套由
+/// `ErrorClass` 驱动重连行为的分类体系——这是一次性的单会话操作，不代表
+/// 隧道本身的健康状况，不需要、也不应该触发任何重连逻辑。
+///
+/// 用来区分"成功关闭了一条真实存在的会话"（`Ok(())`）与"这条会话现在
+/// 压根不在"（`Err(UnknownSessionId)`）——见 `ssh::pump::SharedChannels`
+/// 上关于账本插入/移除时机的说明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("远程会话 {0} 不存在（从未打开，或已经自然结束）")]
+pub struct UnknownSessionId(pub u64);
+
 #[async_trait::async_trait]
 pub trait TunnelHandle: Send + Sync {
-    /// 断开某一条远程会话，隧道本身保持。
-    async fn close_remote_session(&self, id: u64) -> Result<()>;
+    /// 断开某一条远程会话，隧道本身保持。`id` 不对应任何一条当前打开的
+    /// 会话时返回 `Err(UnknownSessionId)`——这个 id 从未存在过、或者对应
+    /// 的会话已经自然结束，两种情况都不该被上层误当成"关闭失败"处理。
+    async fn close_remote_session(&self, id: u64) -> std::result::Result<(), UnknownSessionId>;
     async fn shutdown(self: Box<Self>);
 }
 

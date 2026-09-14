@@ -44,6 +44,11 @@ pub struct ClientHandler {
     /// 认证之前调用，用 `Mutex` 而不是直接返回值——它是 trait 方法，
     /// 签名由 russh 定死，没有别的地方能把结果带出去。
     pub verdict: Arc<Mutex<Option<(String, bool)>>>,
+    /// 与 `SshTunnel` 共享的"当前打开的会话"账本，见
+    /// `super::pump::SharedChannels` 上的文档。每次 accept 一条
+    /// forwarded-tcpip 通道都把它原样传给 `pump::spawn`——插入/移除账本
+    /// 的时机由 `pump::run` 自己负责，这里不直接碰这个 Mutex。
+    pub channels: super::pump::SharedChannels,
 }
 
 impl ClientHandler {
@@ -141,11 +146,13 @@ impl russh::client::Handler for ClientHandler {
         reply.accept().await;
 
         let id = self.alloc_session_id();
-        let appliance = self.appliance.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            super::pump::run(id, channel, appliance, tx).await;
-        });
+        super::pump::spawn(
+            id,
+            channel,
+            self.appliance.clone(),
+            self.tx.clone(),
+            self.channels.clone(),
+        );
         Ok(())
     }
 }

@@ -1,26 +1,26 @@
-//! forwarded-tcpip 通道到一体机的双向转发。
+//! forwarded-tcpip 通道到一体机的双向转发与逐会话流量账目。
 //!
-//! 占位实现：只负责接住 `ClientHandler::server_channel_open_forwarded_tcpip`
-//! 已经 accept 过的 `Channel`，暂不转发任何字节——真正的双向拷贝、
-//! `ApplianceDialFailed`/`RemoteSessionOpened`/`RemoteSessionClosed`/
-//! `RemoteSessionBytes` 上报都留给 Task 8。
-//!
-//! 这个函数不能删掉参数直接返回：`Channel<Msg>` 在这里被 `run` 拿到
-//! 所有权，函数体什么都不做也没关系——`Channel` 本体（不是
-//! `into_stream()` 之后包了 `ChannelCloseOnDrop` 的那个流）被 drop 时不会
-//! 主动发送 channel-close，所以持有它但不读写，效果是"通道保持打开但不
-//! 转发任何数据"，不是"悄悄把通道关掉"。这一点被
-//! `establishes_and_reports_first_seen_host_key`（tests/ssh_tunnel.rs）
-//! 末尾那段原始 TCP 探测用来证明 `reply.accept()` 真的被调用过：一个
-//! 连到反向端口的原始 TCP 客户端会一直连着、读不到任何字节也读不到
-//! EOF，而不是刚连上就被服务端挂断。
+//! 一条 `Channel<client::Msg>` 对应工程师那一侧的一次连接（由
+//! `ClientHandler::server_channel_open_forwarded_tcpip` accept 出来）；这里
+//! 要做的只有两件事：把它和一体机 SSH 端口之间的字节原样搬过去搬回来，
+//! 以及记下搬了多少——**转发的内容一个字节都不许进日志**，那是远程工程师
+//! 和一体机之间的 SSH 流量，账目只记数量，不记内容。
 
 use crate::addr::HostPort;
 use crate::tunnel::TunnelMsg;
-use tokio::sync::mpsc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
 
-/// 关闭某条远程会话的句柄。
-pub struct Closer(#[allow(dead_code)] tokio::sync::oneshot::Sender<()>);
+/// 流量上报周期。界面每两秒看到一次增量足够，过密会刷爆事件通道。
+pub const BYTES_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// 关闭某条远程会话的句柄，只存在于 [`SharedChannels`] 账本里。
+pub struct Closer(oneshot::Sender<()>);
 
 impl Closer {
     pub fn close(self) {
@@ -28,11 +28,487 @@ impl Closer {
     }
 }
 
-pub async fn run(
-    _id: u64,
-    _channel: russh::Channel<russh::client::Msg>,
-    _appliance: HostPort,
-    _tx: mpsc::Sender<TunnelMsg>,
+/// `ClientHandler`（登记新会话）与 `SshTunnel`（响应 `close_remote_session`）
+/// 共享的"当前打开的会话"账本。
+///
+/// 账本里只有**真正打开成功**的会话：插入发生在 `run()` 里一体机拨号成功、
+/// 紧跟着 `RemoteSessionOpened` 发出之后；移除发生在 `run()` 结束前，不管
+/// 结束的原因是正常 EOF、写失败，还是被 `close_remote_session` 主动关闭。
+///
+/// 这个设计不是 brief 原始草稿的写法——草稿里 `spawn(...)` 直接返回
+/// `Closer`，交给调用方（`ClientHandler`）自己塞进账本，账本从此只增不减：
+/// 一条会话自然结束之后，它的 `Closer` 会一直留在表里，直到进程退出。这样
+/// `close_remote_session` 没法区分"这个 id 从未存在过"和"这个 id 存在过、
+/// 但会话早就自然结束了"——两种情况命中的都是"表里有一个失效的
+/// `oneshot::Sender`"，调用 `.close()` 发送失败会被默默吞掉，返回的都是
+/// `Ok(())`。把插入和移除都收进 `run()` 自己，账本在任意时刻的内容精确
+/// 等于"当前仍然打开的会话"，`close_remote_session` 才谈得上区分"关掉了
+/// 一条真会话"与"这个 id 现在压根不在"——后者不区分"从未存在"和"已经
+/// 自然结束"，但这两种情况对调用方而言本来就该给出同一个信号："没有什么
+/// 好关的"，不是一次静默的、看似成功实则什么都没发生的操作。
+pub type SharedChannels = Arc<Mutex<HashMap<u64, Closer>>>;
+
+/// 新建一个空账本，供 `establish_over` 在构造 `ClientHandler`/`SshTunnel`
+/// 时共用同一个实例。
+pub fn new_shared_channels() -> SharedChannels {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// 把 [`run`] 丢进独立的 tokio 任务。调用方（`ClientHandler`）不需要自己
+/// `tokio::spawn`，也不需要关心账本的插入/移除时机——这两件事全部收在
+/// `run` 内部完成，见 [`SharedChannels`] 上的文档。
+pub fn spawn(
+    id: u64,
+    channel: russh::Channel<russh::client::Msg>,
+    appliance: HostPort,
+    tx: mpsc::Sender<TunnelMsg>,
+    channels: SharedChannels,
 ) {
-    // Task 8 实现：拨号一体机、双向拷贝字节、上报 TunnelMsg。
+    tokio::spawn(run(id, channel, appliance, tx, channels));
+}
+
+/// 拨号一体机、登记账本、双向转发，直到通道结束。
+///
+/// 拨号失败时发送 `ApplianceDialFailed` 并显式 `eof()` + `close()` 这条
+/// 通道——只发 `eof()`（brief 原始草稿的写法）不够：`Channel` 本体被 drop
+/// 时不会主动发送 channel-close（这一点在这个占位实现被替换之前就已经在
+/// 模块文档里写明，见 git 历史），只 `eof()` 会让通道停在"再也不会有数据
+/// 但还没关闭"的半开状态，工程师那一侧连的是一条真实 TCP 连接，会一直
+/// 挂着等不到任何响应，而不是像"一体机确实拒绝了连接"那样迅速失败。
+pub async fn run(
+    id: u64,
+    channel: russh::Channel<russh::client::Msg>,
+    appliance: HostPort,
+    tx: mpsc::Sender<TunnelMsg>,
+    channels: SharedChannels,
+) {
+    let upstream = match TcpStream::connect((appliance.host(), appliance.port())).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx
+                .send(TunnelMsg::ApplianceDialFailed {
+                    id,
+                    reason: format!("连接 {appliance} 失败：{e}"),
+                })
+                .await;
+            let _ = channel.eof().await;
+            let _ = channel.close().await;
+            return;
+        }
+    };
+    let _ = upstream.set_nodelay(true);
+
+    // 只有拨号成功之后才登记进账本——见 SharedChannels 上的文档：登记的
+    // 时机必须晚于"调用方第一次有可能合法地得知这个 id"（也就是
+    // RemoteSessionOpened 发出）之后，否则一个抢在通知之前用这个 id 调用
+    // close_remote_session 的调用者，会静默命中一个还没真正开始转发的
+    // 会话，观察不到任何有意义的效果。
+    let (close_tx, mut close_rx) = oneshot::channel();
+    channels.lock().unwrap().insert(id, Closer(close_tx));
+    let _ = tx.send(TunnelMsg::RemoteSessionOpened { id }).await;
+
+    let to_appliance = Arc::new(AtomicU64::new(0));
+    let from_appliance = Arc::new(AtomicU64::new(0));
+
+    // 周期上报累计计数，界面据此显示流量。上报的是累计值不是增量，最后
+    // 结束前那次补报（见函数末尾）用的是同一套累计值，跟这里语义一致。
+    let reporter = {
+        let tx = tx.clone();
+        let to = to_appliance.clone();
+        let from = from_appliance.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(BYTES_REPORT_INTERVAL);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let msg = TunnelMsg::RemoteSessionBytes {
+                    id,
+                    to_appliance: to.load(Ordering::Relaxed),
+                    from_appliance: from.load(Ordering::Relaxed),
+                };
+                if tx.send(msg).await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+
+    let (mut up_read, mut up_write) = tokio::io::split(upstream);
+    let mut ch_stream = channel.into_stream();
+
+    let pump = async {
+        let mut ch_buf = vec![0u8; 32 * 1024];
+        let mut up_buf = vec![0u8; 32 * 1024];
+        loop {
+            tokio::select! {
+                // 工程师 -> 一体机：从 SSH 通道读，写进一体机的 TCP 连接。
+                r = ch_stream.read(&mut ch_buf) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if up_write.write_all(&ch_buf[..n]).await.is_err() {
+                            break;
+                        }
+                        to_appliance.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                },
+                // 一体机 -> 工程师：从一体机的 TCP 连接读，写回 SSH 通道。
+                r = up_read.read(&mut up_buf) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if ch_stream.write_all(&up_buf[..n]).await.is_err() {
+                            break;
+                        }
+                        from_appliance.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                },
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = pump => {}
+        _ = &mut close_rx => {}
+    }
+
+    reporter.abort();
+    // 从账本摘除必须发生在这里，不管上面的 select 是怎么结束的——这是
+    // SharedChannels 账本"任意时刻的内容精确等于当前仍打开的会话"这条
+    // 不变式的另一半（插入见上文）。摘除之后，任何人再拿这个 id 调用
+    // close_remote_session 都会被判定为"不存在"，不会静默命中一个已经
+    // 结束的会话。
+    channels.lock().unwrap().remove(&id);
+    let _ = ch_stream.shutdown().await;
+    let _ = up_write.shutdown().await;
+
+    // 结束前补一次最终计数，确保界面看到的最后一条 RemoteSessionBytes
+    // 反映的是完整的总量，再报关闭。
+    let _ = tx
+        .send(TunnelMsg::RemoteSessionBytes {
+            id,
+            to_appliance: to_appliance.load(Ordering::Relaxed),
+            from_appliance: from_appliance.load(Ordering::Relaxed),
+        })
+        .await;
+    let _ = tx.send(TunnelMsg::RemoteSessionClosed { id }).await;
+}
+
+#[cfg(test)]
+mod tests {
+    //! 这里的测试全部跑在 `crate::ssh::test_support` 的进程内假 Gateway
+    //! 上——不需要 docker、DNS、`/etc/hosts`，`cargo test -p rmc-core` 任何
+    //! 一次都会跑到。"一体机"用测试自己起的一个真实 `TcpListener`
+    //! 冒充：pump 从工程师这一侧读到什么字节、真的原样出现在这个监听器
+    //! accept 出来的连接上，是这份证据比"能连上"更强的地方——两个方向用
+    //! 长度不同、内容不同的payload，一旦读写方向被接反、或者账目的两个
+    //! 字段被换标签，测试会直接读到错误的字节或者错误的计数，而不是巧合
+    //! 蒙混过关。
+
+    use super::*;
+    use crate::ssh::establish_over;
+    use crate::ssh::test_support::*;
+    use crate::tunnel::{TunnelParams, UnknownSessionId};
+    use tokio::net::TcpListener;
+    use zeroize::Zeroizing;
+
+    fn params_with_appliance(appliance: HostPort) -> TunnelParams {
+        TunnelParams {
+            username: TEST_USER.into(),
+            password: Zeroizing::new(TEST_PASSWORD.to_string()),
+            reverse_port: 22001,
+            appliance,
+        }
+    }
+
+    /// 会让这条测试变红的实现改法：
+    /// - 把 `up_write`/`ch_stream` 两个读写分支的读源或写目标对调（方向
+    ///   接反）——一体机侧再也读不到 `to_appliance_payload`，或者读到的是
+    ///   `from_appliance_payload` 的内容。
+    /// - 把 `RemoteSessionBytes` 里 `to_appliance`/`from_appliance` 两个
+    ///   字段的赋值对调——两个方向用了不同长度的 payload，标签一旦对调，
+    ///   `assert_eq!` 会拿到互相调换过的数字，立刻不等。
+    /// - 把上报用的计数器换成某个只在实现内部才看得到的值（例如只报
+    ///   "读了几次" 而不是"读了多少字节"）——这里比对的是测试自己在
+    ///   两端独立数出来的字节数，不是抄实现内部算出来的数。
+    #[tokio::test]
+    async fn forwards_bytes_in_both_directions_with_independently_counted_totals() {
+        let appliance_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let appliance_addr = appliance_listener.local_addr().unwrap();
+        let appliance = HostPort::new("127.0.0.1", appliance_addr.port()).unwrap();
+
+        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let known_hosts = Arc::new(tmp_known_hosts());
+        let (tx, mut rx) = mpsc::channel(64);
+        let handle = with_timeout(
+            "establish_over",
+            establish_over(
+                conn,
+                &test_gateway_hostport(),
+                &known_hosts,
+                params_with_appliance(appliance),
+                tx,
+            ),
+        )
+        .await
+        .unwrap();
+        drain_authenticated_and_forward_registered(&mut rx).await;
+        let server_handle = pending.get().await;
+
+        let mut engineer_channel = with_timeout(
+            "channel_open_forwarded_tcpip",
+            server_handle.channel_open_forwarded_tcpip("127.0.0.1", 22001, "203.0.113.5", 54321),
+        )
+        .await
+        .unwrap();
+
+        let (mut appliance_sock, _peer) =
+            with_timeout("一体机 accept 拨入连接", appliance_listener.accept())
+                .await
+                .unwrap();
+
+        let id = match next_msg(&mut rx).await {
+            TunnelMsg::RemoteSessionOpened { id } => id,
+            other => panic!("期望 RemoteSessionOpened，实际 {other:?}"),
+        };
+
+        // 工程师 -> 一体机：10 万字节。
+        let to_appliance_payload = vec![0xABu8; 100_000];
+        with_timeout(
+            "写入 engineer_channel",
+            engineer_channel.data_bytes(to_appliance_payload.clone()),
+        )
+        .await
+        .unwrap();
+
+        let mut got_at_appliance = Vec::new();
+        with_timeout("一体机读取工程师数据", async {
+            let mut buf = [0u8; 8192];
+            while got_at_appliance.len() < to_appliance_payload.len() {
+                let n = appliance_sock.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "一体机侧提前读到 EOF");
+                got_at_appliance.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await;
+        assert_eq!(
+            got_at_appliance, to_appliance_payload,
+            "到达一体机的字节与工程师发出的不一致——方向或内容被改动"
+        );
+
+        // 一体机 -> 工程师：4 万字节，故意用不同的长度：账目字段一旦被
+        // 换标签，这里立刻能数出不一样的数字。
+        let from_appliance_payload = vec![0xCDu8; 40_000];
+        with_timeout(
+            "一体机写回",
+            appliance_sock.write_all(&from_appliance_payload),
+        )
+        .await
+        .unwrap();
+
+        let mut got_at_engineer = Vec::new();
+        with_timeout("engineer_channel 读取一体机数据", async {
+            while got_at_engineer.len() < from_appliance_payload.len() {
+                match engineer_channel.wait().await {
+                    Some(russh::ChannelMsg::Data { data }) => {
+                        got_at_engineer.extend_from_slice(&data);
+                    }
+                    other => panic!("期望 ChannelMsg::Data，实际 {other:?}"),
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            got_at_engineer, from_appliance_payload,
+            "到达工程师侧的字节与一体机发出的不一致——方向或内容被改动"
+        );
+
+        // 关掉一体机侧连接，让 pump 的读循环退出；下面的账目断言比对的是
+        // 上面两段测试代码自己独立数出来的长度，不是实现内部算出来的数。
+        drop(appliance_sock);
+        let mut bytes_report = None;
+        loop {
+            match next_msg(&mut rx).await {
+                TunnelMsg::RemoteSessionBytes {
+                    id: bid,
+                    to_appliance,
+                    from_appliance,
+                } => {
+                    assert_eq!(bid, id);
+                    bytes_report = Some((to_appliance, from_appliance));
+                }
+                TunnelMsg::RemoteSessionClosed { id: cid } => {
+                    assert_eq!(cid, id);
+                    break;
+                }
+                other => panic!("未预期的消息 {other:?}"),
+            }
+        }
+        let (to_appliance, from_appliance) = bytes_report.expect("没有收到 RemoteSessionBytes");
+        assert_eq!(
+            to_appliance,
+            to_appliance_payload.len() as u64,
+            "上报的 to_appliance 字节数与独立计数不一致"
+        );
+        assert_eq!(
+            from_appliance,
+            from_appliance_payload.len() as u64,
+            "上报的 from_appliance 字节数与独立计数不一致"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// 会让这条测试变红的实现改法：把 `run()` 里拨号失败分支的
+    /// `TcpStream::connect(...).await` 之后那个 `Err(e) => { ... return; }`
+    /// 换成继续往下走（例如误把 `Ok`/`Err` 分支写反）——那样这里会等到
+    /// `RemoteSessionOpened` 而不是 `ApplianceDialFailed`，直接 panic。
+    #[tokio::test]
+    async fn unreachable_appliance_reports_dial_failure_and_keeps_the_session_handler_alive() {
+        // 绑一个端口再立刻释放：地址合法，但没有人监听，拨号会立即
+        // 收到 ECONNREFUSED（回环地址上不需要等超时）。
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let appliance = HostPort::new("127.0.0.1", dead_addr.port()).unwrap();
+
+        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let known_hosts = Arc::new(tmp_known_hosts());
+        let (tx, mut rx) = mpsc::channel(64);
+        let handle = with_timeout(
+            "establish_over",
+            establish_over(
+                conn,
+                &test_gateway_hostport(),
+                &known_hosts,
+                params_with_appliance(appliance),
+                tx,
+            ),
+        )
+        .await
+        .unwrap();
+        drain_authenticated_and_forward_registered(&mut rx).await;
+        let server_handle = pending.get().await;
+
+        let mut channel1 = with_timeout(
+            "第一次 channel_open_forwarded_tcpip",
+            server_handle.channel_open_forwarded_tcpip("127.0.0.1", 22001, "203.0.113.5", 1),
+        )
+        .await
+        .unwrap();
+        let id1 = match next_msg(&mut rx).await {
+            TunnelMsg::ApplianceDialFailed { id, reason } => {
+                assert!(!reason.is_empty(), "拨号失败原因不能为空");
+                id
+            }
+            other => panic!("期望 ApplianceDialFailed，实际 {other:?}"),
+        };
+
+        // 正面证据：通道真的被关闭了（eof + close），不是停在"再也不会有
+        // 数据但还没关闭"的半开状态——工程师那一侧连的是一条真实 TCP
+        // 连接，只 eof 不 close 会让它一直挂着等不到任何响应。
+        let mut saw_close = false;
+        let deadline_msgs = 4;
+        for _ in 0..deadline_msgs {
+            match with_timeout("等待通道关闭", channel1.wait()).await {
+                Some(russh::ChannelMsg::Eof) => continue,
+                Some(russh::ChannelMsg::Close) | None => {
+                    saw_close = true;
+                    break;
+                }
+                other => panic!("未预期的通道消息 {other:?}"),
+            }
+        }
+        assert!(saw_close, "拨号失败后通道应该被显式关闭，不能停在半开状态");
+
+        // 隧道必须还活着：能再开一条新通道，还是走同一条失败路径——证明
+        // ClientHandler 没有因为这次拨号失败崩掉或者停止处理后续通道，
+        // 不是把整条隧道拆了重建。
+        let _channel2 = with_timeout(
+            "第二次 channel_open_forwarded_tcpip",
+            server_handle.channel_open_forwarded_tcpip("127.0.0.1", 22001, "203.0.113.5", 2),
+        )
+        .await
+        .unwrap();
+        let id2 = match next_msg(&mut rx).await {
+            TunnelMsg::ApplianceDialFailed { id, .. } => id,
+            other => panic!("期望第二次 ApplianceDialFailed，实际 {other:?}"),
+        };
+        assert_ne!(id1, id2, "两次失败的拨号应该分配不同的会话 id");
+
+        // 从未真正打开过的会话 id 不应该出现在账本里——一次失败的拨号
+        // 不该留下一个可以被"关闭"的假会话。
+        assert_eq!(
+            handle.close_remote_session(id1).await,
+            Err(UnknownSessionId(id1)),
+            "拨号失败的 id 不该出现在账本里"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// 会让这条测试变红的实现改法：把"只有拨号成功才插入账本"改回
+    /// brief 草稿的写法（`spawn` 一开始就无条件插入、`run` 结束后从不
+    /// 移除）——那样对一个从未存在过的 id 调用 `close_remote_session`
+    /// 会命中"运气好还是运气不好"的巧合，而对一条已经自然结束的会话
+    /// 再关一次会静默返回 `Ok(())`，两种"不存在"都观察不出来。
+    #[tokio::test]
+    async fn close_remote_session_distinguishes_unknown_id_from_a_real_open_session() {
+        let appliance_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let appliance =
+            HostPort::new("127.0.0.1", appliance_listener.local_addr().unwrap().port()).unwrap();
+
+        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let known_hosts = Arc::new(tmp_known_hosts());
+        let (tx, mut rx) = mpsc::channel(64);
+        let handle = with_timeout(
+            "establish_over",
+            establish_over(
+                conn,
+                &test_gateway_hostport(),
+                &known_hosts,
+                params_with_appliance(appliance),
+                tx,
+            ),
+        )
+        .await
+        .unwrap();
+        drain_authenticated_and_forward_registered(&mut rx).await;
+        let server_handle = pending.get().await;
+
+        // 1) 从未存在过的 id：必须能被区分出来，不能安静地返回 Ok。
+        let err = handle.close_remote_session(999_999).await.unwrap_err();
+        assert_eq!(err, UnknownSessionId(999_999));
+
+        // 2) 打开一条真实会话。
+        let _engineer_channel = with_timeout(
+            "channel_open_forwarded_tcpip",
+            server_handle.channel_open_forwarded_tcpip("127.0.0.1", 22001, "203.0.113.5", 1),
+        )
+        .await
+        .unwrap();
+        let (_appliance_sock, _peer) = with_timeout("一体机 accept", appliance_listener.accept())
+            .await
+            .unwrap();
+        let id = match next_msg(&mut rx).await {
+            TunnelMsg::RemoteSessionOpened { id } => id,
+            other => panic!("期望 RemoteSessionOpened，实际 {other:?}"),
+        };
+
+        // 3) 关掉这条真实存在的会话：必须是 Ok。
+        handle.close_remote_session(id).await.unwrap();
+
+        // 等它真正从账本里摘除（RemoteSessionClosed 之后）。
+        loop {
+            if let TunnelMsg::RemoteSessionClosed { id: cid } = next_msg(&mut rx).await {
+                assert_eq!(cid, id);
+                break;
+            }
+        }
+
+        // 4) 同一个 id 再关一次：账本里已经没有它了，这次必须区分成
+        // "不存在"，不能又是一次静默的 Ok。
+        let err = handle.close_remote_session(id).await.unwrap_err();
+        assert_eq!(err, UnknownSessionId(id));
+
+        handle.shutdown().await;
+    }
 }
