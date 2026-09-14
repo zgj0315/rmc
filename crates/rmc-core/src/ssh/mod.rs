@@ -12,7 +12,7 @@ use crate::knownhosts::KnownHosts;
 use crate::platform::Conn;
 use crate::transport::Transport;
 use crate::tunnel::{TunnelFactory, TunnelHandle, TunnelMsg, TunnelParams, UnknownSessionId};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -42,6 +42,74 @@ impl SshTunnelFactory {
 pub struct SshTunnel {
     session: Arc<AsyncMutex<russh::client::Handle<handler::ClientHandler>>>,
     channels: pump::SharedChannels,
+    /// R76：`shutdown()` 是否已经真的把 disconnect 发出去了。只由
+    /// [`Drop`] 读取，用来判断还需不需要补一次——见 `impl Drop for
+    /// SshTunnel` 上的说明。
+    disconnected: AtomicBool,
+}
+
+/// 把"给 Gateway 发一条 disconnect"这一步单列出来，`shutdown()`（正常
+/// 路径）和 [`Drop`]（兜底路径）共用同一份实现，不会长歪。
+///
+/// 失败一律忽略：会话可能早就死了（对端先断、keepalive 超时），这时
+/// 发不出去是正常的，也没有任何补救动作可做。
+async fn disconnect_session(session: &AsyncMutex<russh::client::Handle<handler::ClientHandler>>) {
+    let _ = session
+        .lock()
+        .await
+        .disconnect(russh::Disconnect::ByApplication, "", "")
+        .await;
+}
+
+/// R76（第四轮评审，纵深防御）：**句柄被丢弃而没有 `shutdown()`，必须
+/// 不再等于 Gateway 侧的真实泄漏。**
+///
+/// 到第四轮为止，同一个根源已经三次造成真实泄漏（`Start` 紧接 `Cancel`、
+/// `Start` 紧接第二条 `Start`、`Backoff` 中连发两条系统事件），三次都是
+/// `supervisor.rs` 主循环里某一处把 `Box<dyn TunnelHandle>` 丢掉而没有
+/// `shutdown()`。之所以每一次都会升级成"Gateway 上留下一条活着的会话和
+/// 一个已注册的反向端口"，是因为：
+///
+/// 1. `SshTunnel` 原来没有 `Drop`，丢弃它不会发出任何 disconnect；
+/// 2. [`spawn_disconnect_watcher`] 起的那个后台任务还攥着
+///    `Arc<AsyncMutex<Handle>>`，所以 `SshTunnel` 被丢弃时 `Handle`
+///    本身**不会**被析构，russh 的会话任务继续活着，TCP 连接也继续
+///    活着——连"靠析构顺带断开"这条退路都被堵死了。
+///
+/// 逐个堵调用点是治标（而且第三次证明了它堵不干净）；给类型加 `Drop`
+/// 是对**整类**缺陷的防御，也更耐后人改动：以后任何人在主循环里新写
+/// 一条路径、忘了 `shutdown()`，代价从"必须重启进程才能解除的生产
+/// 故障"降级成"晚了最多一个调度周期的断开"。
+///
+/// 实现上的两处约束：
+///
+/// - `Drop::drop` 不能 `async`，disconnect 必须走一个 detached 任务；
+/// - `tokio::spawn` 在没有运行时上下文时会 panic——在 `Drop` 里 panic
+///   尤其危险（可能发生在栈展开过程中，导致 abort）。用
+///   [`tokio::runtime::Handle::try_current`] 判断，拿不到就安静放弃：
+///   这种情况意味着运行时已经关掉、或者根本不在运行时线程上，几乎必然
+///   是进程正在退出，操作系统会关掉这条 TCP 连接，Gateway 侧的 sshd
+///   随之收掉会话与反向端口——真正需要这条兜底的场景（进程继续跑、
+///   运行时还活着，只是主循环把句柄弄丢了）恰好就是 `try_current()`
+///   一定成功的那个场景。
+///
+/// 正常走过 `shutdown()` 的句柄不会在这里重复发一次 disconnect：
+/// `disconnected` 标志由 `shutdown()` 在 disconnect **真的完成之后**
+/// 才置位，所以"`shutdown()` 的 future 跑到一半被取消"这种情况仍然会
+/// 落到这条兜底路径上，正是想要的行为。
+impl Drop for SshTunnel {
+    fn drop(&mut self) {
+        if self.disconnected.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let session = self.session.clone();
+        rt.spawn(async move {
+            disconnect_session(&session).await;
+        });
+    }
 }
 
 /// `Handle::is_closed()` 的轮询间隔。见 [`spawn_disconnect_watcher`]。
@@ -237,7 +305,11 @@ pub(crate) async fn establish_over(
     let session = Arc::new(AsyncMutex::new(session));
     spawn_disconnect_watcher(session.clone(), tx);
 
-    Ok(Box::new(SshTunnel { session, channels }))
+    Ok(Box::new(SshTunnel {
+        session,
+        channels,
+        disconnected: AtomicBool::new(false),
+    }))
 }
 
 #[async_trait::async_trait]
@@ -256,12 +328,12 @@ impl TunnelHandle for SshTunnel {
     }
 
     async fn shutdown(self: Box<Self>) {
-        let _ = self
-            .session
-            .lock()
-            .await
-            .disconnect(russh::Disconnect::ByApplication, "", "")
-            .await;
+        disconnect_session(&self.session).await;
+        // R76：disconnect 真的发完之后才置位，`Drop` 据此跳过兜底的
+        // 那次 disconnect——见 `impl Drop for SshTunnel`。放在这一步
+        // 之后（而不是函数开头）是故意的：`shutdown()` 的 future 如果
+        // 跑到一半被取消，标志仍然是 false，`Drop` 会补上。
+        self.disconnected.store(true, Ordering::SeqCst);
         // 主动断开之后 [`spawn_disconnect_watcher`] 会在下一次轮询里发现
         // `is_closed()` 已经为真、送出一条 `TunnelMsg::Disconnected`——这是
         // 无害的：`Supervisor` 收到这条命令触发的 `shutdown` 时早已经把
@@ -379,6 +451,51 @@ mod tests {
         match with_timeout("等待 Disconnected 消息", next_msg(&mut rx)).await {
             TunnelMsg::Disconnected { .. } => {}
             other => panic!("会话结束后应该收到 Disconnected，实际 {other:?}"),
+        }
+        drop(pending);
+    }
+
+    // R76（第四轮评审，纵深防御）：句柄被**直接丢弃**、完全没有调用
+    // `shutdown()` 时，Gateway 侧的会话也必须被断开。
+    //
+    // 这是 `supervisor.rs` 里三次隧道泄漏（R71/R72/R75）共同的最后一
+    // 环：主循环某一处把 `Box<dyn TunnelHandle>` 丢了，而 `SshTunnel`
+    // 原来没有 `Drop`、`spawn_disconnect_watcher` 又攥着
+    // `Arc<AsyncMutex<Handle>>` 让 `Handle` 连析构都不会发生，于是
+    // 那条 SSH 会话和反向端口就在 Gateway 上一直活着。这条测试直接
+    // 钉住"丢弃 == 断开"这条不变量，不经过状态机——状态机侧那些调用
+    // 点该堵的照样堵（见 supervisor.rs），这里是最后一道网。
+    //
+    // 会让这条测试变红的实现改法：删掉 `impl Drop for SshTunnel`
+    // ——`drop(handle)` 之后再也没有人会发出 disconnect，watcher 的
+    // `is_closed()` 永远是 false，`next_msg` 会在 `with_timeout` 的
+    // 5 秒预算耗尽后 panic（本地实测：删掉之后这条测试必定失败，
+    // 其余测试无一变红）。
+    #[tokio::test]
+    async fn dropping_the_handle_without_shutdown_still_disconnects_the_session() {
+        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let known_hosts = Arc::new(tmp_known_hosts());
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = with_timeout(
+            "establish_over",
+            establish_over(
+                conn,
+                &test_gateway_hostport(),
+                &known_hosts,
+                test_params(22001),
+                tx,
+            ),
+        )
+        .await
+        .unwrap();
+        drain_authenticated_and_forward_registered(&mut rx).await;
+
+        // 注意：不是 `handle.shutdown().await`，就是直接丢掉。
+        drop(handle);
+
+        match with_timeout("等待 Disconnected 消息", next_msg(&mut rx)).await {
+            TunnelMsg::Disconnected { .. } => {}
+            other => panic!("句柄被丢弃后也应该收到 Disconnected，实际 {other:?}"),
         }
         drop(pending);
     }
