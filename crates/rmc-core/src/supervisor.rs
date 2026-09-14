@@ -169,6 +169,35 @@
 //!       那行 `warn!` 还有另一条测试也会触发它，哨兵现在只能证明
 //!       "这个 callsite 能被捕获"，不能证明"是本测试自己那次触发被
 //!       捕获"——已经改成对捕获内容做匹配来加固。
+//!
+//! # 评审第四轮追加的修复（R75-R78），逐条写明理由
+//!
+//! 16. **[R75，必现] 系统事件分支是"用 `ctx.state` 做准入判断"的第三
+//!     个入口，而且是唯一一个必现的**——第三轮（R71）把
+//!     `Start`/`Cancel`/`Stop`/`RetryNow` 四处准入判断都改成了看同步
+//!     字段，但 `sys.recv()` 那条分支被漏掉了，它仍然写着
+//!     `matches!(ctx.state, State::Backoff { .. })`。
+//!
+//!     `retry_at` 触发（或者 `RetryNow`）之后，`spawn_connect` 已经
+//!     **同步**写好了 `ctx.connect_task`，而 `ctx.state` 要等后台任务
+//!     回 `EnteredConnecting` 才离开 `Backoff`。这个窗口里再来一条
+//!     网络/唤醒事件，分支里的 `spawn_connect` 会直接覆盖
+//!     `ctx.connect_task`（旧 `JoinHandle` 被丢弃、从不 `abort()`）
+//!     **并且覆盖 `pending_handle` 槎位**——旧任务建成的隧道写进的是
+//!     已经没人持有的那个槎位，`Arc` 归零后句柄被 drop。
+//!
+//!     触发条件是现场最普通的一条路径：笔记本从睡眠恢复时本来就会
+//!     同时产生 `ResumedFromSleep` 与 `NetworkChanged`（方案 §3.9 明确
+//!     要求两者都接），而恢复那一刻状态机几乎必然正在 `Backoff`。这
+//!     不是竞态：单线程下 `spawn_connect` 起的任务在主循环真正 park
+//!     之前根本没机会被调度，第二条事件必然撞在这个窗口里，本地
+//!     实测 20/20 必现。修法与 R71 一致：`retry_at.is_some() &&
+//!     !connecting_or_connected(&ctx)`。
+//!
+//!     这已经是同一个根源第三次造成隧道泄漏，所以这一轮同时在
+//!     `SshTunnel` 上加了 `Drop`（见 `ssh/mod.rs`）做纵深防御——逐个
+//!     堵调用点是治标，让"句柄被丢弃"这件事本身不再等于"Gateway 侧
+//!     泄漏"才是治本。
 
 use crate::addr::HostPort;
 use crate::backoff::{Backoff, Jitter};
@@ -776,7 +805,18 @@ async fn run(
 
             Ok(event) = sys.recv() => {
                 // 网络变化与休眠恢复都清零退避并立刻重试。
-                if matches!(ctx.state, State::Backoff { .. })
+                //
+                // R75：准入判断也改看同步字段，不看 `ctx.state`——原来
+                // 这里写的是 `matches!(ctx.state, State::Backoff { .. })`，
+                // 那是第四轮评审抓到的第三个、也是唯一**必现**的隧道
+                // 泄漏入口，见模块顶部第 16 条与
+                // `two_system_events_during_backoff_do_not_leak_a_tunnel`。
+                // `retry_at.is_some()` 表达"处于自动重试等待中"（就是
+                // `Backoff`，但这个字段是同步维护的，没有 `ctx.state`
+                // 那段异步延迟），`!connecting_or_connected(&ctx)` 排除
+                // "这一次重试已经发起了、只是状态还没跟上"。
+                if retry_at.is_some()
+                    && !connecting_or_connected(&ctx)
                     && matches!(event, SystemEvent::NetworkChanged | SystemEvent::ResumedFromSleep)
                 {
                     ctx.backoff.reset();
@@ -1962,6 +2002,122 @@ mod tests {
                 })
                 .collect();
             assert_eq!(delays.last(), Some(&1), "退避未清零：{delays:?}");
+        })
+        .await;
+    }
+
+    // --- R75（第四轮评审）：`Backoff` 期间连发两条系统事件会必现地泄漏
+    // 一条隧道 ---
+    //
+    // 现场最普通的一条路径：笔记本从睡眠恢复时，`platform` 会同时产生
+    // `ResumedFromSleep` 与 `NetworkChanged`（方案 §3.9 明确要求两者都
+    // 接），而"恢复那一刻"状态机几乎必然正在 `Backoff`（睡眠期间网络
+    // 早就断了）。两条事件之间没有任何 `.await`，主循环连着处理两次：
+    // 第一次 `spawn_connect` 已经**同步**写好了 `ctx.connect_task`，但
+    // `ctx.state` 要等后台任务回 `EnteredConnecting` 才离开 `Backoff`
+    // ——用 `ctx.state` 做准入判断的话，第二条事件会被误判为"还在退避、
+    // 可以立刻重试"，`spawn_connect` 覆盖 `ctx.connect_task`（旧
+    // `JoinHandle` 被丢弃、从不 `abort()`）**并且覆盖 `pending_handle`
+    // 槎位**：第一个任务建成的隧道写进的是已经没人持有的那个槎位，
+    // `Arc` 归零后句柄被 drop——Gateway 上留下一条活着的 SSH 会话和一个
+    // 已注册的反向端口，界面全程无感。
+    //
+    // 这不是竞态，是必现：单线程运行时下 `spawn_connect` 起的任务在主
+    // 循环下一次真正 park 之前根本没机会被调度（`sys.recv()` 有缓冲
+    // 事件时直接返回 `Ready`，不让出执行权），第二条事件必然撞在
+    // "`connect_task` 已设置、`ctx.state` 还没变"这个窗口里。
+    //
+    // 会让这条测试变红的实现改法：把系统事件分支的准入判断
+    // `retry_at.is_some() && !connecting_or_connected(&ctx)` 改回
+    // `matches!(ctx.state, State::Backoff { .. })`——本地实测连续 20 次
+    // 单跑全部失败（20/20），失败信息恒为 `handles=2, shutdowns=1`。
+    // 这条测试用 `start_paused = true`，只能跑在 `current_thread` 上
+    // （tokio 不允许 `start_paused` 配 `multi_thread`），但这条缺陷本来
+    // 就不需要多线程才能现形。
+    #[tokio::test(start_paused = true)]
+    async fn two_system_events_during_backoff_do_not_leak_a_tunnel() {
+        guard(async {
+            struct CountingHandle(Arc<std::sync::atomic::AtomicUsize>);
+            #[async_trait::async_trait]
+            impl TunnelHandle for CountingHandle {
+                async fn close_remote_session(
+                    &self,
+                    _id: u64,
+                ) -> std::result::Result<(), crate::tunnel::UnknownSessionId> {
+                    Ok(())
+                }
+                async fn shutdown(self: Box<Self>) {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            /// 第一次 `establish()` 失败（把状态机送进 `Backoff`），之后
+            /// 每次都成功——`handles` 只统计真的造出过句柄的那些次。
+            struct CountingFactory {
+                attempts: Arc<std::sync::atomic::AtomicUsize>,
+                handles: Arc<std::sync::atomic::AtomicUsize>,
+                shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+            }
+            #[async_trait::async_trait]
+            impl TunnelFactory for CountingFactory {
+                async fn establish(
+                    &self,
+                    _params: TunnelParams,
+                    tx: mpsc::Sender<TunnelMsg>,
+                ) -> crate::error::Result<Box<dyn TunnelHandle>> {
+                    if self
+                        .attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        == 0
+                    {
+                        return Err(Error::Tcp("refused".into()));
+                    }
+                    self.handles
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(TunnelMsg::Authenticated {
+                                host_key_fp: "SHA256:aaa".into(),
+                                first_seen: false,
+                            })
+                            .await;
+                        let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
+                    });
+                    Ok(Box::new(CountingHandle(self.shutdowns.clone())))
+                }
+            }
+
+            let handles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let factory = Arc::new(CountingFactory {
+                attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                handles: handles.clone(),
+                shutdowns: shutdowns.clone(),
+            });
+            let (ev_tx, _) = broadcast::channel(8);
+            let events = Arc::new(ManualEvents(ev_tx.clone()));
+            let (tx, mut rx) = Supervisor::spawn(config(), deps(factory, events));
+            tx.send(start()).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Backoff { .. })).await;
+
+            // 两条事件之间不插入任何 await——这正是"笔记本醒来"那一刻
+            // 真实发生的事。
+            ev_tx.send(SystemEvent::ResumedFromSleep).unwrap();
+            ev_tx.send(SystemEvent::NetworkChanged).unwrap();
+
+            states_until(&mut rx, |s| matches!(s, State::Connected { .. })).await;
+            tx.send(Command::Stop).await.unwrap();
+            states_until(&mut rx, |s| matches!(s, State::Idle)).await;
+            // 给那个（可能存在的）被覆盖、无人认领的连接任务足够的机会
+            // 跑完 `establish()`——泄漏要等它真的造出句柄才看得见。
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            let handles_n = handles.load(std::sync::atomic::Ordering::SeqCst);
+            let shutdowns_n = shutdowns.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                handles_n, shutdowns_n,
+                "建成 {handles_n} 条隧道却只关掉 {shutdowns_n} 条：多出来的那条\
+                 在 Gateway 上仍然活着、反向端口仍然被占用，界面上完全看不到"
+            );
         })
         .await;
     }
