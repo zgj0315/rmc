@@ -61,6 +61,7 @@ use crate::ssh::{client_config, establish_over};
 use crate::tunnel::{TunnelHandle, TunnelMsg, TunnelParams};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -310,6 +311,132 @@ impl PendingHandle {
             .await
             .expect("进程内假 Gateway 从没能返回一个 handle——run_stream 大概率失败了")
     }
+}
+
+/// Task 10 新增：让底层连接可以在测试需要的时刻被"冻结"——冻结后
+/// `poll_read`/`poll_write` 恒定返回 `Poll::Pending`，不注册、也不触发
+/// 任何 waker。这不是协议层面的优雅断开（不会产生 EOF、不会发
+/// SSH_MSG_DISCONNECT），而是模拟一个已经不再应答、但连接本身尚未被
+/// 判定关闭的黑洞对端——真实世界里的网络分区、防火墙静默丢包都是这种
+/// 表现：客户端能写（写进内核缓冲区不会立刻报错），只是永远收不到
+/// 任何回应。这正是方案设计.md §3.4 要求实测的场景："让链路真的安静
+/// 下来（例如服务端不再应答）"，不是"服务端主动挂断"。
+///
+/// 用于 `supervisor.rs` 里端到端测量 keepalive 断线判定耗时的测试：先用
+/// `spawn_freezable_gateway` 建立一条真实握手成功的隧道，再在合适的时机
+/// 调用 `FreezeSwitch::freeze()`，掐表量从冻结时刻到状态机进入
+/// `State::Backoff` 实际用了多久。
+#[derive(Clone, Default)]
+pub(crate) struct FreezeSwitch(Arc<AtomicBool>);
+
+impl FreezeSwitch {
+    pub(crate) fn freeze(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn is_frozen(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+pub(crate) struct Freezable<S> {
+    inner: S,
+    switch: FreezeSwitch,
+}
+
+impl<S> Freezable<S> {
+    fn new(inner: S) -> (Self, FreezeSwitch) {
+        let switch = FreezeSwitch::default();
+        (
+            Self {
+                inner,
+                switch: switch.clone(),
+            },
+            switch,
+        )
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Freezable<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.switch.is_frozen() {
+            return Poll::Pending;
+        }
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Freezable<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.switch.is_frozen() {
+            return Poll::Pending;
+        }
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.switch.is_frozen() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.switch.is_frozen() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// 与 [`spawn_gateway`] 相同的接线方式，只是服务端一侧的连接额外裹了一层
+/// [`Freezable`]：调用方可以在任意时刻冻结它，模拟"服务端不再应答"。
+pub(crate) fn spawn_freezable_gateway(
+    cfg: GatewayConfig,
+) -> (ReadTimestamps, FreezeSwitch, PendingHandle, Box<dyn Io>) {
+    let key = test_host_key();
+    let server_config = Arc::new(russh::server::Config {
+        keys: vec![key],
+        ..Default::default()
+    });
+
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let (frozen_server_side, switch) = Freezable::new(server_side);
+    let (sniffed_server_side, server_reads) = Sniff::new(frozen_server_side);
+    let handler = GatewayHandler {
+        permitted_port: cfg.permitted_port,
+        accept_password: cfg.accept_password,
+    };
+
+    let (handle_tx, handle_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        // `Err(_)` 时 `handle_tx` 直接被丢弃；调用方 `PendingHandle::get()`
+        // 会在 `RecvError` 处得到一个说得清楚的 panic，而不是挂起。
+        if let Ok(running) =
+            russh::server::run_stream(server_config, sniffed_server_side, handler).await
+        {
+            let handle = running.handle();
+            let _ = handle_tx.send(handle);
+            let _ = running.await;
+        }
+    });
+
+    (
+        server_reads,
+        switch,
+        PendingHandle(handle_rx),
+        Box::new(client_side),
+    )
 }
 
 /// 起一个跑在内存管道上的假 Gateway。返回：服务端读到的字节时间戳、

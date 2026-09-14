@@ -15,7 +15,7 @@ use crate::tunnel::{TunnelFactory, TunnelHandle, TunnelMsg, TunnelParams, Unknow
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 pub struct SshTunnelFactory {
     transport: Arc<Transport>,
@@ -33,9 +33,67 @@ impl SshTunnelFactory {
     }
 }
 
+/// Task 10 新增：`session` 从直接持有改成 `Arc<AsyncMutex<..>>`，理由见
+/// [`spawn_disconnect_watcher`]——一个独立的后台任务需要能在
+/// `SshTunnel`（负责 `close_remote_session`/`shutdown`）之外，同时对同一个
+/// `Handle` 做一次轻量的 `is_closed()` 检查，`Handle` 本身不是 `Clone`，
+/// 共享所有权是唯一的办法。锁只在检查/断开这类不跨越应用层等待的短操作
+/// 上持有，不构成争用热点。
 pub struct SshTunnel {
-    session: russh::client::Handle<handler::ClientHandler>,
+    session: Arc<AsyncMutex<russh::client::Handle<handler::ClientHandler>>>,
     channels: pump::SharedChannels,
+}
+
+/// `Handle::is_closed()` 的轮询间隔。见 [`spawn_disconnect_watcher`]。
+///
+/// 200ms 是权衡过的：轮询本身不消耗虚拟时钟之外的真实等待（`#[tokio::
+/// test(start_paused = true)]` 下的 `tokio::time::sleep` 在没有别的活干时
+/// 会被虚拟时钟直接跳过），但它给测量 keepalive 断线判定耗时的测试
+/// （`supervisor.rs`）引入了至多 200ms 的滞后——相对于方案设计.md §3.4
+/// 实测的约 40 秒量级，这个滞后可以忽略；数值定得比这更大会让"最坏情况
+/// 滞后"开始逼近需要在报告里额外说明的量级，比这更小则会让非
+/// `start_paused` 的普通测试（`ssh::mod::tests`）里轮询本身的调度开销
+/// 变得不必要地密集，两者之间取了个整数。
+const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// R——本任务（Task 10）开工前发现的缺口：`establish_over` 建好隧道之后，
+/// 如果底层 SSH 会话中途死掉（对端主动断开、或者 keepalive 连续
+/// `keepalive_max` 次无应答被 russh 自己判定为 `KeepaliveTimeout`），
+/// 在这一行代码存在之前**没有任何人会注意到**——`TunnelHandle` 只有
+/// `close_remote_session`/`shutdown` 两个方法，都是调用方主动发起的操作，
+/// 没有任何一处会主动去问"这条隧道是不是已经死了"。`tunnel::TunnelMsg`
+/// 里其实早就定义了 `Disconnected { reason }` 这个变体（Task 7 就有），
+/// 但在这个函数存在之前，从来没有任何生产代码路径会真的送出它。
+///
+/// `Handle<H>` 没有暴露"等待关闭"的方法，唯一能问的是同步的
+/// `is_closed()`——它背后是 `mpsc::Sender::is_closed()`：当 `Handle`
+/// 内部对应的接收端被丢弃（也就是 `session.run(...)` 那个后台任务返回、
+/// 它拥有的 `Session` 被整体析构）时变为 `true`。没有事件可等，只能轮询，
+/// 于是有了 [`DISCONNECT_POLL_INTERVAL`]。
+///
+/// 这个任务在 `Supervisor`（Task 10 的另一半）能观察到之前，不需要、也
+/// 不应该做任何分类判断——它只负责如实转告"会话没了"，`reason` 里不放
+/// 任何猜测出来的原因（尤其不能把 `KeepaliveTimeout` 这个词或数字写进
+/// 面向用户的文案，见 `error.rs` 上 `Error::KeepaliveTimeout` 的说明），
+/// 分类交给 `Supervisor` 按 `Error::SshTransport(reason).class()`
+/// （`Network`）统一处理。
+fn spawn_disconnect_watcher(
+    session: Arc<AsyncMutex<russh::client::Handle<handler::ClientHandler>>>,
+    tx: mpsc::Sender<TunnelMsg>,
+) {
+    tokio::spawn(async move {
+        loop {
+            if session.lock().await.is_closed() {
+                break;
+            }
+            tokio::time::sleep(DISCONNECT_POLL_INTERVAL).await;
+        }
+        let _ = tx
+            .send(TunnelMsg::Disconnected {
+                reason: "SSH 会话已断开".into(),
+            })
+            .await;
+    });
 }
 
 /// 生产用的 russh 客户端 `Config`。单列成函数有两个理由：
@@ -176,6 +234,9 @@ pub(crate) async fn establish_over(
         })
         .await;
 
+    let session = Arc::new(AsyncMutex::new(session));
+    spawn_disconnect_watcher(session.clone(), tx);
+
     Ok(Box::new(SshTunnel { session, channels }))
 }
 
@@ -197,8 +258,16 @@ impl TunnelHandle for SshTunnel {
     async fn shutdown(self: Box<Self>) {
         let _ = self
             .session
+            .lock()
+            .await
             .disconnect(russh::Disconnect::ByApplication, "", "")
             .await;
+        // 主动断开之后 [`spawn_disconnect_watcher`] 会在下一次轮询里发现
+        // `is_closed()` 已经为真、送出一条 `TunnelMsg::Disconnected`——这是
+        // 无害的：`Supervisor` 收到这条命令触发的 `shutdown` 时早已经把
+        // `ctx.handle` 置空、多数路径下 `ctx.creds` 也已经清空，迟到的
+        // `Disconnected` 会在 `handle_msg` 里被 `ctx.creds.is_some()` 挡掉，
+        // 不会触发一次多余的重连。
     }
 }
 
@@ -268,5 +337,49 @@ mod tests {
         let cfg = client_config();
         assert_eq!(cfg.keepalive_interval, Some(Duration::from_secs(10)));
         assert_eq!(cfg.keepalive_max, 3);
+    }
+
+    // --- Task 10：spawn_disconnect_watcher 的快速证据（不依赖 keepalive
+    // 计时）——只证明"会话结束后，无论什么原因，watcher 最终都会送出一条
+    // Disconnected 消息"这条接线本身是通的；keepalive 超时具体耗时多久的
+    // 端到端测量在 supervisor.rs（需要真实经过状态机）。
+    //
+    // 会让这条测试变红的实现改法：删掉 `establish_over` 末尾对
+    // `spawn_disconnect_watcher` 的调用（或者让它监视一个错误的
+    // session）——`shutdown()` 之后再也不会有任何人往 `tx` 送
+    // `TunnelMsg::Disconnected`，`next_msg` 会在 `with_timeout` 的 5 秒
+    // 预算耗尽后 panic。
+
+    use crate::ssh::test_support::{
+        drain_authenticated_and_forward_registered, next_msg, spawn_gateway, test_gateway_hostport,
+        test_params, tmp_known_hosts, with_timeout, GatewayConfig,
+    };
+
+    #[tokio::test]
+    async fn session_close_is_reported_as_a_disconnected_message() {
+        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let known_hosts = Arc::new(tmp_known_hosts());
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = with_timeout(
+            "establish_over",
+            establish_over(
+                conn,
+                &test_gateway_hostport(),
+                &known_hosts,
+                test_params(22001),
+                tx,
+            ),
+        )
+        .await
+        .unwrap();
+        drain_authenticated_and_forward_registered(&mut rx).await;
+
+        handle.shutdown().await;
+
+        match with_timeout("等待 Disconnected 消息", next_msg(&mut rx)).await {
+            TunnelMsg::Disconnected { .. } => {}
+            other => panic!("会话结束后应该收到 Disconnected，实际 {other:?}"),
+        }
+        drop(pending);
     }
 }
