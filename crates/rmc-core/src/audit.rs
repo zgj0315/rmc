@@ -40,10 +40,53 @@
 //!    加一个公开的时钟注入口）。
 //! 5. **写失败不是 `Fatal`，`record()` 因此故意不返回 `Result`**——
 //!    见 [`Audit::record`] 上的说明，这是本任务最重要的一条裁定。
+//!
+//! # 复审第一轮追加的修复（R85-R87），逐条写明理由
+//!
+//! 6. **[R85] `Audit` 的时钟收进一个可替换的字段**——第 3 条那套"拆成
+//!    纯函数直接测"解决的是"格式化函数忽略参数"这一类回归，没解决
+//!    "活着的 `Audit` 跨天要不要换文件"这件事本身：如果有人把
+//!    `record()`/`current_path()` 优化成第一次调用时算好文件名、用
+//!    `OnceLock` 之类的东西缓存起来复用，`file_name_for`/`line_for`
+//!    的纯函数测试全部照样通过（它们从来没有经过 `Audit` 的实例方法），
+//!    `two_different_days_...` 也测不出来（它压根没调用过 `record`/
+//!    `current_path`，是手写两个文件模拟出来的）。现在 `Audit` 内部
+//!    持有 `clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>`，
+//!    生产路径（`open`/`open_best_effort`）固定装的是 [`today`]；
+//!    `#[cfg(test)]` 专用的 `with_clock` 构造函数可以装一个能在测试
+//!    里动态改写的时钟，同一个 `Audit` 实例先在一天记一条、把时钟拨到
+//!    下一天再记一条，两条必须落进两个不同的文件——这才是真的在测
+//!    "活着的实例"，不是测公式。`with_clock` 不对 crate 外公开，
+//!    生产代码永远走 `open`/`open_best_effort`。
+//! 7. **[R86] 保留期边界测试不能跟 `RETENTION_DAYS` 本身算出来**——
+//!    原来 `prune_keeps_files_inside_retention` 的夹具年龄写的是
+//!    `RETENTION_DAYS - 2`，把 `RETENTION_DAYS` 从 30 调小到 3 之后，
+//!    夹具年龄也会跟着缩成 1 天，1 天老的文件在任何正数保留期下都
+//!    "在保留期内"，这条测试因此永远不可能抓到"保留期被调小"这类
+//!    回归，结构上就不可能红。现在换成写死的 29/31 天两个边界（假设
+//!    `RETENTION_DAYS == 30`，用一条独立测试把这个假设钉死，改了
+//!    常量这条测试会先炸出一个清楚的信号），29 天必须留、31 天必须
+//!    删，`RETENTION_DAYS` 往大往小调都会被其中一条抓到。
+//! 8. **[R87] 时间戳补上显式的 `±HH:MM` 偏移量**——`today()` 取不到
+//!    本地时区信息时会退化到 UTC，退化之前时间戳没有任何标记能看出
+//!    "这一行到底是本地时间还是 UTC"，同一份追责日志里可能一半行本地
+//!    时间、一半 UTC，读的人（可能不是开发者）无从分辨，跨时区对
+//!    Gateway 侧日志时只能靠猜。现在 [`line_for`] 把 `OffsetDateTime`
+//!    自带的偏移量显式写进时间戳，哪怕正好是 `+00:00`（本地时区就是
+//!    UTC，或者真的退化到了 UTC）也写出来，不用容易被忽略的 "Z" 简写。
+//!    `today()` 上关于回退触发条件的说明也订正了——见该函数文档。
+//! 9. **[R88] 目录/文件权限在 Unix 上收紧到 `0700`/`0600`**——审计
+//!    日志记的是"谁在什么时候连了哪台客户设备"，原来落盘用的是
+//!    `create`/`create_dir_all` 的默认权限（`0644`/`0755`），本机
+//!    任何用户都能读。上一版实现对这件事一个字的说明都没有，不是
+//!    权衡后决定不做，是没考虑过。见 [`harden_dir_permissions`]/
+//!    [`harden_file_permissions`] 上的说明，包括为什么 Windows 上是
+//!    有意的空操作。
 
 use crate::error::{Error, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// 审计日志保留天数。
@@ -69,10 +112,42 @@ impl Level {
     }
 }
 
-/// 当前本地时间；极少数取不到时区信息的环境下退化为 UTC——宁可时区
-/// 标错，也不要审计日志因为这个次要问题直接罢工。
+/// 当前本地时间；取不到时区信息时退化为 UTC——宁可退化，也不要审计
+/// 日志因为这个次要问题直接罢工。
+///
+/// R87（复审订正）：这里曾经写"极少数取不到时区信息的环境"，并暗示
+/// 原因是"`time` 的 `local-offset` 在 Unix 多线程进程里会返回
+/// `Err`"——这个具体机制在当前锁定的 `time = "0.3.55"` 上不成立，
+/// 已经实测验证过：macOS 上、以及一个真实的 Linux 容器（glibc，
+/// `rust:1-slim-bookworm`）里，多线程 tokio 运行时 + 并发
+/// `tokio::spawn` 出的 8 个任务同时调用 `now_local()`，全部成功。
+/// 翻过这个版本的 `local_offset_at`（Unix 侧）源码：它直接调用线程
+/// 安全的 `libc::localtime_r`，不像该 crate 更早的版本那样按
+/// `num_threads::is_single_threaded()` 决定要不要返回 `Err`（那条
+/// 逻辑现在只留在一个不相关的内部工具函数 `refresh_tz` 里，`now_
+/// local()` 不会走到它）。真正会触发这条回退的场景是系统本身缺时区
+/// 数据库/环境变量（精简容器、某些嵌入式环境），确实少见，但跟"是否
+/// 多线程"无关，这里不再把原因归到线程模型上。
+///
+/// 无论具体原因是什么，回退这件事本身现在在日志文本里是可见的：
+/// [`line_for`] 把 `UtcOffset` 显式写进时间戳（`±HH:MM`），退化到
+/// UTC 时那一行会显式带 `+00:00`，不会让读的人误以为自己看到的是
+/// 本地时间——这比"猜清楚哪个具体系统调用会不会失败"更管用。
 fn today() -> time::OffsetDateTime {
     time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+}
+
+/// `±HH:MM` 形式的偏移量文本，供时间戳使用——见 [`line_for`]。故意
+/// 不用 "Z" 表示 UTC：`+00:00` 与本地偏移量走同一套格式，读的人不用
+/// 记两套写法，也不会把"退化到了 UTC"的那一行看成"格式不一样，出
+/// 错了"。
+fn format_offset(offset: time::UtcOffset) -> String {
+    let sign = if offset.is_negative() { '-' } else { '+' };
+    format!(
+        "{sign}{:02}:{:02}",
+        offset.whole_hours().abs(),
+        offset.minutes_past_hour().abs()
+    )
 }
 
 /// 这一天对应的日志文件名。"按天滚动"的全部逻辑都在这一个纯函数里，
@@ -87,16 +162,18 @@ fn file_name_for(d: time::OffsetDateTime) -> String {
 }
 
 /// 一条日志行的完整文本，含末尾换行。调用方保证 `message` 里已经没有
-/// 换行（见 [`Audit::record`]）。
+/// 换行（见 [`Audit::record`]）。时间戳带显式的 `±HH:MM` 偏移量——
+/// 见模块文档 R87。
 fn line_for(d: time::OffsetDateTime, level: Level, message: &str) -> String {
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02} {} {}\n",
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{} {} {}\n",
         d.year(),
         u8::from(d.month()),
         d.day(),
         d.hour(),
         d.minute(),
         d.second(),
+        format_offset(d.offset()),
         level.as_str(),
         message
     )
@@ -109,8 +186,61 @@ fn is_log_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// R88（复审发现，中低严重）：审计日志记的是"谁在什么时候连了哪台
+/// 客户设备"，本机任何用户默认都能读——上一版实现对这件事一个字的
+/// 说明都没有，不是权衡后决定不做，是没考虑过。这里在 Unix 上把
+/// 目录收紧成 `0700`（只有属主能进）、文件收紧成 `0600`（只有属主
+/// 能读写）；失败静默忽略——权限收紧不了不该阻止日志本身被写下来
+/// （跟 [`Audit::record`] 同一条裁定：这类次要故障不该掐断会话）。
+///
+/// **Windows 上这两个函数是空操作**，不是漏做：Windows 没有 Unix 的
+/// mode 位这个概念，`std::fs::Permissions` 在 Windows 上只有一个
+/// "只读"标志，设不出"仅属主可读写"这种粒度；产品的真实落点是
+/// `%LOCALAPPDATA%\rmc\`（每个 Windows 用户账户私有），访问控制靠
+/// 的是 NTFS ACL（继承自 `%LOCALAPPDATA%` 本身的默认 ACL），不是这里
+/// 能设的东西。这条防线只覆盖 Unix：`config.rs` 里 `Config::default
+/// ().log_dir` 是相对路径 `"logs"`，如果落在共享目录、或者 Linux 侧
+/// （CI、将来的跨平台构建）运行，`0644`/`0755` 的默认权限就是真实的
+/// 暴露面，这里补上。
+#[cfg(unix)]
+fn harden_dir_permissions(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(dir) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        let _ = std::fs::set_permissions(dir, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_dir_permissions(_dir: &Path) {}
+
+#[cfg(unix)]
+fn harden_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_file_permissions(_path: &Path) {}
+
+/// R85：`clock` 收进字段而不是每次都直接调 [`today`]——生产路径两个
+/// 构造函数都固定装 `today`，行为跟以前完全一样；`#[cfg(test)]` 专用
+/// 的 [`Audit::with_clock`] 能装一个测试可控的时钟，让"同一个活着的
+/// `Audit` 实例跨天要不要换文件"这件事本身能被钉住，不止是
+/// `file_name_for` 这个纯函数的行为。`Arc<dyn Fn() -> .. + Send +
+/// Sync>` 而不是裸的 `fn` 指针：`fn` 指针没有可变状态，没法在测试里
+/// "先给出第一天、再给出第二天"；`Ctx`（持有 `Audit`）要跨 `tokio::
+/// spawn` 的 `Send` 边界，字段类型必须是 `Send + Sync`，生产用的
+/// `today` 是普通函数、天然满足，测试用的时钟包着一个
+/// `Arc<AtomicI64>`，同样满足。
 pub struct Audit {
     dir: PathBuf,
+    clock: Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>,
 }
 
 impl Audit {
@@ -123,7 +253,11 @@ impl Audit {
     /// 掐断一次正在进行的维护会话。
     pub fn open(dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir).map_err(Error::LocalIo)?;
-        Ok(Self { dir })
+        harden_dir_permissions(&dir);
+        Ok(Self {
+            dir,
+            clock: Arc::new(today),
+        })
     }
 
     /// `open()` 失败之后的兜底：不重新尝试创建目录，无条件成功。
@@ -134,11 +268,25 @@ impl Audit {
     /// 这不是给测试开的口子（测试就该用会失败的 `open()`），只是
     /// Supervisor 接线要用，不需要对 crate 外公开。
     pub(crate) fn open_best_effort(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            clock: Arc::new(today),
+        }
+    }
+
+    /// 只给本模块自己的测试用：装一个测试可控的时钟，不经过 `open()`
+    /// 那次 `create_dir_all`（测试自己决定要不要先建目录）。见结构体
+    /// 与模块文档 R85 的说明。
+    #[cfg(test)]
+    fn with_clock(
+        dir: PathBuf,
+        clock: Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>,
+    ) -> Self {
+        Self { dir, clock }
     }
 
     pub fn current_path(&self) -> PathBuf {
-        self.dir.join(file_name_for(today()))
+        self.dir.join(file_name_for((self.clock)()))
     }
 
     /// 写一行。换行被折成空格，保证一个事件一行——`\r\n`/`\n`/`\r` 都会
@@ -168,7 +316,11 @@ impl Audit {
             tracing::warn!(error = %e, dir = ?self.dir, "审计日志目录不可用，这条记录已丢弃");
             return;
         }
-        let d = today();
+        // R88：目录权限每次都重新收紧一遍，跟上面 `create_dir_all` 每次
+        // 都重试同一个道理——万一目录是之前用别的权限建出来的，或者
+        // 权限被后来改动过，这里会自己纠正回来，不需要重启进程。
+        harden_dir_permissions(&self.dir);
+        let d = (self.clock)();
         let path = self.dir.join(file_name_for(d));
         let line = line_for(d, level, &flat);
         match std::fs::OpenOptions::new()
@@ -177,6 +329,7 @@ impl Audit {
             .open(&path)
         {
             Ok(mut f) => {
+                harden_file_permissions(&path);
                 if let Err(e) = f.write_all(line.as_bytes()) {
                     tracing::warn!(error = %e, path = ?path, "写审计日志失败，这条记录已丢弃");
                 }
@@ -310,15 +463,69 @@ mod tests {
 
     #[test]
     fn prune_keeps_files_inside_retention() {
+        // R86：夹具年龄写死成 28 天，不是 `RETENTION_DAYS - 2`——原来
+        // 那样写是自指的：把 `RETENTION_DAYS` 从 30 调小到 3 之后,
+        // 夹具年龄也会跟着缩成 1 天，1 天老的文件在任何正数保留期下
+        // 都"在保留期内"，这条测试因此永远不可能抓到"保留期被调小"
+        // 这类回归。见下面 `retention_days_is_30_as_documented` 与
+        // 两条固定边界测试。
         let dir = tmpdir();
         let a = Audit::open(dir.path().to_path_buf()).unwrap();
         let recent = dir.path().join("rmc-2026-09-01.log");
         std::fs::write(&recent, "较近的日志\n").unwrap();
-        let days_ago = SystemTime::now() - Duration::from_secs((RETENTION_DAYS - 2) * 86_400);
+        let days_ago = SystemTime::now() - Duration::from_secs(28 * 86_400);
         filetime::set_file_mtime(&recent, filetime::FileTime::from_system_time(days_ago)).unwrap();
 
         assert_eq!(a.prune().unwrap(), 0);
         assert!(recent.exists());
+    }
+
+    // 后面两条固定 29/31 天边界都假设这个值是 30——如果这个假设不成立，
+    // 这条先炸出一个清楚的信号，不能让边界测试悄悄测错边界。
+    //
+    // 会让这条测试变红的实现改法：改 `RETENTION_DAYS` 的值（不管改大
+    // 还是改小）。
+    #[test]
+    fn retention_days_is_30_as_documented() {
+        assert_eq!(RETENTION_DAYS, 30);
+    }
+
+    // R86：29 天必须留、31 天必须删，两条都固定写死天数，不跟
+    // `RETENTION_DAYS` 算——这样 `RETENTION_DAYS` 无论调大还是调小都
+    // 会被其中一条抓到（`prune_removes_files_older_than_retention` 用
+    // 40 天做夹具，同理只能抓"调大"；这两条专门补"调小"，也把边界
+    // 精确到 1 天）。
+    //
+    // 会让这条测试变红的实现改法：把 `RETENTION_DAYS` 从 30 改成任何
+    // 小于 30 的值（例如 3）——29 天老的文件会被误判成"超过保留期"
+    // 删掉，`assert_eq!(a.prune().unwrap(), 0)` 会看到 1。
+    #[test]
+    fn prune_keeps_a_file_exactly_29_days_old() {
+        let dir = tmpdir();
+        let a = Audit::open(dir.path().to_path_buf()).unwrap();
+        let recent = dir.path().join("rmc-2026-08-01.log");
+        std::fs::write(&recent, "29 天前的日志\n").unwrap();
+        let days_ago = SystemTime::now() - Duration::from_secs(29 * 86_400);
+        filetime::set_file_mtime(&recent, filetime::FileTime::from_system_time(days_ago)).unwrap();
+
+        assert_eq!(a.prune().unwrap(), 0);
+        assert!(recent.exists());
+    }
+
+    // 会让这条测试变红的实现改法：把 `RETENTION_DAYS` 从 30 改成任何
+    // 大于等于 31 的值（例如 60）——31 天老的文件会被误判成"还在保留
+    // 期内"留下来，`assert_eq!(a.prune().unwrap(), 1)` 会看到 0。
+    #[test]
+    fn prune_removes_a_file_exactly_31_days_old() {
+        let dir = tmpdir();
+        let a = Audit::open(dir.path().to_path_buf()).unwrap();
+        let old = dir.path().join("rmc-2026-08-01.log");
+        std::fs::write(&old, "31 天前的日志\n").unwrap();
+        let days_ago = SystemTime::now() - Duration::from_secs(31 * 86_400);
+        filetime::set_file_mtime(&old, filetime::FileTime::from_system_time(days_ago)).unwrap();
+
+        assert_eq!(a.prune().unwrap(), 1);
+        assert!(!old.exists());
     }
 
     #[test]
@@ -414,5 +621,117 @@ mod tests {
 
         let text = std::fs::read_to_string(a.current_path()).unwrap();
         assert!(text.contains("目录被删之后"), "{text}");
+    }
+
+    // --- R85：活着的 Audit 实例跨天要不要换文件，不能只靠纯函数测。
+    // ---
+
+    // 会让这条测试变红的实现改法：把 `record()`/`current_path()`
+    // "优化"成第一次调用时算好文件名、缓存起来复用（例如塞进一个
+    // `OnceLock<PathBuf>` 字段）——第二条记录会被错误地追加进第一天
+    // 的文件里：`path1 == path2`（`assert_ne!` 直接失败），就算文件名
+    // 计算本身没被缓存，`current_path()` 单独测过（如果它也被同一个
+    // bug 影响会在这里体现），本条主要钉住 `record()` 本身写进的是
+    // 哪个文件。
+    #[test]
+    fn record_recomputes_the_file_name_on_every_call_not_just_once() {
+        let dir = tmpdir();
+        let d1 = day(2026, 9, 13);
+        let d2 = day(2026, 9, 14);
+        let clock_ts = Arc::new(std::sync::atomic::AtomicI64::new(d1.unix_timestamp()));
+        let clock = {
+            let clock_ts = clock_ts.clone();
+            Arc::new(move || {
+                time::OffsetDateTime::from_unix_timestamp(
+                    clock_ts.load(std::sync::atomic::Ordering::SeqCst),
+                )
+                .unwrap()
+            }) as Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>
+        };
+        let a = Audit::with_clock(dir.path().to_path_buf(), clock);
+
+        a.record(Level::Info, "第一天的事件");
+        let path1 = a.current_path();
+
+        clock_ts.store(d2.unix_timestamp(), std::sync::atomic::Ordering::SeqCst);
+        a.record(Level::Info, "第二天的事件");
+        let path2 = a.current_path();
+
+        assert_ne!(path1, path2, "跨天之后 current_path() 应该换成新文件");
+        let text1 = std::fs::read_to_string(&path1).unwrap();
+        let text2 = std::fs::read_to_string(&path2).unwrap();
+        assert!(
+            text1.contains("第一天的事件") && !text1.contains("第二天的事件"),
+            "{text1}"
+        );
+        assert!(
+            text2.contains("第二天的事件") && !text2.contains("第一天的事件"),
+            "{text2}"
+        );
+    }
+
+    // --- R87：时间戳带显式的 ±HH:MM 偏移量。---
+
+    // 会让这条测试变红的实现改法：把 `line_for` 里的 `format_offset
+    // (d.offset())` 删掉——时间戳长度会缩短、第 20 个字符不再是符号位。
+    #[test]
+    fn timestamp_carries_an_explicit_utc_offset() {
+        let dir = tmpdir();
+        let a = Audit::open(dir.path().to_path_buf()).unwrap();
+        a.record(Level::Info, "带时区的时间戳");
+        let text = std::fs::read_to_string(a.current_path()).unwrap();
+        let line = text.lines().next().unwrap();
+        let ts = line.split(' ').next().unwrap();
+        // 形如 2026-09-13T11:12:44+08:00：日期 10 + T 1 + 时间 8 +
+        // 偏移量 6 = 25 个字符，第 20 个（0-based 索引 19）是符号位。
+        assert_eq!(
+            ts.len(),
+            "2026-09-13T11:12:44+08:00".len(),
+            "时间戳应带 ±HH:MM 偏移量：{ts}"
+        );
+        let sign = ts.as_bytes()[19];
+        assert!(
+            sign == b'+' || sign == b'-',
+            "第 20 个字符应该是偏移量的符号：{ts}"
+        );
+    }
+
+    #[test]
+    fn format_offset_writes_the_utc_case_explicitly_as_plus_zero() {
+        // 不用 "Z" 表示 UTC——退化到 UTC 的那一行应该长得跟本地时区
+        // 偏移量一样，不是另一套格式。
+        assert_eq!(format_offset(time::UtcOffset::UTC), "+00:00");
+    }
+
+    // --- R88：目录/文件权限在 Unix 上收紧。---
+
+    // 会让这条测试变红的实现改法：把 `record()`/`open()` 里对
+    // `harden_dir_permissions`/`harden_file_permissions` 的调用删掉
+    // ——目录/文件会留着 `create_dir_all`/`OpenOptions::create` 的
+    // 默认权限（`0755`/`0644`），本机任何用户都能读。
+    #[cfg(unix)]
+    #[test]
+    fn record_locks_down_file_and_directory_permissions_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir();
+        let a = Audit::open(dir.path().to_path_buf()).unwrap();
+        a.record(Level::Info, "权限测试");
+
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "目录权限应该收紧到 0700，实际 {dir_mode:o}"
+        );
+
+        let file_mode = std::fs::metadata(a.current_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "文件权限应该收紧到 0600，实际 {file_mode:o}"
+        );
     }
 }
