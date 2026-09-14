@@ -21,7 +21,13 @@ rustls-pemfile = "2"
 # default-features 会拉 aws-lc-rs，其 aws-lc-sys 需要 cmake 做一次数分钟的 C
 # 编译，CI 超时预算扛不住；ring 是纯 Rust 实现，编译快得多。
 russh = { version = "0.63", default-features = false, features = ["ring"] }
+# 只开 local-offset：审计日志的时间戳想显示现场笔记本的本地时间，不是
+# UTC。不开 formatting/macros——本模块自己手写 format! 拼时间戳，不用
+# `time::macros::datetime!` 或 `Formattable`，那两个 feature 声明了但
+# 没有任何代码路径会用到。
+time = { version = "0.3", default-features = false, features = ["local-offset"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+filetime = "0.2"
