@@ -583,7 +583,15 @@ mod tests {
     /// 会让这条测试变红的实现改法：在 `run()` 的读写循环里加一行
     /// `tracing::debug!(?data, ...)`（或者把 `ch_buf`/`up_buf` 的切片
     /// 原样传给任何 `tracing::` 宏）——不管加在哪个方向、哪个级别，这里
-    /// 的特征字节断言都会当场抓到。
+    /// 的特征字节断言都会当场抓到。R96 之前这句话是假的：那时只有
+    /// ASCII 子串匹配，`?slice` 这种最顺手的写法渲染成十进制数组，
+    /// 一个字符都对不上，整段明文进日志而测试照绿；见函数末尾那段
+    /// 注释与实测记录。现在三种写法各自实测变红：
+    ///
+    /// - `tracing::debug!(data = ?&ch_buf[..n], "MUTATION-A")`
+    /// - `tracing::info!(payload = ?&up_buf[..n], "MUTATION-B")`
+    /// - `tracing::warn!(text = %String::from_utf8_lossy(&ch_buf[..n]),
+    ///   "MUTATION-C")`
     ///
     /// 测试本身不是靠"pump.rs 现在没有任何 tracing 调用"这件事空转过
     /// 关：先故意触发 handler.rs 里唯一一处真实存在的
@@ -722,6 +730,33 @@ mod tests {
              （端口不匹配，connected_port=22002），不然下面「没有特征\
              字节」的断言证明不了任何事；已捕获：{captured:?}"
         );
+        // R96（最终复审发现）：光有上面这两条 ASCII 子串断言，对**最
+        // 可能发生的那种泄漏**是瞎的。实测：在 `run()` 的工程师→一体机
+        // 读循环里插一行
+        //     tracing::debug!(data = ?&ch_buf[..n], "MUTATION-A");
+        // ——整段明文一个字节不落地进了日志，197 条 lib 测试照样全绿。
+        // 捕获到的那一行长这样：`data=[82, 77, 67, 45, 84, 79, ...]`
+        // ——`&[u8]` 的 `Debug` 把每个字节渲染成十进制数字，一个 ASCII
+        // 字符都不出现，`contains(TO_APPLIANCE_MARKER)` 自然永远为假。
+        // 而 `?buf` / `?&buf[..n]` 恰恰是把载荷塞进 tracing 最顺手、
+        // 也是当初提这条要求时点名的那一种写法。
+        //
+        // 所以两个方向各再加一条断言，用载荷前 32 字节的 `Debug` 渲染
+        // 当特征串。渲染结果形如 `[82, 77, ..., 84]`，结尾那个 `]` 要
+        // 去掉——更长切片的渲染里，这一段之后跟的是 `, ` 而不是 `]`，
+        // 不去掉就不再是子串，断言会退化成永真。去掉之后，不管实现
+        // 记的是 `?&ch_buf[..n]`（长度恰好）还是 `?ch_buf`（整个 32K
+        // 缓冲区，后面全是 0），开头这一段都一模一样，照抓不误。
+        //
+        // 两类写法于是都被盖住：`?slice` 走这两条新断言，
+        // `%String::from_utf8_lossy(..)`（以及任何把字节当文本记的
+        // 写法）走上面两条 marker 断言。
+        let debug_prefix = |payload: &[u8]| {
+            let rendered = format!("{:?}", &payload[..32]);
+            rendered.trim_end_matches(']').to_string()
+        };
+        let to_appliance_debug = debug_prefix(&to_appliance_payload);
+        let from_appliance_debug = debug_prefix(&from_appliance_payload);
         for line in captured.iter() {
             assert!(
                 !line.contains(TO_APPLIANCE_MARKER),
@@ -730,6 +765,16 @@ mod tests {
             assert!(
                 !line.contains(FROM_APPLIANCE_MARKER),
                 "转发回工程师方向的内容出现在日志里：{line}"
+            );
+            assert!(
+                !line.contains(&to_appliance_debug),
+                "转发去一体机方向的内容以 `{{:?}}` 字节数组的形式出现在\
+                 日志里（特征串 {to_appliance_debug}...）：{line}"
+            );
+            assert!(
+                !line.contains(&from_appliance_debug),
+                "转发回工程师方向的内容以 `{{:?}}` 字节数组的形式出现在\
+                 日志里（特征串 {from_appliance_debug}...）：{line}"
             );
         }
     }
