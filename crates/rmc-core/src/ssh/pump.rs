@@ -698,10 +698,23 @@ mod tests {
         handle.shutdown().await;
 
         let captured = captured.lock().unwrap();
+        // R74（第三轮评审）：只断言"捕获到过至少一行"曾经削弱过——换成
+        // `set_global_default` 之后（见上面 R59 的说明），全 crate 唯一
+        // 那行 `tracing::warn!` 还有另一条测试
+        // （`test_support.rs::forwarded_channel_open_is_rejected_when_
+        // port_does_not_match`）也会触发它；如果那条测试先跑、往这个
+        // *全局* 缓冲区里塞了一行，而本测试自己触发的那一次因为某种
+        // 原因没被捕获到，`!captured.is_empty()` 依然会通过——哨兵只
+        // 证明了"这个 callsite 能被捕获"，不能证明"是本测试自己这次
+        // 触发被捕获"。改成对内容做匹配：本测试用端口 22002（注册的是
+        // 22001）触发拒绝，`handler.rs` 的 `warn!` 把 `connected_port`
+        // 当字段记录下来，匹配这个具体端口号才能证明确实是这一次
+        // 触发被捕获到，不是蒙对了非空。
         assert!(
-            !captured.is_empty(),
-            "capture 机制应该至少拦到 handler.rs 里那一次 tracing::warn!，\
-             不然下面「没有特征字节」的断言是在空缓冲区上自证"
+            captured.iter().any(|line| line.contains("22002")),
+            "capture 机制应该拦到本测试自己触发的那一次 tracing::warn!\
+             （端口不匹配，connected_port=22002），不然下面「没有特征\
+             字节」的断言证明不了任何事；已捕获：{captured:?}"
         );
         for line in captured.iter() {
             assert!(
