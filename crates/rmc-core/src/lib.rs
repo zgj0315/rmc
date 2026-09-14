@@ -7,6 +7,7 @@ pub mod config;
 pub mod error;
 pub mod knownhosts;
 pub mod platform;
+pub mod preflight;
 pub mod ssh;
 pub mod transport;
 pub mod tunnel;
