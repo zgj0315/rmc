@@ -499,4 +499,214 @@ mod tests {
             .expect("对着假 Gateway 探测 host key 不应该失败");
         assert_eq!(fp, expected_fingerprint().as_str());
     }
+
+    // R56（第二轮评审，LOW）：`tests/preflight.rs` 原来有一条 `#[ignore]`
+    // 的 `appliance_hostkey_step_reports_a_sha256_fingerprint`，需要
+    // `gateway/test-env` 的 `appliance` 服务在运行——但它测的是
+    // `appliance_host_key`（真实 TCP 拨号 + KEX），而 `appliance_host_key`
+    // 需要的只是"TCP 那一头真的是个会做 SSH 握手的服务端"，不需要真的是
+    // OpenSSH，也不需要 docker：`russh::server::run_stream` 泛型于任意
+    // `AsyncRead + AsyncWrite`，直接喂一个真实的 `tokio::net::TcpStream`
+    // 就能在进程内把"服务端"这一半也用 russh 实现，不用 `ssh::
+    // test_support::spawn_gateway` 的内存双工管道。这条测试因此把
+    // 那条 ignored 用例的断言原样搬到默认会跑的 `cargo test` 里：真的
+    // `TcpStream::connect` 一个本机端口，真的做一次 KEX，一体机 TCP／
+    // host key 两步都必须是 `Pass`，指纹必须等于独立算出来的期望值。
+    // 覆盖范围比原来那条 ignored 用例更宽（原来的只验证
+    // `STEP_APPLIANCE_HOSTKEY`，这条连 `STEP_APPLIANCE_TCP` 的 banner
+    // 检查也一并覆盖了——`russh::server::run_stream` 发送的版本行天然
+    // 以 "SSH-2.0-" 开头），原来那条 ignored 用例因此删掉，不再需要
+    // docker、也不再计入本 crate 的 ignored 总数。
+    //
+    // 会让这条测试变红的实现改法：跟
+    // `probe_host_key_over_reports_the_real_servers_fingerprint` 一样，
+    // 把 `check_server_key` 改成塞固定字符串；或者把 `appliance_banner`
+    // 的 `Ok`/`Err` 分支写反。
+    #[tokio::test]
+    async fn appliance_tcp_and_hostkey_steps_pass_over_a_real_tcp_socket() {
+        use crate::ssh::test_support::{expected_fingerprint, test_host_key};
+
+        struct MinimalServer;
+        impl russh::server::Handler for MinimalServer {
+            type Error = russh::Error;
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config = Arc::new(russh::server::Config {
+            keys: vec![test_host_key()],
+            ..Default::default()
+        });
+        // `run()` 对一体机做两次独立的 TCP 拨号（`appliance_banner`、
+        // `appliance_host_key` 各一次），服务端必须能接住不止一条连接，
+        // 否则第二次拨号会因为监听端已经在第一次 `accept` 之后被丢弃而
+        // 被拒绝/重置——不是每个连接各起一个监听端口，而是循环 accept，
+        // 每条连接各自 spawn 一个 `run_stream`。
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let cfg = server_config.clone();
+                tokio::spawn(run_stream_ignoring_errors(cfg, stream));
+            }
+        });
+
+        async fn run_stream_ignoring_errors(
+            cfg: Arc<russh::server::Config>,
+            stream: tokio::net::TcpStream,
+        ) {
+            let _ = russh::server::run_stream(cfg, stream, MinimalServer).await;
+        }
+
+        let appliance = HostPort::new("127.0.0.1", port).unwrap();
+        // 这条只关心一体机的两步，Gateway 用一个保证解析失败的名字，
+        // 避免这条不需要网络的测试意外摸到真实 DNS。
+        let gateway: HostPort = format!("{}.invalid:443", "a".repeat(64)).parse().unwrap();
+
+        let r = run(
+            &Transport::new(
+                Arc::new(crate::platform::NoProxy),
+                Arc::new(crate::platform::NoProxyAuth),
+                crate::transport::tls::TlsRoots::webpki(),
+            ),
+            &gateway,
+            &appliance,
+        )
+        .await;
+
+        let tcp = r
+            .steps
+            .iter()
+            .find(|s| s.name == STEP_APPLIANCE_TCP)
+            .unwrap();
+        assert!(
+            matches!(tcp.outcome, StepOutcome::Pass { .. }),
+            "{:?}",
+            tcp.outcome
+        );
+
+        let hostkey = r
+            .steps
+            .iter()
+            .find(|s| s.name == STEP_APPLIANCE_HOSTKEY)
+            .unwrap();
+        match &hostkey.outcome {
+            StepOutcome::Pass { detail } => {
+                assert!(detail.contains("SHA256:"), "{detail}");
+                assert_eq!(detail, expected_fingerprint().as_str());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // --- R54（第二轮评审，HIGH）：四步里 Pass 方向完全没有测试守着——
+    // `tests/preflight.rs` 已有的用例只覆盖 Fail/Skipped，Gateway TLS
+    // 步骤的成功分支唯一的把关者是 `#[ignore]` 的
+    // `all_four_steps_pass_against_the_harness`，本仓没有任何 CI 会跑
+    // 它。评审把 `run()` 里 TLS 步骤的成功分支改成恒定 `Fail`，146 条
+    // 依旧全绿。这里在进程内起一个真正的 rustls TLS 服务端（自签证书，
+    // 固定下来而不是每次现生成——跟 `ssh::test_support` 里固定 Ed25519
+    // host key 是同一个理由：两次连接不需要额外传证书对象），通过
+    // `TlsRoots::with_extra_pem` 把它加成信任根（Task 6 已经趟平的
+    // 用法，跟 `tests/transport.rs` 信任 harness 自签证书是同一个模式），
+    // 证明 DNS 成功、证书受信时 TLS 步骤真的是 `Pass`。
+    //
+    // 会让这条测试变红的实现改法：把 `run()` 里 TLS 步骤 `Ok(conn) =>
+    // {...}` 分支的结果强制改成 `fail(&e)`（不管 `transport.connect`
+    // 是否真的成功）——本地验证过：改完这条测试会在 `match` 的 `other`
+    // 分支上 panic。
+
+    /// 固定的测试专用 EC (P-256) 自签证书 + 私钥，本地用
+    /// `openssl req -x509 -newkey ec ...` 生成一次，CN/SAN 都是
+    /// `localhost`，只用来跑进程内假 Gateway 的 TLS 服务端，不是任何
+    /// 真实环境的凭据，有效期 100 年（避免这条测试因为证书过期而莫名
+    /// 变红）。
+    const TEST_TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBODCB36ADAgECAgkAr2yXAE+wDB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJ\n\
+bG9jYWxob3N0MCAXDTI2MDkxNDAzNDE1M1oYDzIxMjYwODIxMDM0MTUzWjAUMRIw\n\
+EAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ50frL\n\
+mLEPSa7z0sqCmmRXJQQxgTfzxlcoJ4CKlST85mlZ9Fl2Un3fPCYFwtRi0eEJ4jAh\n\
+5cf6WHGmEM9gZlsVoxgwFjAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0E\n\
+AwIDSAAwRQIgAQ1gD0AFOxtEdH0SRv1x7wvGDHHzEXsEqehSXayGKjcCIQCXRetW\n\
+I3vKyk+IVraIkoFtpwtyhck6zxYrkM07snH3iw==\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_TLS_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqqQ6iAlPo7gj+MbM\n\
+Z5JHB/f/r1o7nt406+2/PKx/N1yhRANCAAQ50frLmLEPSa7z0sqCmmRXJQQxgTfz\n\
+xlcoJ4CKlST85mlZ9Fl2Un3fPCYFwtRi0eEJ4jAh5cf6WHGmEM9gZlsV\n\
+-----END PRIVATE KEY-----\n";
+
+    #[tokio::test]
+    async fn gateway_tls_step_passes_when_the_certificate_is_trusted() {
+        use crate::platform::{NoProxy, NoProxyAuth};
+        use crate::transport::tls::TlsRoots;
+
+        let certs: Vec<_> = rustls_pemfile::certs(&mut TEST_TLS_CERT_PEM.as_bytes())
+            .collect::<std::result::Result<_, _>>()
+            .expect("测试证书应该能被解析");
+        let key = rustls_pemfile::private_key(&mut TEST_TLS_KEY_PEM.as_bytes())
+            .expect("测试私钥应该能被解析")
+            .expect("测试私钥不应该缺失");
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("测试证书与私钥应该匹配");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                // 预检的 TLS 步骤只关心握手成不成功，完成一次握手就够了。
+                let _ = acceptor.accept(sock).await;
+            }
+        });
+
+        let mut roots = TlsRoots::webpki();
+        roots.with_extra_pem(TEST_TLS_CERT_PEM.as_bytes()).unwrap();
+        let transport = Transport::new(Arc::new(NoProxy), Arc::new(NoProxyAuth), roots);
+
+        let gateway: HostPort = format!("localhost:{port}").parse().unwrap();
+        // 一体机步骤跟这条测试无关，绑一个立刻释放的端口，保证空置、
+        // 快速失败，不拖慢这条只关心 TLS 步骤的测试。
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let appliance = HostPort::new("127.0.0.1", dead.local_addr().unwrap().port()).unwrap();
+        drop(dead);
+
+        let r = run(&transport, &gateway, &appliance).await;
+        let tls = r.steps.iter().find(|s| s.name == STEP_GATEWAY_TLS).unwrap();
+        match &tls.outcome {
+            StepOutcome::Pass { .. } => {}
+            other => panic!("证书受信、握手应该成功，实际却是 {other:?}"),
+        }
+    }
+
+    // --- R55（第二轮评审，MED）：`bounded()` 的超时分支之前没有任何
+    // 测试命中过。用 `#[tokio::test(start_paused = true)]` 配
+    // `std::future::pending`（一个定义上永远不会自己完成、也不注册任何
+    // 定时器的占位 future）：`tokio::time::timeout` 内部会为它挂一个
+    // `PROBE_TIMEOUT` 之后到期的定时器，虚拟时钟在"没有别的活干、只剩
+    // 这一个定时器"时会自动跳到它的到期时刻——不需要真的等 8 秒挂钟
+    // 时间，也不需要改一行生产代码：`bounded` 本来就泛型于任意
+    // `Future`，这条本来就是免费的。
+    //
+    // 会让这条测试变红的实现改法：把 `unwrap_or_else(|_| Err(on_timeout()))`
+    // 换成别的错误分支（本地验证过：改成 `Err(Error::AuthRejected)`，
+    // 这条测试立刻在 `match` 上失败）。把 `bounded` 里的
+    // `tokio::time::timeout(PROBE_TIMEOUT, fut)` 直接换成裸 `fut`（去掉
+    // 超时保护）则会让这条测试真的挂住——`std::future::pending()` 定义
+    // 上就是永远不完成、也不注册任何定时器，虚拟时钟的自动前进机制救
+    // 不了一个压根没有定时器可跳的死等，这正是这条测试想防住的后果，
+    // 不需要在提交里真的复现一次死锁来证明它。
+    #[tokio::test(start_paused = true)]
+    async fn bounded_times_out_without_waiting_for_the_probe_budget_in_real_time() {
+        let result: Result<(), Error> =
+            bounded(std::future::pending(), || Error::Dns("探测超时占位".into())).await;
+        match result {
+            Err(Error::Dns(msg)) => assert_eq!(msg, "探测超时占位"),
+            other => panic!("超过 PROBE_TIMEOUT 应该报超时错误，实际却是 {other:?}"),
+        }
+    }
 }

@@ -18,14 +18,23 @@
 //! crate 已经被"失败路径报不出错、只会一直挂着"坑过不止一次（见
 //! `ssh::test_support` 模块文档、Task 7 报告）。
 //!
-//! 需要 docker 环境的三条仍然标 `#[ignore]`，与 `tests/transport.rs`/
+//! 需要 docker 环境的两条仍然标 `#[ignore]`，与 `tests/transport.rs`/
 //! `tests/ssh_tunnel.rs` 现有的十几条是同一个历史遗留限制（R40/R46）：
 //! 这台开发机没有 `/etc/hosts` 的 sudo 权限，`gateway.test` 解析不到
 //! docker 环境里的 Gateway，见 `tests/transport.rs` 顶部的说明。
-//! `appliance_hostkey_step_reports_a_sha256_fingerprint` 是例外——它只
-//! 检查一体机那一步，一体机地址是 docker 直接发布到宿主的
-//! `127.0.0.1:2322`（不涉及任何主机名解析），本任务开发时真的起过一次
-//! `gateway/test-env` 的 `appliance` 服务验证过这一条，见任务报告。
+//!
+//! R56（第二轮评审）：原来这里还有第三条 ignored 用例
+//! `appliance_hostkey_step_reports_a_sha256_fingerprint`，只检查一体机
+//! 那一步、只依赖 docker 发布的 `127.0.0.1:2322`，根本不需要
+//! `/etc/hosts` 这道限制——继续把它挂在"需要 docker"这个理由下没有道理：
+//! `appliance_host_key` 需要的只是"TCP 那一头有个会做 SSH 握手的服务
+//! 端"，不需要真的是 OpenSSH。已删掉，改成
+//! `rmc_core::preflight::tests::appliance_tcp_and_hostkey_steps_pass_over_a_real_tcp_socket`
+//! （`src/preflight.rs` 内部单测）：用 `russh::server::run_stream` 直接
+//! 喂一个真实的 `tokio::net::TcpStream`，在进程内把"服务端"这一半也用
+//! russh 实现，覆盖范围比原来那条更宽（原来只测 host key 这一步，这条
+//! 连 TCP／banner 这一步也一起覆盖了），而且默认就跑，不再计入本 crate
+//! 的 ignored 总数。
 
 use rmc_core::addr::HostPort;
 use rmc_core::error::ErrorClass;
@@ -155,6 +164,51 @@ async fn bad_gateway_name_fails_dns_and_skips_tls() {
     assert!(matches!(r.steps[3].outcome, StepOutcome::Skipped { .. }));
 }
 
+// R54（第二轮评审，HIGH）：`STEP_APPLIANCE_TCP` 的 Pass 方向之前一个字
+// 都没有测试守着——本文件原有用例只覆盖 Fail/Skipped 两个方向（下面的
+// `appliance_tcp_step_fails_when_the_port_answers_but_is_not_ssh` 是
+// Fail 方向），评审把 `appliance_banner` 的 `Ok(banner)` 分支改成恒定
+// `Err`，全套 `cargo test` 依旧全绿，因为 Pass 方向唯一的把关者是
+// `#[ignore]` 的 `all_four_steps_pass_against_the_harness`，本仓没有
+// 任何 CI 会跑它。这条补上 Pass 方向：一个真的说 SSH 的端口，这一步
+// 必须是 `Pass`，且 detail 里必须包含真实读到的 banner 文本（不是巧合
+// 命中"SSH banner"这几个字——banner 内容本身带一段不会出现在错误信息
+// 里的独有字符串）。
+// 会让这条测试变红的实现改法：把 `appliance_banner` 的 `Ok(banner)`
+// 分支改成恒定 `Err(...)`（哪怕真的读到了合法的 SSH banner）——本地
+// 验证过：改完之后这条测试立刻在 `match` 的 `other` 分支上 panic。
+#[tokio::test]
+async fn appliance_tcp_step_passes_and_reports_the_real_banner() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.write_all(b"SSH-2.0-TestApplianceD-8f2c1a\r\n").await;
+            // 稍微留一会儿再关闭，确保对端的 read 拿到的是这几个字节。
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let appliance = HostPort::new("127.0.0.1", port).unwrap();
+
+    let r = preflight_within(
+        "一体机端口真的说 SSH",
+        preflight::run(&transport(), &unresolvable_gateway(), &appliance),
+    )
+    .await;
+
+    let tcp = r
+        .steps
+        .iter()
+        .find(|s| s.name == STEP_APPLIANCE_TCP)
+        .unwrap();
+    match &tcp.outcome {
+        StepOutcome::Pass { detail } => {
+            assert!(detail.contains("SSH-2.0-TestApplianceD-8f2c1a"), "{detail}");
+        }
+        other => panic!("端口真的说 SSH，这一步不该是 {other:?}"),
+    }
+}
+
 // 这条不在 brief 原始草稿里：给 `STEP_APPLIANCE_TCP` 补一条"结果真的被
 // 采纳"的证据——一个真的在监听、真的能三次握手成功的端口，只要它不说
 // SSH，这一步也必须失败，而不是把"连得上 socket"直接当成"这一步通过"。
@@ -254,26 +308,6 @@ fn appliance_ssh() -> HostPort {
 async fn all_four_steps_pass_against_the_harness() {
     let r = preflight::run(&transport(), &gateway_tls(), &appliance_ssh()).await;
     assert!(r.passed(), "{:#?}", r.steps);
-}
-
-// 与其他两条 `#[ignore]` 用例不同：这一条只依赖 docker 发布到宿主的
-// `127.0.0.1:2322`（一体机 SSH，容器内部端口是方案 §3.8 要求的
-// 61001），不涉及任何主机名解析——`gateway` 参数在这条用例里从头到尾
-// 只影响 DNS/TLS 那两步，不影响这里断言的一体机步骤。本任务开发时真的
-// 起过一次 `gateway/test-env` 的 `appliance` 服务验证过，见任务报告。
-#[tokio::test]
-#[ignore = "需要 gateway/test-env 的 appliance 服务在运行"]
-async fn appliance_hostkey_step_reports_a_sha256_fingerprint() {
-    let r = preflight::run(&transport(), &unresolvable_gateway(), &appliance_ssh()).await;
-    let step = r
-        .steps
-        .iter()
-        .find(|s| s.name == STEP_APPLIANCE_HOSTKEY)
-        .unwrap();
-    match &step.outcome {
-        StepOutcome::Pass { detail } => assert!(detail.contains("SHA256:"), "{detail}"),
-        other => panic!("{other:?}"),
-    }
 }
 
 #[tokio::test]
