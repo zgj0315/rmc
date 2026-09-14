@@ -38,13 +38,37 @@ pub const TUNNEL_USER: &str = "tunnel-zhang";
 pub const TUNNEL_PW: &str = "tunnel-init-pw";
 pub const REVERSE_PORT: u16 = 22001;
 
+/// 每次都要一个全新、保证互不冲突的路径。
+///
+/// R96（最终复审发现）：这里原来用纳秒时间戳拼路径，跟
+/// `src/ssh/test_support.rs::tmp_known_hosts` 当初那一版一模一样——而
+/// 那一版已经因为一个**实测踩到过的真故障**被换掉了：
+/// `wrong_password_is_auth_rejected` 跟另一条测试撞了同一个纳秒、共用
+/// 同一份 `known_hosts` 文件，读到别的用例写进去的指纹，报出一个不相关
+/// 的 `HostKeyMismatch` 而不是预期的 `AuthRejected`（详见
+/// `test_support.rs` 上同名函数的文档注释）。
+///
+/// CI 的 integration job 靠 `--test-threads=1` 兜住了这个形状；但本机
+/// 直接 `cargo test -p rmc-core -- --ignored`（不带 `--test-threads=1`）
+/// 就原样暴露在同一个已被证实过的故障里，而且现场看起来像是被测代码
+/// 的 host key 校验出了问题，不像夹具自己撞了路径。纳秒这个粒度靠不住
+/// 不是推测：把这段路径生成逻辑原样抄出来，8 个线程各调 2000 次，本机
+/// 实测 16000 个路径里只有 2400~4500 个是唯一的，撞车率 72%~85%。
+///
+/// **修好这一条不等于并发跑就绿了**，别据此去掉 `--test-threads=1`：
+/// `ssh_tunnel.rs`/`forwarding.rs` 里有几条用例会真的把反向端口 22001
+/// 绑起来，并发跑必然互相抢占（实测失败是 `ForwardPortBusy(22001)`）。
+/// 那是一个独立的、结构性的理由，本函数管不着。这一条修的是另一半：
+/// 并发跑失败时，失败原因应当是那个真实存在的端口争用，而不是夹具自己
+/// 撞路径伪装成的 `HostKeyMismatch`。
+///
+/// `tempfile::tempdir()` 用的是操作系统级别的唯一名字生成，不会有这个
+/// 问题——拿到路径之后立刻让 `TempDir` guard 被丢弃也没关系：
+/// `KnownHosts::append()` 自己会在第一次写入时用 `create_dir_all` 补上
+/// 目录，路径本身的唯一性才是这里真正依赖的性质。
 pub fn tmp_known_hosts() -> KnownHosts {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    KnownHosts::open(std::env::temp_dir().join(format!("rmc-kh-{n}/known_hosts")))
+    let dir = tempfile::tempdir().expect("创建临时目录失败");
+    KnownHosts::open(dir.path().join("known_hosts"))
 }
 
 pub fn gateway() -> HostPort {
