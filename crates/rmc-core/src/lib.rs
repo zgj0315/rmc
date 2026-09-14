@@ -9,8 +9,11 @@ pub mod knownhosts;
 pub mod platform;
 pub mod preflight;
 pub mod ssh;
+pub mod state;
+pub mod supervisor;
 pub mod transport;
 pub mod tunnel;
 
 pub use addr::HostPort;
 pub use error::{Error, ErrorClass, Result};
+pub use state::{Command, State, TunnelEvent};
