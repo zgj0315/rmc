@@ -1,6 +1,18 @@
 //! 代理串解析。纯函数，与 Win32 无关，因此跨平台可测。
-//! 覆盖两种来源：WinHTTP/IE 的 `http=host:port;https=host:port`，
-//! 以及 PAC 求值结果 `PROXY host:port; DIRECT`。
+//! 覆盖两种来源：WinHTTP/IE 的手工配置 `http=host:port;https=host:port`，
+//! 以及 PAC 求值结果——`DIRECT`，或者跟手工配置同样格式的
+//! `scheme=host:port[;...]` 列表（这是 `WinHttpGetProxyForUrl` 真正
+//! 返回的形状：它已经替调用方从 PAC 脚本的原始返回值里剥掉了
+//! `SOCKS`/`SOCKS4`/`SOCKS5` 这些非 HTTP 类型、并在遇到 `DIRECT` 时
+//! 截断列表，`WINHTTP_PROXY_INFO.lpszProxy` 的文档格式跟
+//! `WINHTTP_CURRENT_USER_IE_PROXY_CONFIG.lpszProxy` 完全一样，见
+//! `winhttp.rs` 里 `eval_pac` 的实现与那里引用的文档）。这个函数额外
+//! 兼容 `PROXY host:port`/`HTTP host:port`/`HTTPS host:port` 这种空格
+//! 分隔的 PAC 原生关键字写法，以及 `SOCKS*` 关键字（识别出来但不当成
+//! 可用代理，因为这条隧道全靠 HTTP CONNECT 建立、SOCKS 用不了）——这不
+//! 是本函数会从真实 WinHTTP 调用点收到的输入，是为了不让这个"纯函数、
+//! 可以被任何调用方喂任何字符串"的公开 API 在收到这类输入时安静地做错
+//! 事（把字面量 `SOCKS5`/`HTTPS` 当成主机名去解析）。
 
 use rmc_core::addr::HostPort;
 
@@ -43,13 +55,49 @@ pub fn parse_proxy_list(raw: &str, _target_host: &str) -> Option<HostPort> {
     let mut i = 0usize;
     while i < entries.len() {
         let entry = entries[i];
-        // PAC 形式：PROXY host:port
-        if entry.eq_ignore_ascii_case("PROXY") {
+
+        // PAC 原生返回值的裸关键字写法（空格分隔，不带 `=`）：
+        // `PROXY host:port`、`HTTP host:port`、`HTTPS host:port`。
+        // "下一个 token 就是地址"这件事只在下一个 token 本身不是另一个
+        // 保留关键字时才成立——`PROXY ;DIRECT` 这种畸形输入按分隔符拆完
+        // 之后，"PROXY" 紧跟着的就是字面量 "DIRECT"，不做这层检查会把
+        // "DIRECT" 错当成主机名解析出 `DIRECT:80` 这样一个荒谬的代理。
+        if entry.eq_ignore_ascii_case("PROXY")
+            || entry.eq_ignore_ascii_case("HTTP")
+            || entry.eq_ignore_ascii_case("HTTPS")
+        {
+            let is_https = entry.eq_ignore_ascii_case("HTTPS");
             i += 1;
-            if let Some(hp) = entries.get(i).and_then(|e| parse_one(e)) {
-                first_hit = first_hit.or(Some(hp));
+            if let Some(next) = entries.get(i) {
+                if !is_reserved_keyword(next) {
+                    if let Some(hp) = parse_one(next) {
+                        if is_https {
+                            https_hit = https_hit.or(Some(hp));
+                        } else {
+                            first_hit = first_hit.or(Some(hp));
+                        }
+                    }
+                    i += 1;
+                }
             }
+            continue;
+        }
+        // SOCKS/SOCKS4/SOCKS5：PAC 合法的返回值类型，但这条隧道全靠
+        // HTTP CONNECT 建立，SOCKS 是完全不同的协议，用不了。把它的
+        // 地址当成 HTTP 代理去 CONNECT，只会连上一个不认识 HTTP 的
+        // 服务器——比直接跳过更容易在排查时误导人（现场会看到「Gateway
+        // TLS 失败」而不是「代理类型不支持」）。跳过整条 `SOCKS* addr`，
+        // 让循环继续找列表里后面能用的条目。
+        if entry.eq_ignore_ascii_case("SOCKS")
+            || entry.eq_ignore_ascii_case("SOCKS4")
+            || entry.eq_ignore_ascii_case("SOCKS5")
+        {
             i += 1;
+            if let Some(next) = entries.get(i) {
+                if !is_reserved_keyword(next) {
+                    i += 1;
+                }
+            }
             continue;
         }
         if entry.eq_ignore_ascii_case("DIRECT") {
@@ -57,11 +105,19 @@ pub fn parse_proxy_list(raw: &str, _target_host: &str) -> Option<HostPort> {
             continue;
         }
 
-        // WinHTTP 形式：可能带 scheme=
+        // 手工配置形式：可能带 scheme=
         let (scheme, body) = match entry.split_once('=') {
             Some((s, b)) => (Some(s.to_ascii_lowercase()), b),
             None => (None, entry),
         };
+        // socks=/socks4=/socks5= 同上，跳过而不是当成 HTTP 代理解析。
+        if matches!(
+            scheme.as_deref(),
+            Some("socks") | Some("socks4") | Some("socks5")
+        ) {
+            i += 1;
+            continue;
+        }
         if let Some(hp) = parse_one(body) {
             if scheme.as_deref() == Some("https") {
                 https_hit = https_hit.or(Some(hp));
@@ -75,6 +131,16 @@ pub fn parse_proxy_list(raw: &str, _target_host: &str) -> Option<HostPort> {
     // 建 CONNECT 隧道要用 https 那一项（跟代理之间也走加密），其余情况
     // 退回第一个能解析出来的条目。
     https_hit.or(first_hit)
+}
+
+/// `PROXY`/`HTTP`/`HTTPS`/`SOCKS*` 这些裸关键字词——独立成词时不能被
+/// 当成主机名去解析。见 [`parse_proxy_list`] 里对 `PROXY ;DIRECT` 这类
+/// 畸形输入的处理。
+fn is_reserved_keyword(s: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "DIRECT", "PROXY", "SOCKS", "SOCKS4", "SOCKS5", "HTTP", "HTTPS",
+    ];
+    KEYWORDS.iter().any(|k| s.eq_ignore_ascii_case(k))
 }
 
 /// `host` 或 `host:port`，端口缺省为 80。
@@ -222,6 +288,83 @@ mod tests {
         // 而不是跳过）。
         let hp = parse_proxy_list("https=:::;https=p.company.com:8443", "gw.company.com").unwrap();
         assert_eq!(hp.to_string(), "p.company.com:8443");
+    }
+
+    #[test]
+    fn socks_keyword_is_recognized_and_not_treated_as_a_proxy_host() {
+        // W18（评审）：改红前，"SOCKS5 p.company.com:1080" 会把字面量
+        // "SOCKS5" 当成裸主机名解析成 `SOCKS5:80`，报告成一个自信的
+        // 代理——现场表现是客户端去 TCP 拨一台真的叫 "SOCKS5" 的主机，
+        // 失败被归因成"Gateway TLS 失败"而不是"代理类型不支持"。
+        //
+        // 改红：删掉 SOCKS/SOCKS4/SOCKS5 那个分支（连同它的 `continue`），
+        // 让 "SOCKS5" 掉进最后的手工配置分支被当成裸主机名解析。
+        for raw in ["SOCKS5 p.company.com:1080", "SOCKS p.company.com:1080"] {
+            assert!(parse_proxy_list(raw, "gw.company.com").is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn socks_scheme_prefix_form_is_also_skipped() {
+        // 手工配置格式里的 `socks=host:port`（真实的 IE"高级"代理设置
+        // 允许单独给 SOCKS 填一条）同样不可用——不跟任何其它条目搭配，
+        // 单独一条 `socks=` 应该被跳过，跳过之后没有其它候选，结果是
+        // `None`。
+        //
+        // 注意：这条测试原来写成跟一条 `https=` 搭配、断言选中 https
+        // 那一项——但 `https_hit.or(first_hit)` 里 https 优先级本来就
+        // 高于其它一切，删掉 socks= 的跳过逻辑之后 socks= 会走进
+        // `first_hit`，`https_hit.or(first_hit)` 仍然选 https_hit，
+        // 测试结果不变、看不出任何差别——这是本任务实现过程中自己
+        // 抓到的一次弱测试（改红验证时才发现），已经改成这条更严格的
+        // 独立形式，配合下面
+        // `socks_scheme_prefix_does_not_shadow_a_later_usable_entry`
+        // 一起覆盖"单独出现"与"跟非 https 条目搭配"两种情况。
+        //
+        // 改红：删掉 `matches!(scheme.as_deref(), Some("socks") | ...)`
+        // 这一整段 socks= 跳过逻辑——"socks=socks.company.com:1080" 会
+        // 被当成一个普通 scheme 走进 first_hit，返回 Some 而不是 None。
+        assert!(parse_proxy_list("socks=socks.company.com:1080", "gw.company.com").is_none());
+    }
+
+    #[test]
+    fn socks_scheme_prefix_does_not_shadow_a_later_usable_entry() {
+        // 混在一条可用的 `http=` 条目旁边（都不是 https，所以走的是
+        // `first_hit` 而不是 `https_hit` 的优先级）时，可用的那条应该
+        // 照样被选中，而不是被 `socks=` 抢占 `first_hit`。
+        //
+        // 改红：同上，删掉 socks= 跳过逻辑——socks= 会抢先填满
+        // first_hit，后面的 http= 条目因为 `first_hit.or(Some(hp))`
+        // 的短路而被忽略，结果变成 socks.company.com:1080 而不是
+        // p.company.com:8080。
+        let hp = parse_proxy_list(
+            "socks=socks.company.com:1080;http=p.company.com:8080",
+            "gw.company.com",
+        )
+        .unwrap();
+        assert_eq!(hp.to_string(), "p.company.com:8080");
+    }
+
+    #[test]
+    fn https_keyword_form_is_recognized_like_the_equals_form() {
+        // 部分 PAC 实现会用裸关键字写法而不是手工配置的 `https=` 形式。
+        //
+        // 改红：把 `entry.eq_ignore_ascii_case("HTTPS")` 那个分支条件
+        // 里的 `HTTPS` 删掉（只留 PROXY/HTTP），"HTTPS" 会被当成主机名
+        // 解析成 `HTTPS:80` 而不是识别出后面那个地址。
+        let hp = parse_proxy_list("HTTPS p.company.com:8443", "gw.company.com").unwrap();
+        assert_eq!(hp.to_string(), "p.company.com:8443");
+    }
+
+    #[test]
+    fn proxy_keyword_followed_by_another_keyword_has_no_usable_address() {
+        // W18（评审）：`"PROXY ;DIRECT"` 这种畸形输入按分隔符拆完之后，
+        // "PROXY" 后面紧跟的就是字面量 "DIRECT"——改红前这里会被当成
+        // 主机名解析出 `DIRECT:80`，报告成一个自信的代理。
+        //
+        // 改红：把 `if !is_reserved_keyword(next)` 这层判断删掉，
+        // 直接对 `next` 调 `parse_one`。
+        assert!(parse_proxy_list("PROXY ;DIRECT", "gw.company.com").is_none());
     }
 
     #[test]
