@@ -691,6 +691,26 @@ mod tests {
     }
 
     #[test]
+    fn the_file_name_keeps_all_128_bits_of_the_hash() {
+        // `different_keys_do_not_collide` 只用两个 key，挡不住哈希被截短
+        // ——`.take(16)` 改成 `.take(4)` 全套仍然绿（复审实测 24 passed）。
+        // 而截短的后果不是"文件名难看"：两个 key 撞到同一个文件名，
+        // 意味着 A 运维服务器的口令被填进 B 的密码框。
+        //
+        // 造一次真实碰撞太做作，钉长度不做作——这一句就够。
+        //
+        // 改红：把 `path_for` 里的 `.take(16)` 改成任何别的数。
+        let s = FileSecretStore::new(std::path::PathBuf::from("/nonexistent"), FlipSealer);
+        let stem = s.path_for("tunnel-zhang@gateway.company.com:443");
+        let stem = stem.file_stem().unwrap().to_str().unwrap();
+        assert_eq!(stem.len(), 32, "128 位哈希应该是 32 个十六进制字符");
+        assert!(
+            stem.bytes().all(|b| b.is_ascii_hexdigit()),
+            "文件名主体应该全是十六进制字符：{stem}"
+        );
+    }
+
+    #[test]
     fn overwrite_replaces_the_previous_secret() {
         let s = FileSecretStore::new(tmpdir(), FlipSealer);
         s.save("k", "old").unwrap();
