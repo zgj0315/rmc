@@ -199,26 +199,85 @@ fn with_input_desc<R>(bytes: &mut [u8], f: impl FnOnce(Option<*const SecBufferDe
     f(Some(&desc as *const SecBufferDesc))
 }
 
+/// 用一个**由 SSPI 分配**的输出缓冲搭出 `SecBufferDesc`，同样建在
+/// **这个函数自己的栈帧上**，把指向它的指针交给 `f`；`f` 返回之后，
+/// 不论成败都把 SSPI 写进去的 token 取走、抹零、`FreeContextBuffer`
+/// 还回去。
+///
+/// # 为什么输出侧也要收成这个形状（W44）
+///
+/// [`with_input_desc`] 只收了输入那一半。输出那一半
+/// （`out_desc.pBuffers = &mut out_buf`，两个都是 `step` 的局部变量，
+/// 而 `out_desc` 要活过闭包里那次 `InitializeSecurityContextW`）是
+/// **一模一样的自引用形状**，一旦有人把 `out_buf` 挪进一个块里就是同
+/// 一个 use-after-free——而复审实测过：这么改之后 macOS 74 条测试
+/// `ok`、`cargo zigbuild --tests` rc=0 零告警、`clippy -- -D warnings`
+/// rc=0 零告警，**三道防线同样全盲**。那块缓冲里装的正是刚从 SSPI
+/// 拿到的 token。
+///
+/// 收进闭包之后，`buf` 与 `desc` 被关进一个必然比 `f(...)` 长寿的栈帧，
+/// 调用方连"建在块里"这个形状都写不出来。
+///
+/// 顺带把两条顺序约束也变成结构性的：
+///
+/// 1. **归还一定发生**——不论 `f` 走的是成功路径还是失败路径，
+///    `take_token` 都在 `f` 返回之后执行。`ISC_REQ_ALLOCATE_MEMORY`
+///    下缓冲是 SSPI 分配的，必须 `FreeContextBuffer`，而**失败路径上
+///    SSPI 也可能已经写进了一段**（例如要发给服务端的错误 token），
+///    所以"失败就直接 return"是漏。
+/// 2. **`CompleteAuthToken` 一定排在归还之前**——它要读的就是这块还
+///    没还回去的缓冲，所以它只能写在 `f` 内部。
+///
+/// # Safety
+///
+/// `f` 拿到的那个指针只许交给带 `ISC_REQ_ALLOCATE_MEMORY` 的
+/// `InitializeSecurityContextW`（本模块的 [`REQ_FLAGS`] 固定带着它）
+/// 与紧随其后、针对同一次调用的 `CompleteAuthToken`；不许往
+/// `pvBuffer` 里塞一个不是 SSPI 分配的指针，也不许把这个指针留到 `f`
+/// 返回之后。归还那一步（[`take_token`] 里的 `FreeContextBuffer`）
+/// 就建立在"这块缓冲只可能是 SSPI 分配的"这一条上。
+unsafe fn with_output_desc<R>(
+    f: impl FnOnce(*mut SecBufferDesc) -> R,
+) -> (R, Option<Zeroizing<Vec<u8>>>) {
+    // 不自己预分配定长缓冲：计划原文那个 16KB 固定缓冲会截断带 PAC 的
+    // Kerberos token（`cbMaxToken` 在 Negotiate 上通常是 48KB），而
+    // 截断之后只会换回一个 `SEC_E_BUFFER_TOO_SMALL`，没有别的提示。
+    let mut buf = SecBuffer {
+        cbBuffer: 0,
+        BufferType: SECBUFFER_TOKEN,
+        pvBuffer: std::ptr::null_mut(),
+    };
+    let mut desc = SecBufferDesc {
+        ulVersion: SECBUFFER_VERSION,
+        cBuffers: 1,
+        pBuffers: &mut buf,
+    };
+    // `buf` 与 `desc` 都是本函数的局部变量，它们的存储活到本函数返回
+    // 为止——也就是必然覆盖下面这次 `f` 调用。
+    let out = f(&mut desc);
+    // SAFETY: 按函数级 Safety 契约，`f` 只可能让 SSPI 往 `buf` 里写一块
+    // 自己分配的缓冲（或者一个字节都没写，那时 `pvBuffer` 仍是 NULL）。
+    let token = unsafe { take_token(&mut buf) };
+    (out, token)
+}
+
 impl SspiContext for NegotiateContext {
     fn step(&mut self, input: Option<&[u8]>) -> SspiStep {
+        // 这一支经 [`super::SspiProxyAuthenticator`] **到不了**（W46）：
+        // 会把 `finished` 置真的三种结局里，`Done` 与 `Failed` 都让协商器
+        // 当场 `neg.context = None`，而 `Token { last: true }` 让协商器记下
+        // `concluded`、下一次调用在 `advance` 里就被 `Completed` 那一支拦
+        // 住，根本不会再碰这个上下文。留着它是因为 [`NegotiateContext`] 是
+        // 一个**公开类型**、实现的是一个公开 trait：任何别的调用方都可以
+        // 自己驱动它，而对一个已经收工的 SSPI 上下文再调一次
+        // `InitializeSecurityContextW` 换回来的是一个看不懂的状态码。
+        // 文案因此写成给人看的话，不再是那句内部行话。
         if self.finished {
-            return SspiStep::Failed("这个上下文的协商已经结束".into());
+            return SspiStep::Failed(format!(
+                "{} 协商在这个上下文里已经走完，不能再往前推进；下一次连接需要一个新的上下文",
+                self.package.package_name()
+            ));
         }
-
-        // 输出缓冲由 SSPI 自己分配（`ISC_REQ_ALLOCATE_MEMORY`）。不自己
-        // 预分配定长缓冲：计划原文那个 16KB 固定缓冲会截断带 PAC 的
-        // Kerberos token（`cbMaxToken` 在 Negotiate 上通常是 48KB），
-        // 而截断之后只会换回一个 `SEC_E_BUFFER_TOO_SMALL`，没有别的提示。
-        let mut out_buf = SecBuffer {
-            cbBuffer: 0,
-            BufferType: SECBUFFER_TOKEN,
-            pvBuffer: std::ptr::null_mut(),
-        };
-        let mut out_desc = SecBufferDesc {
-            ulVersion: SECBUFFER_VERSION,
-            cBuffers: 1,
-            pBuffers: &mut out_buf,
-        };
 
         // 输入缓冲。首段没有输入 → 空切片 → `with_input_desc` 交 NULL。
         // 那个 helper 的文档解释了为什么这里必须是闭包形状（W34）。
@@ -227,51 +286,65 @@ impl SspiContext for NegotiateContext {
         let mut new_ctx = SecHandle::default();
         let mut attrs = 0u32;
         let mut expiry = 0i64;
-        let status = with_input_desc(&mut in_bytes, |pinput| {
-            // SAFETY: `cred` 是 `new` 里拿到、本对象持有到 `Drop` 的有效
-            // 凭据句柄；`self.ctx` 要么是上一段协商产出的有效上下文句柄，
-            // 要么是 `None`（首段）；`self.target` 是以 0 结尾的宽字符串，
-            // 活得比这次调用长；`pinput` 要么是 NULL，要么指向
-            // `with_input_desc` 栈帧上的 `SecBufferDesc`——那个栈帧覆盖
-            // 整个闭包调用，而它指向的 `in_bytes` 是本函数的局部变量；
-            // `out_desc`/`new_ctx`/`attrs`/`expiry` 都是本次调用独占的
-            // 栈上可变引用。
-            unsafe {
-                InitializeSecurityContextW(
-                    Some(&self.cred),
-                    self.ctx.as_ref().map(|c| c as *const SecHandle),
-                    Some(self.target.as_ptr()),
-                    REQ_FLAGS,
-                    0,
-                    SECURITY_NATIVE_DREP,
-                    pinput,
-                    0,
-                    Some(&mut new_ctx),
-                    Some(&mut out_desc),
-                    &mut attrs,
-                    Some(&mut expiry),
-                )
-            }
-        });
 
-        // 少数包（Digest 之类）会要求补一次 `CompleteAuthToken` 才算把
-        // token 做完。必须在归还输出缓冲**之前**做。
-        if super::needs_complete_auth_token(status.0) {
-            // SAFETY: `new_ctx` 是这次调用刚产出的上下文句柄，
-            // `out_desc` 仍指向尚未归还的输出缓冲。
-            if let Err(e) = unsafe { CompleteAuthToken(&new_ctx, &out_desc) } {
-                tracing::warn!(
-                    "CompleteAuthToken 失败：{}",
-                    super::describe_sspi_status(e.code().0)
-                );
-            }
-        }
+        // 输出缓冲同样收进闭包（W44）：`with_output_desc` 的栈帧覆盖整个
+        // 调用，缓冲的归还与 `CompleteAuthToken` 的先后也一并由它保证。
+        //
+        // 闭包单独绑一个名字，而不是写在 `unsafe { ... }` 里面：那样整个
+        // 闭包体都会落进同一个 `unsafe` 块，里面每一处 FFI 调用各自的
+        // SAFETY 注释就都变成 `unused_unsafe` 告警，这个模块最需要的
+        // 「一处 unsafe 一条理由」也就没了地方写。
+        let call = |pout: *mut SecBufferDesc| {
+            with_input_desc(&mut in_bytes, |pinput| {
+                // SAFETY: `cred` 是 `new` 里拿到、本对象持有到 `Drop`
+                // 的有效凭据句柄；`self.ctx` 要么是上一段协商产出的
+                // 有效上下文句柄，要么是 `None`（首段）；`self.target`
+                // 是以 0 结尾的宽字符串，活得比这次调用长；`pinput`
+                // 要么是 NULL，要么指向 `with_input_desc` 栈帧上的
+                // `SecBufferDesc`——那个栈帧覆盖整个闭包调用，而它指
+                // 向的 `in_bytes` 是本函数的局部变量；`pout` 指向
+                // `with_output_desc` 栈帧上的 `SecBufferDesc`，那个栈
+                // 帧同样覆盖整个闭包调用；`new_ctx`/`attrs`/`expiry`
+                // 都是本次调用独占的栈上可变引用。
+                let status = unsafe {
+                    InitializeSecurityContextW(
+                        Some(&self.cred),
+                        self.ctx.as_ref().map(|c| c as *const SecHandle),
+                        Some(self.target.as_ptr()),
+                        REQ_FLAGS,
+                        0,
+                        SECURITY_NATIVE_DREP,
+                        pinput,
+                        0,
+                        Some(&mut new_ctx),
+                        Some(pout),
+                        &mut attrs,
+                        Some(&mut expiry),
+                    )
+                };
 
-        // 不论成败都把输出缓冲拿走并归还——失败路径下 SSPI 也可能已经
-        // 写进了一段（例如要发给服务端的错误 token）。
-        // SAFETY: `out_buf` 的指针要么是 NULL，要么是这次调用用
-        // `ISC_REQ_ALLOCATE_MEMORY` 分配出来的缓冲。
-        let token = unsafe { take_token(&mut out_buf) };
+                // 少数包（Digest 之类）会要求补一次 `CompleteAuthToken`
+                // 才算把 token 做完。**必须在归还输出缓冲之前做**——
+                // 写在这里，这条顺序就是结构性的：归还发生在
+                // `with_output_desc` 里、本闭包返回之后。
+                if super::needs_complete_auth_token(status.0) {
+                    // SAFETY: `new_ctx` 是这次调用刚产出的上下文句柄，
+                    // `pout` 仍指向尚未归还的输出缓冲。
+                    if let Err(e) = unsafe { CompleteAuthToken(&new_ctx, pout) } {
+                        tracing::warn!(
+                            "CompleteAuthToken 失败：{}",
+                            super::describe_sspi_status(e.code().0)
+                        );
+                    }
+                }
+                status
+            })
+        };
+        // SAFETY: 上面那个闭包只把 `pout` 交给带 `ISC_REQ_ALLOCATE_MEMORY`
+        // 的 `InitializeSecurityContextW`（[`REQ_FLAGS`] 固定带着它）与紧
+        // 随其后、针对同一次调用的 `CompleteAuthToken`，不另作他用，也不
+        // 把它留到闭包之外——这正是 `with_output_desc` 的 Safety 契约。
+        let (status, token) = unsafe { with_output_desc(call) };
 
         // 状态码 + 输出 token → 这一段算什么、句柄接不接管、上下文到没
         // 到头。**判断本身一行都不留在这里**（W29）：全在

@@ -21,15 +21,38 @@
 //! `Arc<dyn ProxyAuthenticator>` 被 `Transport` 持有到进程结束——同一个
 //! 协商器实例要伺候此后每一次重连。
 //!
-//! 「新一轮协商开始」的唯一信号是首次调用时 `challenge == None`
-//! （`http_connect` 第一次发 CONNECT 时手里还没有任何 challenge）。
-//! 因此 [`SspiProxyAuthenticator::next_token`] 在 `challenge.is_none()`
-//! 时**无条件重建**上下文。计划原文写的是「只在还没建过时才建」，
-//! 那会让第一次协商结束（无论成败）之后的每一次重连都拿不到 token、
-//! 直接 `ProxyAuthFailed`——客户端在第一次断线之后永久废掉，而那恰恰
-//! 是 Supervisor 存在的全部场景。见
-//! `a_challengeless_call_starts_a_fresh_context_for_the_next_connection`
-//! 与 `a_failed_negotiation_does_not_disable_the_authenticator_forever`。
+//! 「新一条连接开始了」这件事由
+//! [`rmc_core::platform::ProxyAuthenticator::begin_connection`] **明说**
+//! （`http_connect` 在它的轮询循环之前调用恰好一次），
+//! [`SspiProxyAuthenticator::begin_connection`] 在那里**无条件**丢掉上一
+//! 次连接留下的一切。于是「每次连接尝试新建一个上下文」这条硬约束是
+//! **结构性的**，不再是从 challenge 里推断出来的。
+//!
+//! # 在 `begin_connection` 之前，这里靠猜（W45）
+//!
+//! 修复轮 2 之前，唯一的信号是 `challenge == None`：一条连接的第一个
+//! 407 不带 token68，所以「没有 challenge」被当成「新一轮开始」。
+//! 这条推断有一半是对的（计划原文写的「只在还没建过时才建」会让第一次
+//! 协商结束之后的每一次重连都拿不到 token，客户端第一次断线就永久
+//! 废掉），**另一半是错的**：同一条连接里，最后一段 token 发出之后
+//! 代理再回一个**裸的** `Proxy-Authenticate: Negotiate`——NTLM 拒绝
+//! Type-3 之后的标准写法——也是「没有 challenge」，而它的意思是
+//! 「凭据没问题，是这个用户不被接受」。
+//!
+//! 同一个信号承担两个互斥的含义，而 `next_token` 手里没有任何连接身份
+//! 可以把它们分开。实测的代价：一次注定失败的 CONNECT 里连建 **4 个**
+//! 安全上下文、发 **5 次** CONNECT，最后诊断页对现场工程师说「协商还要
+//! 继续」。现在是 **1 个**上下文、**3 次** CONNECT，诊断是「凭据格式
+//! 没问题，是代理不接受当前用户」。两种形状各有一条走完整 `http_connect`
+//! 链路的常驻端到端测试
+//! （`a_407_carrying_a_token68_after_the_final_leg_is_a_refusal` 与
+//! `a_bare_407_after_the_final_leg_is_a_refusal_too`）。
+//!
+//! W2 的那三条回归测试仍在，只是「新连接」的信号换成了
+//! `begin_connection`：
+//! `one_connection_reuses_one_context_across_rounds`、
+//! `a_challengeless_call_starts_a_fresh_context_for_the_next_connection`、
+//! `a_reconnect_after_a_successful_negotiation_starts_a_fresh_context`。
 //!
 //! # token 是敏感数据
 //!
@@ -516,61 +539,126 @@ fn bounded_scheme(raw: &str) -> String {
     }
 }
 
-/// 一次（或一段）协商的结局。
+/// 声明 [`AuthOutcome`]。
 ///
-/// `next_token` 的返回值是 `Option<Zeroizing<String>>`，`None` 同时表示"scheme
-/// 不支持"、"challenge 是坏的"、"建不出上下文"、"协商走完了"、"协商
-/// 失败了"五件事——跟 Task 2 里 `resolve()` 的 `Option` 把"不走代理"
-/// 与"解析失败"压平是同一类问题，解法也一样：另开一个带类型的出口，
-/// 诊断页（方案 §3.10 的「代理认证（SSPI Negotiate）」一行）读它。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum AuthOutcome {
-    /// 这个进程还没被任何代理要求过认证。
-    #[default]
-    NotAttempted,
-    /// 代理要求的 scheme 本机不做（Basic/Digest）。带的是 scheme 名，
-    /// 不是任何凭据。
+/// # 为什么这个枚举要经一个宏（W46）
+///
+/// `every_outcome_gives_the_diagnostic_line_its_own_verdict_and_its_own_words`
+/// 那张表要能证明自己**一格都没漏**。原来的办法是一个没有 `_ =>` 兜底的
+/// `variant_name`：往枚举里加变体，它会编译不过，逼着补一行——但**只逼着
+/// 补那一行**。表那边只有一句 `names.len() == cases.len()`，查的是重复，
+/// 不是遗漏；加第十一格、顺手给 `variant_name` 补一行、不动表，测试照样
+/// 全绿，而新那一格的诊断文案一个字都没被看过。
+///
+/// 宏把"一共有几个变体"从人写的数字变成从变体列表里**数出来**的
+/// [`AuthOutcome::VARIANTS`]。表于是可以写成一个定长数组
+/// `[(AuthOutcome, Option<bool>, &str); AuthOutcome::VARIANTS]`——少一格
+/// 就是 `error[E0308]: expected an array with a size of 11`，**编译不
+/// 过**，而不是绿着骗人。[`AuthOutcome::VARIANT_NAMES`] 再把"漏的是哪
+/// 一格"当场说出来。
+macro_rules! declare_auth_outcome {
+    (
+        $(#[$emeta:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident
+                $( ( $($tty:ty),* $(,)? ) )?
+                $( { $( $(#[$fmeta:meta])* $fname:ident : $fty:ty ),* $(,)? } )?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$emeta])*
+        pub enum $name {
+            $(
+                $(#[$vmeta])*
+                $variant
+                $( ( $($tty),* ) )?
+                $( { $( $(#[$fmeta])* $fname : $fty ),* } )?
+            ),*
+        }
+
+        impl $name {
+            /// 全部变体的名字，按声明顺序。**由声明宏生成**，加一个变体
+            /// 这里就多一格，不需要谁记得同步。
+            pub const VARIANT_NAMES: &'static [&'static str] = &[$(stringify!($variant)),*];
+
+            /// 变体总数。诊断行那张表的长度必须等于它。
+            pub const VARIANTS: usize = Self::VARIANT_NAMES.len();
+
+            /// 这个结局是哪一个变体。只用来把断言失败的信息说清楚
+            /// （"漏的是哪一格"、"哪一格的文案不对"），不参与任何判断。
+            pub fn variant_name(&self) -> &'static str {
+                match self {
+                    $( Self::$variant { .. } => stringify!($variant) ),*
+                }
+            }
+        }
+    };
+}
+
+declare_auth_outcome! {
+    /// 一次（或一段）协商的结局。
     ///
-    /// **这个字符串一律经 [`bounded_scheme`] 截断过**（W32）：它的来源
-    /// 是代理响应头里未经长度约束的字节（`read_response` 按第一个空白
-    /// 切 scheme，整行上限 16KB），而它会直接进诊断行与 `Debug`。仓库
-    /// 的规范见 `knownhosts::redact_for_error`。
-    UnsupportedScheme(String),
-    /// 不知道当前经过哪个代理，SPN 构造不出来。
-    UnknownProxyEndpoint,
-    /// 代理给的 challenge 不是合法 base64。**不带原文**。
-    MalformedChallenge,
-    /// 收到 challenge，但本机这边没有正在进行的协商（状态对不上）。
-    ChallengeWithoutNegotiation,
-    /// 建不出安全上下文：机器不在域里、包不可用、当前用户没有凭据。
-    ContextUnavailable(SspiPackage),
-    /// 已经发出第 `round` 段 token，而且协商**还要继续**（SSPI 说
-    /// `SEC_I_CONTINUE_NEEDED`）。
-    TokenIssued { package: SspiPackage, round: usize },
-    /// **最后一段** token 已经发出（共 `rounds` 段），本机这边收工，
-    /// 等代理裁决。
-    ///
-    /// 这一格是 W31 补的。在它之前，NTLM 第二段与 Kerberos 单段——
-    /// 也就是真实 Windows 上**绝大多数**协商的收尾——都落在
-    /// [`AuthOutcome::TokenIssued`] 上，跟"还要再谈一轮"分不开，于是
-    /// "凭据格式没问题、是代理不接受当前用户"这句最需要的话挂在了一个
-    /// 产不出来的状态上。
-    FinalTokenIssued { package: SspiPackage, rounds: usize },
-    /// 本机这边的协商已经走完，没有 token 可发了，而代理仍在要求认证。
-    ///
-    /// 两条路径都会到这里，而且**第二条才是现实中的那条**：
-    ///
-    /// 1. SSPI 直接给了 [`SspiStep::Done`]（连最后一段都没有）——HTTP 上
-    ///    的 Negotiate/NTLM 很少这样；
-    /// 2. 最后一段 token 已经发出（[`AuthOutcome::FinalTokenIssued`]），
-    ///    代理却又回了一个 407。那就是代理看过凭据之后**不接受**。
-    Completed { package: SspiPackage, rounds: usize },
-    /// 协商失败。`detail` 只有状态码与原因。
-    Failed {
-        package: SspiPackage,
-        round: usize,
-        detail: String,
-    },
+    /// `next_token` 的返回值是 `Option<Zeroizing<String>>`，`None` 同时表示"scheme
+    /// 不支持"、"challenge 是坏的"、"建不出上下文"、"协商走完了"、"协商
+    /// 失败了"五件事——跟 Task 2 里 `resolve()` 的 `Option` 把"不走代理"
+    /// 与"解析失败"压平是同一类问题，解法也一样：另开一个带类型的出口，
+    /// 诊断页（方案 §3.10 的「代理认证（SSPI Negotiate）」一行）读它。
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub enum AuthOutcome {
+        /// 这个进程还没被任何代理要求过认证。
+        #[default]
+        NotAttempted,
+        /// 代理要求的 scheme 本机不做（Basic/Digest）。带的是 scheme 名，
+        /// 不是任何凭据。
+        ///
+        /// **这个字符串一律经 [`bounded_scheme`] 截断过**（W32）：它的来源
+        /// 是代理响应头里未经长度约束的字节（`read_response` 按第一个空白
+        /// 切 scheme，整行上限 16KB），而它会直接进诊断行与 `Debug`。仓库
+        /// 的规范见 `knownhosts::redact_for_error`。
+        UnsupportedScheme(String),
+        /// 不知道当前经过哪个代理，SPN 构造不出来。
+        UnknownProxyEndpoint,
+        /// 代理给的 challenge 不是合法 base64。**不带原文**。
+        MalformedChallenge,
+        /// 收到 challenge，但本机这边没有正在进行的协商（状态对不上）。
+        ChallengeWithoutNegotiation,
+        /// 建不出安全上下文：机器不在域里、包不可用、当前用户没有凭据。
+        ContextUnavailable(SspiPackage),
+        /// 已经发出第 `round` 段 token，而且协商**还要继续**（SSPI 说
+        /// `SEC_I_CONTINUE_NEEDED`）。
+        TokenIssued { package: SspiPackage, round: usize },
+        /// **最后一段** token 已经发出（共 `rounds` 段），本机这边收工，
+        /// 等代理裁决。
+        ///
+        /// 这一格是 W31 补的。在它之前，NTLM 第二段与 Kerberos 单段——
+        /// 也就是真实 Windows 上**绝大多数**协商的收尾——都落在
+        /// [`AuthOutcome::TokenIssued`] 上，跟"还要再谈一轮"分不开，于是
+        /// "凭据格式没问题、是代理不接受当前用户"这句最需要的话挂在了一个
+        /// 产不出来的状态上。
+        FinalTokenIssued { package: SspiPackage, rounds: usize },
+        /// 本机这边的协商已经走完，没有 token 可发了，而代理仍在要求认证。
+        ///
+        /// 两条路径都会到这里，而且**第二条才是现实中的那条**：
+        ///
+        /// 1. SSPI 直接给了 [`SspiStep::Done`]（连最后一段都没有）——HTTP 上
+        ///    的 Negotiate/NTLM 很少这样；
+        /// 2. 最后一段 token 已经发出（[`AuthOutcome::FinalTokenIssued`]），
+        ///    代理却又回了一个 407。那就是代理看过凭据之后**不接受**。
+        ///
+        /// 第 2 条路径在修复轮 1 里**只有一半走得通**（W45）：那个 407
+        /// 带着 token68 才到得了，而它是**裸的**（NTLM 拒绝 Type-3 之后
+        /// 的标准写法）时，裸 407 先被当成"新一轮开始"，这一格撞不上。
+        /// 两种形状现在各有一条端到端测试。
+        Completed { package: SspiPackage, rounds: usize },
+        /// 协商失败。`detail` 只有状态码与原因。
+        Failed {
+            package: SspiPackage,
+            round: usize,
+            detail: String,
+        },
+    }
 }
 
 impl AuthOutcome {
@@ -654,19 +742,31 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 正在进行的协商。`round` 是本次协商已经推进过几段。
+/// **本次连接**的协商状态。每次 [`Inner::begin_connection`] 整个换一个
+/// [`Default`]，所以这里的每一位都只描述当前这一条 TCP 连接。
 #[derive(Default)]
 struct Negotiation {
     context: Option<Box<dyn SspiContext>>,
+    /// 本次连接已经推进过几段。
     round: usize,
     /// 最后一段 token 已经发出去了（[`SspiStep::Token`] 带 `last`），
     /// 本机这边没有东西可发了，就等代理裁决。
     ///
     /// 有了它，"最后一段发完之后代理又要了一次"才能被如实说成"代理
     /// 不接受当前用户"；没有它的话，那次调用会径直落到上下文的
-    /// `step` 上，换回一句 `这个上下文的协商已经结束` 的内部行话
-    /// （W31）。
+    /// `step` 上，换回一句内部行话（W31）。
+    ///
+    /// 这一位在修复轮 1 里**永远撞不上**（W45）：那时"裸的 407"先被
+    /// 当成"新一轮开始"，`*neg = Negotiation::default()` 把它一起清掉
+    /// 了。修不了是因为当时没有连接身份可用——见模块文档。
     concluded: bool,
+    /// 本次连接**已经建过**上下文了（不论它现在还在不在）。
+    ///
+    /// 这一位就是"一次连接尝试最多建一个安全上下文"这条约束的载体：
+    /// 置真发生在调用工厂**之前**，所以连"工厂失败之后在同一条连接里
+    /// 再试一次"都发生不了。清零只发生在 [`Inner::begin_connection`]，
+    /// 也就是只发生在连接边界上。
+    started: bool,
 }
 
 struct Inner<F> {
@@ -739,22 +839,62 @@ where
         *lock(&self.outcome) = outcome;
     }
 
+    /// 一次新的连接尝试开始了：把上一次连接留下的一切丢掉。
+    ///
+    /// **无条件**——这就是 W2 那条硬约束（每次连接尝试一个全新的安全
+    /// 上下文）的全部实现。丢掉旧的上下文会触发它的 `Drop`（Windows 上
+    /// 就是 `DeleteSecurityContext` + `FreeCredentialsHandle`）。
+    ///
+    /// 不动 `outcome`：`last_outcome()` 的语义是"最近一次协商的结局"，
+    /// 重连的那一刻正是现场工程师最需要看到上一次为什么没通过的时候。
+    fn begin_connection(&self) {
+        *lock(&self.negotiation) = Negotiation::default();
+    }
+
     /// 推进一段协商。**整个函数都跑在 `spawn_blocking` 的阻塞线程上**
     /// ——`InitializeSecurityContextW` 是同步调用，首段可能真的去向域控
     /// 取 Kerberos 票，耗时不可预期。
     fn advance(
         &self,
         package: SspiPackage,
-        start_new: bool,
         challenge: Option<Zeroizing<Vec<u8>>>,
     ) -> Option<Zeroizing<String>> {
         let mut neg = lock(&self.negotiation);
 
-        if start_new {
-            // ★ 无条件重建。见模块文档"上下文的生命周期"。丢掉旧的
-            // 上下文会触发它的 Drop（Windows 上就是
-            // DeleteSecurityContext + FreeCredentialsHandle）。
-            *neg = Negotiation::default();
+        // 最后一段 token 已经发出去了，代理却又回了一个 407：本机这边
+        // 的协商已经走完，没有东西可发。这才是"凭据格式没问题，是代理
+        // 不接受当前用户"在真实 Windows 上的到达路径（W31）——不把这一
+        // 格拦在这里，这次调用会落到上下文的 `step` 上，换回一句内部
+        // 行话。
+        //
+        // **这一支能不能撞上，全靠上面那句 `begin_connection`**（W45）：
+        // 在它出现之前，裸的 407 先被当成"新一轮开始"把 `concluded`
+        // 一起清掉了，这一支永远是死代码。现在 `concluded` 只可能在
+        // 同一条连接里为真，所以它可以排在最前面。
+        if neg.concluded {
+            let rounds = neg.round;
+            // 丢掉上下文（触发 Drop：DeleteSecurityContext +
+            // FreeCredentialsHandle），这次协商到此为止。**不清
+            // `started`**：这条连接已经建过上下文了，不许再开第二个。
+            neg.context = None;
+            neg.concluded = false;
+            self.set_outcome(AuthOutcome::Completed { package, rounds });
+            return None;
+        }
+
+        if !neg.started {
+            // 本次连接的第一段。先置位再建——这样连"工厂失败之后在同一条
+            // 连接里再试一次"都发生不了。
+            neg.started = true;
+
+            // 一条连接的**第一个** 407 就带着 challenge：本机这边还一个
+            // 字节都没发过，而真实 SSPI 的首段不接受服务端 token，新建
+            // 一个上下文再把它当首段输入喂进去只会换回一个看不懂的错误码。
+            if challenge.is_some() {
+                self.set_outcome(AuthOutcome::ChallengeWithoutNegotiation);
+                return None;
+            }
+
             let Some(spn) = self
                 .endpoint
                 .current_proxy()
@@ -773,25 +913,27 @@ where
             }
         }
 
-        // 最后一段 token 已经发出去了，代理却又回了一个 407：本机这边
-        // 的协商已经走完，没有东西可发。这才是"凭据格式没问题，是代理
-        // 不接受当前用户"在真实 Windows 上的到达路径（W31）——不把这一
-        // 格拦在这里，这次调用会落到上下文的 `step` 上，换回一句
-        // `这个上下文的协商已经结束` 的内部行话。
-        if neg.concluded {
-            let rounds = neg.round;
-            // 丢掉上下文（触发 Drop：DeleteSecurityContext +
-            // FreeCredentialsHandle），这次协商到此为止。
-            *neg = Negotiation::default();
-            self.set_outcome(AuthOutcome::Completed { package, rounds });
+        // 上下文已经被上一段的 `Done`/`Failed` 清掉了，代理却还在要求
+        // 认证：状态对不上，这条连接上没有东西可谈了。
+        if neg.context.is_none() {
+            self.set_outcome(AuthOutcome::ChallengeWithoutNegotiation);
             return None;
         }
 
-        // 收到 challenge 却没有在途协商：**不能**在这里新建一个上下文
-        // 再把服务端的 challenge 当首段输入喂进去——真实 SSPI 的首段
-        // 不接受服务端 token，那样只会换回一个看不懂的错误码。
-        if neg.context.is_none() {
-            self.set_outcome(AuthOutcome::ChallengeWithoutNegotiation);
+        // 已经发过至少一段、上下文还活着，代理却回了一个**不带
+        // challenge** 的 407。SSPI 的下一段要的就是服务端那一段 token，
+        // 没有它谈不下去。这里既不能把 `None` 喂给一个谈到一半的上下文
+        // （真实 SSPI 只会换回一个看不懂的状态码），也**不能**像修复轮 1
+        // 之前那样把它当成"新一轮开始"去重建上下文——那正是同一次
+        // CONNECT 里白建四个上下文的来源（W40/W45）。
+        if neg.round > 0 && challenge.is_none() {
+            let round = neg.round;
+            neg.context = None;
+            self.set_outcome(AuthOutcome::Failed {
+                package,
+                round,
+                detail: "代理在协商途中不再给出 challenge，这一段没法接着谈".into(),
+            });
             return None;
         }
 
@@ -844,6 +986,22 @@ impl<F> ProxyAuthenticator for SspiProxyAuthenticator<F>
 where
     F: Fn(SspiPackage, &str) -> Option<Box<dyn SspiContext>> + Send + Sync + 'static,
 {
+    async fn begin_connection(&self) {
+        // 跟 `next_token` 一样搬到阻塞线程上（W16 的形状）。`negotiation`
+        // 那把锁可能正被一次 SSPI 调用长时间攥着：`http_connect` 的
+        // future 被上层取消（Supervisor 的连接超时）并不会让已经跑起来的
+        // `spawn_blocking` 任务停下，它还会握着锁直到域控回话。在异步执行
+        // 线程上直接去抢这把锁，会把整个事件循环连同 `tokio::time::timeout`
+        // 自己一起堵住。见 `begin_connection_does_not_starve_the_async_runtime`。
+        let inner = Arc::clone(&self.inner);
+        if let Err(e) = tokio::task::spawn_blocking(move || inner.begin_connection()).await {
+            // 这里到不了：`begin_connection` 只取一把用 `into_inner` 接住
+            // 中毒的锁、再赋一个 `Default`，没有可以 panic 的地方。真的
+            // 崩了也不能把连接尝试带崩——协商器会在下一次连接边界上重来。
+            tracing::error!("SSPI 连接边界的阻塞任务崩溃：{e}");
+        }
+    }
+
     async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>> {
         let Some(package) = SspiPackage::from_http_scheme(scheme) else {
             // 截断（W32）：这一段字节来自代理响应头，没有任何长度约束。
@@ -864,11 +1022,8 @@ where
             None => None,
         };
 
-        // 「新一轮协商开始」的唯一信号。
-        let start_new = decoded.is_none();
-
         let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || inner.advance(package, start_new, decoded))
+        tokio::task::spawn_blocking(move || inner.advance(package, decoded))
             .await
             .unwrap_or_else(|e| {
                 // 阻塞任务 panic 会让 `negotiation` 那把锁中毒；`lock()`
@@ -1018,7 +1173,11 @@ mod tests {
                     // 自己就把这次协商收掉了，不会再 `step` 第三次。
                     // 这一支一旦真的被跑到，测试里那条"legs 只有两条"
                     // 的断言会先失败。
-                    Ending::FinalOnSecondLeg => SspiStep::Failed("这个上下文的协商已经结束".into()),
+                    // 这一句刻意抄 `imp.rs` 那道"已经走完"守卫的措辞：
+                    // 下面那条测试要断言的正是"它不许出现在诊断行里"。
+                    Ending::FinalOnSecondLeg => {
+                        SspiStep::Failed("协商在这个上下文里已经走完，不能再往前推进".into())
+                    }
                 },
             }
         }
@@ -1189,11 +1348,12 @@ mod tests {
         // Negotiate/NTLM 是连接绑定的：同一条 TCP 连接上的多轮必须走
         // 同一个上下文，换一个新的，服务端会认成另一个客户端。
         //
-        // 改红：把 `next_token` 里"只有 challenge 为 None 才重建上下文"
-        // 改成无条件重建——第二段会落到一个全新的上下文（ctx_id=1、
+        // 改红（M2）：把 `advance` 里 `if !neg.started` 那道守卫拿掉、
+        // 每一段都重建上下文——第二段会落到一个全新的上下文（ctx_id=1、
         // round=1），既对不上 `built().len() == 1`，挑剔的假上下文也会
         // 判"首轮不该带 challenge"。
         let (a, h) = scripted(endpoint(), Ending::Completed);
+        a.begin_connection().await;
         a.next_token("Negotiate", None).await.unwrap();
         a.next_token("Negotiate", Some(CHALLENGE_B64))
             .await
@@ -1220,24 +1380,35 @@ mod tests {
     async fn a_challengeless_call_starts_a_fresh_context_for_the_next_connection() {
         // ★ W2。`Transport` 把 `Arc<dyn ProxyAuthenticator>` 持有到进程
         // 结束，每次重连都走同一个实例；而 Negotiate/NTLM 的上下文是
-        // 连接绑定的，第二条连接必须从头协商。"新一轮开始"的唯一信号
-        // 就是 `challenge == None`。
+        // 连接绑定的，第二条连接必须从头协商。
         //
-        // 改红（要忠实复现 brief 的语义，四处一起改）：给
-        // `Negotiation` 加一个 `spent: bool`；`if start_new {` 换成
-        // `if start_new && !neg.spent {`；`SspiStep::Done` 与
-        // `SspiStep::Failed` 两支在清掉上下文之后置 `neg.spent = true`。
-        // 这就是 brief 原文 `Option<Option<Box<dyn SspiContext>>>` 的
-        // 两层语义：外层建过了就不再建，内层用尽了就永远是 None。
-        // 改完这条测试的第二条连接首段返回 None，`unwrap()` 直接 panic。
-        // ——只把 `if start_new {` 改成
-        // `if start_new && neg.context.is_none() {` 是**骗得过**这条的
-        // （协商收尾时上下文已经被清掉，于是照样会重建），那种改法由
+        // 名字里的"challengeless call"仍然准确——第二条连接的第一次调用
+        // 就是不带 challenge 的那一次，它确实跑在一个全新的上下文上；
+        // 变的是**凭什么知道这是新连接**：修复轮 2 之前靠
+        // `challenge == None` 推断，现在由 `begin_connection` 明说（W45）。
+        //
+        // 改红（M10b，要忠实复现 brief 的语义，四处一起改）：给 **`Inner`**
+        // 加一个 `spent: AtomicBool`；`if !neg.started` 换成
+        // `if !neg.started && !self.spent.load(..)`；`SspiStep::Done` 与
+        // `SspiStep::Failed` 两支在清掉上下文之后 `self.spent.store(true)`。
+        //
+        // 标记必须挂在 `Inner` 上，挂在 `Negotiation` 里**这条测试不会红**
+        // （M10 实测 79 条全绿）——因为 `begin_connection` 整个换掉
+        // `Negotiation`，顺手就把它清了。这正是这次重构的收益：
+        // "跨连接残留的状态"现在得专门找个地方放，放不进按连接重置的那
+        // 一格里。这就是 brief 原文
+        // `Option<Option<Box<dyn SspiContext>>>` 的两层语义：外层建过了
+        // 就不再建，内层用尽了就永远是 None。改完这条测试的第二条连接
+        // 首段返回 None，`unwrap()` 直接 panic。
+        // ——只把 `begin_connection` 的重置改成"上下文还在就不重置"
+        // （M1）是**骗得过**这条的（协商收尾时上下文已经被清掉，于是
+        // 照样会重建），那种改法由
         // `a_reconnect_after_a_successful_negotiation_starts_a_fresh_context`
         // 接住。实测两种改法各自只被其中一边抓到，三条缺一不可。
         let (a, h) = scripted(endpoint(), Ending::Completed);
 
         // 第一条连接：两段 token，第三次调用时 SSPI 说没有更多 token。
+        a.begin_connection().await;
         a.next_token("Negotiate", None).await.unwrap();
         a.next_token("Negotiate", Some(CHALLENGE_B64))
             .await
@@ -1249,6 +1420,7 @@ mod tests {
         assert!(matches!(a.last_outcome(), AuthOutcome::Completed { .. }));
 
         // 第二条连接：重连之后代理又要求认证，必须能从头协商。
+        a.begin_connection().await;
         assert_eq!(
             token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
@@ -1273,15 +1445,17 @@ mod tests {
         // 协商器手里还攥着一个用了一半的活上下文——Negotiate/NTLM 是
         // 连接绑定的，拿它接着谈第二条连接，服务端会认成另一个客户端。
         //
-        // 改红：把 `if start_new {` 换成
-        // `if start_new && neg.context.is_none() {`——第二条连接会落到
-        // 第一个上下文的第 3 段，挑剔的假上下文按剧本给 `Done`，
+        // 改红（M1）：把 `Inner::begin_connection` 的无条件重置换成
+        // `if neg.context.is_none() { *neg = Negotiation::default(); }`
+        // ——上一条连接那个用了一半的上下文会被留下来，第二条连接的首段
+        // 撞上"协商途中代理不再给 challenge"那一支，返回 None，
         // `unwrap()` 直接 panic。（这条改法**骗不过**这条测试，但骗得过
         // 上面那两条：那两条里第一条连接已经走完、上下文已经被清掉了。
         // 三条测试合起来才把生命周期这件事围严。）
         let (a, h) = scripted(endpoint(), Ending::Completed);
 
         // 第一条连接：两段 token 之后代理放行，协商器这边上下文还活着。
+        a.begin_connection().await;
         a.next_token("Negotiate", None).await.unwrap();
         a.next_token("Negotiate", Some(CHALLENGE_B64))
             .await
@@ -1292,6 +1466,7 @@ mod tests {
         ));
 
         // 断线重连：必须从一个全新的上下文重新开始。
+        a.begin_connection().await;
         assert_eq!(
             token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
@@ -1316,9 +1491,11 @@ mod tests {
         // `ProxyAuthFailed`——客户端在第一次断线之后永久废掉，而那
         // 恰恰是 Supervisor 存在的全部场景。
         //
-        // 改红：同 `a_challengeless_call_starts_a_fresh_context_for_the_next_connection`
-        // 那条注释里的四处改动（`spent` 标记），已实测变红。
+        // 改红（M10b）：同
+        // `a_challengeless_call_starts_a_fresh_context_for_the_next_connection`
+        // 那条注释里的 `spent` 标记改法（挂在 `Inner` 上），已实测变红。
         let (a, h) = scripted(endpoint(), Ending::Failed);
+        a.begin_connection().await;
         a.next_token("Negotiate", None).await.unwrap();
         a.next_token("Negotiate", Some(CHALLENGE_B64))
             .await
@@ -1329,6 +1506,7 @@ mod tests {
             .is_none());
         assert!(matches!(a.last_outcome(), AuthOutcome::Failed { .. }));
 
+        a.begin_connection().await;
         assert_eq!(
             token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
@@ -1346,6 +1524,7 @@ mod tests {
         // 改红：把这一支改成"没有上下文就建一个"——工厂会被调用，
         // `built()` 不再为空。
         let (a, h) = scripted(endpoint(), Ending::Completed);
+        a.begin_connection().await;
         assert!(a
             .next_token("Negotiate", Some(CHALLENGE_B64))
             .await
@@ -1576,7 +1755,12 @@ mod tests {
                 }) as Box<dyn SspiContext>)
             }
         });
+        a.begin_connection().await;
         assert!(a.next_token("Negotiate", None).await.is_none());
+        // 那次 panic 是在握着 `negotiation` 锁的时候发生的，锁已经中毒；
+        // 连接边界这一步同样要能从中毒的锁里把状态拿回来，否则重连的第一
+        // 件事就先炸了。
+        a.begin_connection().await;
         assert_eq!(
             token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
@@ -1888,7 +2072,7 @@ mod tests {
         // 真实 Windows 上的到达路径。改之前它挂在 `AuthOutcome::Completed`
         // 上，而那一格只有"SSPI 给了 Done 且没有输出 token"才到得了——
         // NTLM 与 Kerberos 都到不了。现场真正会看到的是一句
-        // `Failed(这个上下文的协商已经结束)` 的内部行话。
+        // `Failed(协商在这个上下文里已经走完……)` 的内部行话。
         //
         // 改红：把 `advance` 里 `if neg.concluded { ... }` 整块删掉——
         // 这次调用会落到上下文的 `step` 上，结局变成 `Failed`，文案里是
@@ -1915,7 +2099,7 @@ mod tests {
         assert_eq!(ok, Some(false));
         assert!(text.contains("不接受当前用户"), "{text}");
         assert!(
-            !text.contains("这个上下文的协商已经结束"),
+            !text.contains("这个上下文里已经走完"),
             "不能把内部行话推给现场工程师：{text}"
         );
         assert_eq!(
@@ -1926,17 +2110,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bare_407_in_the_middle_of_a_negotiation_does_not_restart_it() {
+        // ★ W45/W40。Type-1 发出去之后代理回了一个**不带 challenge** 的
+        // 407：协商没法往下走（SSPI 的下一段要的就是服务端那一段 token）。
+        //
+        // 修复轮 1 会把它当成"新一轮开始"，在**同一次 CONNECT 里**再建一
+        // 个完整的安全上下文，然后一路建到 `MAX_ROUNDS` 为止。域机器上每
+        // 建一个就是一次 `AcquireCredentialsHandleW` ＋一次
+        // `InitializeSecurityContextW`，都可能去找域控。
+        //
+        // 改红：在 `advance` 里把这一支删掉——要么工厂被第二次调用
+        // （`built().len()` 变成 2），要么 `None` 被喂给谈到一半的上下文
+        // （挑剔的假上下文判"第二轮缺少 challenge"，结局文案对不上）。
+        let (a, h) = scripted(endpoint(), Ending::Completed);
+        a.begin_connection().await;
+        a.next_token("Negotiate", None).await.unwrap();
+
+        assert!(a.next_token("Negotiate", None).await.is_none());
+        assert_eq!(h.built().len(), 1, "不许在同一次连接里重开第二个上下文");
+        assert_eq!(h.legs().len(), 1, "不许把空输入喂给谈到一半的上下文");
+        let outcome = a.last_outcome();
+        assert!(
+            matches!(
+                &outcome,
+                AuthOutcome::Failed {
+                    package: SspiPackage::Negotiate,
+                    round: 1,
+                    detail
+                } if detail.contains("不再给出 challenge")
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_reconnect_after_the_final_token_starts_a_fresh_context() {
         // 生命周期那三条测试的第四个场景：第一条连接**认证成功**（最后
         // 一段发完代理就回了 200），几小时后断线重连。`concluded` 这个
         // 新状态位必须跟着 `Negotiation::default()` 一起被清掉，否则重连
         // 的首段会撞上"最后一段已发出"那一支，直接报 `Completed`。
         //
-        // 改红：把 `advance` 里 `if start_new` 那支的
-        // `*neg = Negotiation::default();` 换成只清 `context`
-        // （`neg.context = None; neg.round = 0;`）——重连的首段返回 None，
+        // 改红：把 `Inner::begin_connection` 里的
+        // `*lock(&self.negotiation) = Negotiation::default();` 换成只清
+        // `context`（`neg.context = None; neg.round = 0; neg.started =
+        // false;`，留下 `concluded`）——重连的首段撞上 `concluded` 那一支
+        // 直接报 `Completed` 并返回 None，
         // `unwrap()` 当场 panic。
         let (a, h) = scripted(endpoint(), Ending::FinalOnSecondLeg);
+        a.begin_connection().await;
         a.next_token("Negotiate", None).await.unwrap();
         a.next_token("Negotiate", Some(CHALLENGE_B64))
             .await
@@ -1946,6 +2167,7 @@ mod tests {
             AuthOutcome::FinalTokenIssued { rounds: 2, .. }
         ));
 
+        a.begin_connection().await;
         assert_eq!(
             token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
@@ -1964,24 +2186,6 @@ mod tests {
 
     // ================= W30：诊断行的每一格 =================
 
-    /// 一个结局的变体名。**故意不写 `_ =>` 兜底**：往 [`AuthOutcome`]
-    /// 加变体时这里会编译不过，逼着新变体也进下面那张表——否则又会出现
-    /// "九个分支只有三个被断言碰过"。
-    fn variant_name(o: &AuthOutcome) -> &'static str {
-        match o {
-            AuthOutcome::NotAttempted => "NotAttempted",
-            AuthOutcome::UnsupportedScheme(_) => "UnsupportedScheme",
-            AuthOutcome::UnknownProxyEndpoint => "UnknownProxyEndpoint",
-            AuthOutcome::MalformedChallenge => "MalformedChallenge",
-            AuthOutcome::ChallengeWithoutNegotiation => "ChallengeWithoutNegotiation",
-            AuthOutcome::ContextUnavailable(_) => "ContextUnavailable",
-            AuthOutcome::TokenIssued { .. } => "TokenIssued",
-            AuthOutcome::FinalTokenIssued { .. } => "FinalTokenIssued",
-            AuthOutcome::Completed { .. } => "Completed",
-            AuthOutcome::Failed { .. } => "Failed",
-        }
-    }
-
     #[test]
     fn every_outcome_gives_the_diagnostic_line_its_own_verdict_and_its_own_words() {
         // ★ W30。改之前十个分支只有三个被断言碰过，**`NotAttempted`
@@ -1994,8 +2198,17 @@ mod tests {
         // - 把任意一格的文案清空 → 关键词那条断言 +「十句话两两不同」
         //   那条同时失败；
         // - 把 `NotAttempted` 翻成 `Some(false)` → 第一格的 `ok` 对不上；
-        // - 把任意一格写成 `Some(true)` → 「永不为 Some(true)」那条失败。
-        let cases: Vec<(AuthOutcome, Option<bool>, &str)> = vec![
+        // - 把任意一格写成 `Some(true)` → 「永不为 Some(true)」那条失败；
+        // - 给 `AuthOutcome` 加一个变体却不动这张表 → **编译不过**
+        //   （W46，下面那个定长数组）。
+        //
+        // ★ 这张表写成定长数组、长度取 `AuthOutcome::VARIANTS`（由声明宏
+        // 从变体列表数出来），少一格就是
+        // `error[E0308]: expected an array with a size of N`。上一版是
+        // `Vec` + 一句 `names.len() == cases.len()`，那只查得出重复、查不
+        // 出遗漏：加第十一格、顺手补一行 `variant_name`、不动表，测试照样
+        // 全绿。
+        let cases: [(AuthOutcome, Option<bool>, &str); AuthOutcome::VARIANTS] = [
             (AuthOutcome::NotAttempted, None, "代理没有要求认证"),
             (
                 AuthOutcome::UnsupportedScheme("Basic".into()),
@@ -2053,33 +2266,38 @@ mod tests {
             ),
         ];
 
-        // 每个变体都在表里，而且只出现一次。
-        let names: std::collections::BTreeSet<&str> =
-            cases.iter().map(|(o, _, _)| variant_name(o)).collect();
+        // 数组的长度已经由编译器钉住了，这里再把**是哪些**变体对上——
+        // 数量对而变体重复（同一格写两遍、另一格没写）会在这里当场说出
+        // 漏的是谁。
+        let listed: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(o, _, _)| o.variant_name()).collect();
+        let declared: std::collections::BTreeSet<&str> =
+            AuthOutcome::VARIANT_NAMES.iter().copied().collect();
         assert_eq!(
-            names.len(),
-            cases.len(),
-            "表里有重复的变体，说明有一格没被覆盖到：{names:?}"
+            listed,
+            declared,
+            "表里漏了这些变体：{:?}",
+            declared.difference(&listed).collect::<Vec<_>>()
         );
 
         for (outcome, want_ok, keyword) in &cases {
             let (ok, text) = outcome.diagnostic();
-            assert_eq!(ok, *want_ok, "{}", variant_name(outcome));
+            assert_eq!(ok, *want_ok, "{}", outcome.variant_name());
             assert_ne!(
                 ok,
                 Some(true),
                 "{}：协商器只知道自己发出了什么，「代理接受了」只有拿到 200 的 CONNECT 知道",
-                variant_name(outcome)
+                outcome.variant_name()
             );
             assert!(
                 text.contains(keyword),
                 "{} 的诊断行里没有「{keyword}」：{text}",
-                variant_name(outcome)
+                outcome.variant_name()
             );
         }
 
-        // 十句话两两不同：两个结局给出同一句话，等于现场工程师看到的还是
-        // 同一条信息。
+        // 每一句话两两不同：两个结局给出同一句话，等于现场工程师看到的
+        // 还是同一条信息。
         let texts: std::collections::BTreeSet<String> =
             cases.iter().map(|(o, _, _)| o.diagnostic().1).collect();
         assert_eq!(texts.len(), cases.len(), "有两个结局给出了同一句话");
@@ -2182,7 +2400,58 @@ mod tests {
         );
     }
 
-    // ================= W33：Debug 不许碰长持有的那把锁 =================
+    // ========= W33/W46：Debug 与连接边界都不许碰长持有的那把锁 =========
+
+    /// 进了 `step` 就在 `entered` 上发一声——**那一刻 `negotiation` 那把
+    /// 锁必然已经被 `advance` 拿在手里**——然后攥着锁睡 `hold` 那么久。
+    struct LockHoldingContext {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        hold: Duration,
+    }
+
+    impl SspiContext for LockHoldingContext {
+        fn step(&mut self, _input: Option<&[u8]>) -> SspiStep {
+            if let Some(tx) = self.entered.take() {
+                let _ = tx.send(());
+            }
+            std::thread::sleep(self.hold);
+            SspiStep::Done
+        }
+    }
+
+    /// 起一个协商器，让它的首段协商在 `step` 里攥着 `negotiation` 那把锁
+    /// 不放 `hold` 那么久。**函数返回时锁一定已经拿住了**——靠的是上下文
+    /// 亲口说"我进了 step"，不是 sleep 赌一个够长的时间。
+    ///
+    /// W46：上一版这里是 `sleep(80ms)`，失效方向是**假绿**——机器一忙，
+    /// 协商还没抢到锁，被测的那次渲染/边界调用就畅通无阻地过去了，测试
+    /// 照样绿，而它本来要证明的事一次都没被证明过。握手换成
+    /// `oneshot` 之后，"锁已经被拿住"是事实，不是赌来的。
+    ///
+    /// `hold` 这一边**仍然是时间**，但方向是安全的：机器越慢，锁被攥得
+    /// 越久，被测那一侧越容易超时——失效方向是假红，不是假绿。
+    async fn with_the_negotiation_lock_held(
+        hold: Duration,
+    ) -> (
+        Arc<SspiProxyAuthenticator<SspiContextFactory>>,
+        tokio::task::JoinHandle<Option<Zeroizing<String>>>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered_tx));
+        let a = Arc::new(SspiProxyAuthenticator::new(
+            endpoint(),
+            Box::new(move |_: SspiPackage, _: &str| {
+                Some(Box::new(LockHoldingContext {
+                    entered: entered.lock().unwrap().take(),
+                    hold,
+                }) as Box<dyn SspiContext>)
+            }) as SspiContextFactory,
+        ));
+        let running = Arc::clone(&a);
+        let handle = tokio::spawn(async move { running.next_token("Negotiate", None).await });
+        entered_rx.await.expect("首段协商没能进到 step 里");
+        (a, handle)
+    }
 
     #[tokio::test]
     async fn the_debug_rendering_does_not_wait_for_a_negotiation_in_flight() {
@@ -2195,16 +2464,7 @@ mod tests {
         // 改红：把 `impl Debug` 里的 `.field("in_flight",
         // &lock(&self.inner.negotiation).context.is_some())` 加回来——
         // 这次渲染会被在途协商挡满 600ms，`timeout` 先到。
-        let a = Arc::new(SspiProxyAuthenticator::new(
-            endpoint(),
-            |_: SspiPackage, _: &str| {
-                Some(Box::new(SlowContext(Duration::from_millis(600))) as Box<dyn SspiContext>)
-            },
-        ));
-        let running = Arc::clone(&a);
-        let handle = tokio::spawn(async move { running.next_token("Negotiate", None).await });
-        // 等协商真的进到 `spawn_blocking` 里、把 `negotiation` 锁拿住。
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (a, handle) = with_the_negotiation_lock_held(Duration::from_millis(600)).await;
 
         let rendering = Arc::clone(&a);
         let rendered = tokio::time::timeout(
@@ -2217,5 +2477,219 @@ mod tests {
         assert!(rendered.contains("outcome"), "{rendered}");
 
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn begin_connection_does_not_starve_the_async_runtime() {
+        // 连接边界要取的也是 `negotiation` 那把锁，而它可能正被一次
+        // **已经被取消**的连接尝试留下的 SSPI 调用攥着：`spawn_blocking`
+        // 的任务不会因为调用方的 future 被丢掉而停下，它会一直握着锁直到
+        // 域控回话。在异步执行线程上直接去抢，会把整个事件循环连同
+        // `tokio::time::timeout` 自己一起堵住——跟 W16 在 Task 2 立的
+        // 那条形状是同一件事。
+        //
+        // 改红：把 `begin_connection` 里的 `spawn_blocking` 去掉、直接
+        // `self.inner.begin_connection()`——这条会从"超时"变成等满
+        // 500ms 才返回，`is_err()` 断言失败。
+        let (a, handle) = with_the_negotiation_lock_held(Duration::from_millis(500)).await;
+        let boundary = tokio::time::timeout(Duration::from_millis(50), a.begin_connection()).await;
+        assert!(boundary.is_err(), "连接边界不该占用调用方的异步执行线程");
+        let _ = handle.await;
+    }
+
+    // ============ W45：走完整 http_connect 链路的端到端探针 ============
+
+    const BARE_407: &str =
+        "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Negotiate\r\n\r\n";
+    const OK_200: &str = "HTTP/1.1 200 Connection established\r\n\r\n";
+
+    /// 带 token68 的 407（代理把 Type-2 challenge 挂在上面）。
+    fn challenge_407() -> String {
+        format!(
+            "HTTP/1.1 407 Proxy Authentication Required\r\n\
+             Proxy-Authenticate: Negotiate {CHALLENGE_B64}\r\n\r\n"
+        )
+    }
+
+    /// duplex 另一端的一台**假代理**：逐条读 CONNECT 请求、按剧本回应答，
+    /// 并记下每一条请求里的 `Proxy-Authorization`（没有就是 `None`）。
+    /// 剧本用完就关连接。
+    async fn fake_proxy(
+        mut sock: tokio::io::DuplexStream,
+        replies: Vec<String>,
+        seen: Arc<Mutex<Vec<Option<String>>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for reply in replies {
+            let mut req = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match sock.read(&mut byte).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => req.push(byte[0]),
+                }
+                if req.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&req).to_string();
+            let auth = text.lines().find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("proxy-authorization")
+                    .then(|| value.trim().to_string())
+            });
+            seen.lock().unwrap().push(auth);
+            if sock.write_all(reply.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// 端到端探针：真实的 [`SspiProxyAuthenticator`]、真实的
+    /// `http_connect`、一台 duplex 上的假代理。返回 CONNECT 的结果与代理
+    /// 逐条看到的 `Proxy-Authorization`（`seen.len()` 就是实际发了几次
+    /// CONNECT）。
+    async fn connect_through_proxy(
+        auth: &SspiProxyAuthenticator<SspiContextFactory>,
+        replies: &[&str],
+    ) -> (rmc_core::Result<()>, Vec<Option<String>>) {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let proxy = tokio::spawn(fake_proxy(
+            server,
+            replies.iter().map(|r| (*r).to_string()).collect(),
+            Arc::clone(&seen),
+        ));
+        let target: HostPort = "gateway.company.com:443".parse().unwrap();
+        let outcome = rmc_core::transport::connect::http_connect(&mut client, &target, auth).await;
+        drop(client);
+        let _ = proxy.await;
+        let seen = seen.lock().unwrap().clone();
+        (outcome, seen)
+    }
+
+    /// 两种拒绝形状共用的断言：**3 次 CONNECT、1 个安全上下文、2 段协商**，
+    /// 结局是 `Completed`，诊断行说的是"代理不接受当前用户"。
+    fn assert_refused_after_two_legs(
+        outcome: rmc_core::Result<()>,
+        seen: &[Option<String>],
+        a: &SspiProxyAuthenticator<SspiContextFactory>,
+        h: &Harness,
+    ) {
+        let err = outcome.unwrap_err();
+        assert!(
+            matches!(err, rmc_core::Error::ProxyAuthFailed(_)),
+            "CONNECT 应当以代理认证失败告终：{err}"
+        );
+        assert_eq!(
+            seen,
+            [
+                None,
+                Some(format!("Negotiate {NEGOTIATE_B64}")),
+                Some(format!("Negotiate {AUTHENTICATE_B64}")),
+            ],
+            "CONNECT 应当只发三次：无凭据一次、Type-1 一次、Type-3 一次"
+        );
+        assert_eq!(h.built().len(), 1, "一次连接尝试只该建一个安全上下文");
+        assert_eq!(h.legs().len(), 2, "只该推进两段协商");
+        assert_eq!(
+            a.last_outcome(),
+            AuthOutcome::Completed {
+                package: SspiPackage::Negotiate,
+                rounds: 2
+            }
+        );
+        let (ok, text) = a.last_outcome().diagnostic();
+        assert_eq!(ok, Some(false));
+        assert!(text.contains("不接受当前用户"), "{text}");
+        assert!(
+            !text.contains("协商还要继续"),
+            "CONNECT 已经确定失败了，不能对现场工程师说协商还要继续：{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_407_carrying_a_token68_after_the_final_leg_is_a_refusal() {
+        // 形状 A：代理拒绝时回的 407 **带着** token68。这一格在修复轮 1
+        // 就已经是对的，留成常驻测试是为了跟形状 B 成对——两种真实形状
+        // 必须给出同一个结论。
+        let (a, h) = scripted(endpoint(), Ending::FinalOnSecondLeg);
+        let refusal = challenge_407();
+        // 备满 MAX_ROUNDS 条应答：万一哪天又退回"裸 407 算新一轮"的老
+        // 样子，这里断言的是**实际发生了几次 CONNECT**，而不是让协商撞上
+        // EOF 换回一个看不出所以然的 Tcp 错误。
+        let replies = [BARE_407, &refusal, &refusal, &refusal, &refusal];
+        let (outcome, seen) = connect_through_proxy(&a, &replies).await;
+        assert_refused_after_two_legs(outcome, &seen, &a, &h);
+    }
+
+    #[tokio::test]
+    async fn a_bare_407_after_the_final_leg_is_a_refusal_too() {
+        // ★ 形状 B，W45 的正题：代理拒绝时回的 407 是**裸的**
+        // `Proxy-Authenticate: Negotiate`——NTLM 拒绝 Type-3 之后的标准
+        // 写法，Negotiate 也常见。
+        //
+        // 修复轮 1 的实测：`TokenIssued { round: 1 }`、诊断是"协商还要
+        // 继续"（而 CONNECT 已经确定失败）、**5 次 CONNECT、4 个完整的
+        // 安全上下文**——域机器上就是 4 次 `AcquireCredentialsHandleW`
+        // ＋ 4 次 `InitializeSecurityContextW`，每一次都可能去找域控。
+        // 机理是裸 407 ⇒ token68 为 None ⇒ 被当成"新一轮开始"，
+        // `*neg = Negotiation::default()` 把 `concluded` 一起清掉，
+        // `Completed` 那一支永远撞不上。
+        //
+        // 改红：把 `http_connect` 里的 `auth.begin_connection().await;`
+        // 删掉，再把 `advance` 的 `if !neg.started` 换回
+        // `if challenge.is_none()`——就是修复轮 1 的那份代码。
+        let (a, h) = scripted(endpoint(), Ending::FinalOnSecondLeg);
+        let challenge = challenge_407();
+        let replies = [BARE_407, &challenge, BARE_407, BARE_407, BARE_407];
+        let (outcome, seen) = connect_through_proxy(&a, &replies).await;
+        assert_refused_after_two_legs(outcome, &seen, &a, &h);
+    }
+
+    #[tokio::test]
+    async fn a_second_connect_attempt_negotiates_from_scratch_end_to_end() {
+        // ★ W2 的端到端那一半：第一条连接被代理拒了，Supervisor 重连，
+        // 第二条连接必须从一个**全新的**安全上下文重新协商（Negotiate 与
+        // NTLM 都是连接绑定的，接着用上一条连接那个，服务端会认成另一个
+        // 客户端）。
+        //
+        // 改红：把 `http_connect` 里的 `auth.begin_connection().await;`
+        // 删掉——第二条连接的第一个裸 407 会撞上"协商途中代理不再给
+        // challenge"那一支，`http_connect` 报 ProxyAuthFailed，200 永远
+        // 等不到。
+        let (a, h) = scripted(endpoint(), Ending::FinalOnSecondLeg);
+        let challenge = challenge_407();
+
+        let replies = [BARE_407, &challenge, BARE_407, BARE_407, BARE_407];
+        let (first, _) = connect_through_proxy(&a, &replies).await;
+        assert!(first.is_err());
+
+        // 第二条连接：同样两段，这一次代理放行。
+        let replies = [BARE_407, &challenge, OK_200];
+        let (second, seen) = connect_through_proxy(&a, &replies).await;
+        second.expect("重连之后必须能重新协商并打通隧道");
+        assert_eq!(
+            seen,
+            [
+                None,
+                Some(format!("Negotiate {NEGOTIATE_B64}")),
+                Some(format!("Negotiate {AUTHENTICATE_B64}")),
+            ]
+        );
+        assert_eq!(h.built().len(), 2, "两条连接各自一个上下文");
+        assert_eq!(
+            h.legs().last().unwrap().ctx_id,
+            1,
+            "第二条连接必须跑在新建的那个上下文上"
+        );
+        assert_eq!(
+            a.last_outcome(),
+            AuthOutcome::FinalTokenIssued {
+                package: SspiPackage::Negotiate,
+                rounds: 2
+            }
+        );
     }
 }

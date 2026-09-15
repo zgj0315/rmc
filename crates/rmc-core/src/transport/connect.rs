@@ -319,6 +319,16 @@ pub async fn http_connect<S: Io>(
     target: &HostPort,
     auth: &dyn ProxyAuthenticator,
 ) -> Result<()> {
+    // ★ 连接边界（W45）。每调用一次 `http_connect` 就是一条**新的** TCP
+    // 连接上的一次 CONNECT 尝试，而 Negotiate/NTLM 是连接绑定的认证。
+    // 在这里告诉协商器一次，它就不必再从「这个 407 带不带 token68」去猜
+    // ——那个信号在现实里承担了两个互斥的含义，猜错的代价见
+    // [`ProxyAuthenticator::begin_connection`] 的文档。
+    //
+    // **必须排在循环之前、且只调用一次**：循环内部的每一轮都还在同一条
+    // 连接上，同一个安全上下文要一路用到底。
+    auth.begin_connection().await;
+
     let mut authorization: Option<Zeroizing<String>> = None;
 
     for _ in 0..MAX_ROUNDS {

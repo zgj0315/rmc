@@ -51,6 +51,44 @@ pub trait ProxyResolver: Send + Sync {
 /// 只改这里的签名是堵不住的。
 #[async_trait::async_trait]
 pub trait ProxyAuthenticator: Send + Sync {
+    /// **一次新的 CONNECT 尝试开始了。** [`crate::transport::connect::http_connect`]
+    /// 在它的轮询循环之前调用**恰好一次**，而且一定排在本次连接的第一次
+    /// [`Self::next_token`] 之前。
+    ///
+    /// # 为什么这条要在 trait 上（W45）
+    ///
+    /// Negotiate 与 NTLM 都是**连接绑定**的认证：一条 TCP 连接上的多轮
+    /// 协商必须走同一个安全上下文，换一条连接就必须从头来过。而
+    /// `Arc<dyn ProxyAuthenticator>` 被 `Transport` 持有到进程结束，同一个
+    /// 实例要伺候此后每一次重连——"这是新一条连接"这件事，协商器**自己
+    /// 看不见**。
+    ///
+    /// 在这个方法出现之前，rmc-win 的 SSPI 协商器只能从
+    /// `challenge == None` 去猜：一条连接的第一个 407 不带 token68，所以
+    /// "没有 challenge" 被当成"新一轮开始"。**这个信号承担了两个互斥的
+    /// 含义**，而那两个含义在现场都真实存在：
+    ///
+    /// 1. 新连接的第一个 407（裸的 `Proxy-Authenticate: Negotiate`）；
+    /// 2. **同一条连接里**、最后一段 token 发出之后代理又回的一个裸 407
+    ///    ——NTLM 拒绝 Type-3 之后的标准写法，Negotiate 也常见。它的意思
+    ///    是"凭据没问题，是这个用户不被接受"。
+    ///
+    /// 猜错的代价实测过：第 2 种被当成第 1 种，同一次 CONNECT 里连建
+    /// **4 个**安全上下文（域机器上就是 4 次 `AcquireCredentialsHandleW`
+    /// ＋ 4 次 `InitializeSecurityContextW`，每次都可能去找域控），
+    /// 发 5 次 CONNECT，最后给现场工程师看的诊断是"协商还要继续"——
+    /// 而那次 CONNECT 早就确定失败了。
+    ///
+    /// 有了这个方法，连接边界是**被告知的**，不是猜出来的；上面第 2 种
+    /// 形状于是可以被如实判成"代理拒绝了当前用户"。
+    ///
+    /// # 没有默认实现是故意的
+    ///
+    /// 写一个空方法体只要一行，但那一行逼着每一个实现者回答"我有没有
+    /// 跨连接的状态"。给一个默认的空实现，等于让下一个带状态的协商器
+    /// 在完全不知情的情况下继承上面那个 bug。
+    async fn begin_connection(&self);
+
     async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>>;
 }
 
@@ -84,6 +122,9 @@ pub struct NoProxyAuth;
 
 #[async_trait::async_trait]
 impl ProxyAuthenticator for NoProxyAuth {
+    /// 没有任何跨连接的状态，连接边界对它没有意义。
+    async fn begin_connection(&self) {}
+
     async fn next_token(
         &self,
         _scheme: &str,

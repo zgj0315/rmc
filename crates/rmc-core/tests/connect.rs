@@ -103,6 +103,8 @@ struct TwoLegNegotiate {
 
 #[async_trait::async_trait]
 impl ProxyAuthenticator for TwoLegNegotiate {
+    async fn begin_connection(&self) {}
+
     async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>> {
         assert_eq!(scheme, "Negotiate");
         let mut seen = self.seen_challenges.lock().unwrap();
@@ -165,6 +167,8 @@ struct RecordsChallenge {
 
 #[async_trait::async_trait]
 impl ProxyAuthenticator for RecordsChallenge {
+    async fn begin_connection(&self) {}
+
     async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>> {
         assert_eq!(scheme, "Negotiate");
         if let Some(c) = challenge {
@@ -204,6 +208,8 @@ async fn gives_up_when_authenticator_returns_none() {
     struct Refuses;
     #[async_trait::async_trait]
     impl ProxyAuthenticator for Refuses {
+        async fn begin_connection(&self) {}
+
         async fn next_token(&self, _: &str, _: Option<&str>) -> Option<Zeroizing<String>> {
             None
         }
@@ -241,6 +247,8 @@ async fn stops_after_five_rounds() {
     struct Endless;
     #[async_trait::async_trait]
     impl ProxyAuthenticator for Endless {
+        async fn begin_connection(&self) {}
+
         async fn next_token(&self, _: &str, _: Option<&str>) -> Option<Zeroizing<String>> {
             Some(Zeroizing::new("AAAA".into()))
         }
@@ -267,6 +275,8 @@ struct RecordsScheme {
 
 #[async_trait::async_trait]
 impl ProxyAuthenticator for RecordsScheme {
+    async fn begin_connection(&self) {}
+
     async fn next_token(&self, scheme: &str, _: Option<&str>) -> Option<Zeroizing<String>> {
         self.seen.lock().unwrap().push(scheme.to_string());
         Some(Zeroizing::new("TlRMTVNTUAAB".into()))
@@ -376,4 +386,95 @@ async fn truncated_response_is_a_network_error() {
         .await
         .unwrap_err();
     assert_eq!(err.class(), ErrorClass::Network);
+}
+
+/// 按发生的先后记下协商器被调用的每一件事。
+struct RecordsCalls {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ProxyAuthenticator for RecordsCalls {
+    async fn begin_connection(&self) {
+        self.calls.lock().unwrap().push("begin_connection".into());
+    }
+
+    async fn next_token(&self, scheme: &str, _: Option<&str>) -> Option<Zeroizing<String>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("next_token:{scheme}"));
+        Some(Zeroizing::new("TlRMTVNTUAAB".into()))
+    }
+}
+
+/// ★ W45。`http_connect` 每被调用一次就是一条**新的** TCP 连接上的一次
+/// CONNECT 尝试，而 Negotiate/NTLM 是连接绑定的认证——协商器必须在这里
+/// 被告知连接边界，否则它只能从"这个 407 带不带 token68"去猜，而那个
+/// 信号在现实里承担了两个互斥的含义（见
+/// `ProxyAuthenticator::begin_connection` 的文档）。
+///
+/// 三件事一起钉住，缺一条这个保证就不成立：
+/// 1. **调到了**——把 `auth.begin_connection().await;` 那一行删掉就红；
+/// 2. **排在第一次 `next_token` 之前**——挪到循环里面（或循环之后）就红；
+/// 3. **一条连接只调一次**——挪进 `for` 循环体就红（这里是三轮协商，
+///    会看到三次 `begin_connection`）。
+#[tokio::test]
+async fn http_connect_marks_the_connection_boundary_once_before_any_token() {
+    let (port, srv) = fake_proxy(vec![
+        "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Negotiate\r\n\r\n",
+        "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Negotiate TlRMTVNTUAAC\r\n\r\n",
+        "HTTP/1.1 200 Connection established\r\n\r\n",
+    ])
+    .await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth = RecordsCalls {
+        calls: Arc::clone(&calls),
+    };
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    http_connect(&mut s, &target(), &auth).await.unwrap();
+    drop(s);
+    let _ = srv.await;
+
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        vec![
+            "begin_connection".to_string(),
+            "next_token:Negotiate".to_string(),
+            "next_token:Negotiate".to_string(),
+        ]
+    );
+}
+
+/// 上一条的另一半：**两次** `http_connect` 就是两条连接，边界要划两次。
+/// 这正是 Supervisor 重连时的形状——协商器凭这一条才知道该把上一条连接
+/// 的安全上下文丢掉。
+#[tokio::test]
+async fn every_connect_attempt_gets_its_own_boundary() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    for _ in 0..2 {
+        let (port, srv) = fake_proxy(vec![
+            "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Negotiate\r\n\r\n",
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        ])
+        .await;
+        let auth = RecordsCalls {
+            calls: Arc::clone(&calls),
+        };
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        http_connect(&mut s, &target(), &auth).await.unwrap();
+        drop(s);
+        let _ = srv.await;
+    }
+
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        vec![
+            "begin_connection".to_string(),
+            "next_token:Negotiate".to_string(),
+            "begin_connection".to_string(),
+            "next_token:Negotiate".to_string(),
+        ]
+    );
 }
