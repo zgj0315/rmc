@@ -29,6 +29,7 @@
 //! `#[cfg(windows)]` 里——那样它就只能靠人工验收清单守，没法在这台机器
 //! 也没法在 CI 的非 Windows 阶段自动跑到。
 
+pub mod events;
 pub mod proxy;
 pub mod secret;
 pub mod single_instance;
