@@ -732,6 +732,51 @@ mod tests {
     }
 
     #[test]
+    fn the_reason_a_record_cannot_be_read_is_the_real_io_error_text() {
+        // ★ W62。`every_load_outcome_...` 那张表里这一格用的是**字面量**
+        // `Unreadable("权限不足".into())`，于是只测得到 `format!` 模板，
+        // 测不到**真实的 `io::Error` 说明有没有接上**。评审实测 M20——
+        // 把 `LoadOutcome::Unreadable(e.to_string())` 换成
+        // `Unreadable(String::new())`——**102 全绿**，而诊断页上剩下的是
+        // 「记住的密码读不出来：；请重新输入密码」：现场工程师看不出是
+        // 权限不足、是被一个目录占住、还是被别的进程独占，也就无从处置。
+        //
+        // 做法是**逐字**对：先在这台机器上、对着这个路径亲手取一次真实
+        // 的 `io::Error`，实现里那一句必须接的就是它。
+        //
+        // 改红：
+        // - `Unreadable(e.to_string())` → `Unreadable(String::new())`（M20）
+        //   → 「原因是空的」那条失败；
+        // - 换成 `e.kind().to_string()` 之类别的说明 → 逐字相等那条失败；
+        // - `format!("记住的密码读不出来：{detail}；…")` 里去掉 `{detail}`
+        //   → 「诊断行里带着原因」那条失败。
+        let s = FileSecretStore::new(tmpdir(), FlipSealer);
+        let path = s.path_for("k");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let want = std::fs::read(&path)
+            .expect_err("这条测试自己先失灵了：读一个目录居然成功了")
+            .to_string();
+        assert!(
+            !want.is_empty(),
+            "这条测试自己先失灵了：io::Error 的说明是空的"
+        );
+
+        let outcome = s.load_outcome("k");
+        let LoadOutcome::Unreadable(detail) = &outcome else {
+            panic!("这一格应该是 Unreadable，实际是 {outcome:?}");
+        };
+        assert_eq!(
+            detail, &want,
+            "带的不是真实的 io::Error 说明（诊断页上原因会消失或者变成一句空话）"
+        );
+
+        let (ok, text) = outcome.diagnostic();
+        assert_eq!(ok, Some(false));
+        assert!(text.contains(&want), "诊断行里没有把原因带上：{text}");
+    }
+
+    #[test]
     fn a_record_that_does_not_unseal_says_so_instead_of_looking_unremembered() {
         // ★ W21 的整个理由。用户换了 Windows 账号或换了机器，DPAPI 解不
         // 开——这跟"根本没记住过"必须分得开，否则密码框空着、一句解释
@@ -878,30 +923,105 @@ mod tests {
     }
 
     #[test]
-    fn load_agrees_with_load_outcome_in_all_five_situations() {
-        // `load` 是 trait 上由 `load_outcome` 派生的默认实现，两者结构上
-        // 不可能漂移——这条测试守的是"往后谁给某个实现单独覆写一个
-        // `load`"。
-        let dir = tmpdir();
-        let miss = FileSecretStore::new(dir.clone(), FlipSealer);
-        assert!(miss.load("nope").is_none());
+    fn load_hands_back_a_secret_in_the_loaded_situation_and_in_no_other() {
+        // ★ W60。上一版这条测试叫 `..._in_all_five_situations`，**名不
+        // 副实**：循环只走了 `["nope","k"] × [&miss, &ok]`，也就是
+        // `NotRemembered` 与 `Loaded` 两格，`Unreadable` 与 `NotUtf8`
+        // 一次都没进去。评审实测 M21——把 `into_secret` 的兜底改成
+        // `Unreadable(detail) => Some(Zeroizing::new(detail))`，也就是
+        // **把 `io::Error` 的说明文字当口令填进密码框、用户会拿这段文字
+        // 去登录**——**102 全绿**。
+        //
+        // W21 要的「每一格都有身份测试」在 `diagnostic()` 那一侧做满了
+        // （定长表 + 加变体编译不过），在 `load` / `into_secret` 这一侧
+        // 没有。现在这条测试跟那张表同形：长度由 `LoadOutcome::VARIANTS`
+        // 钉住，**加第六格却忘了这里就是 `error[E0308]`**，不会再静默
+        // 漏格。每一格都是真造出来的现场（真文件、真 `fs::read`），不是
+        // 字面量。
+        //
+        // 改红：
+        // - `into_secret` 的 `_ => None` 放行任何一个非 `Loaded` 的格子
+        //   （M21）→ 那一格的 `load` 与 `into_secret` 两条同时失败；
+        // - 给 `FileSecretStore` 单独覆写一个 `load`（M17 那一枪）→ 同上；
+        // - 任何一格的分类改掉（例如 `Err(e) => Unreadable` 换成
+        //   `NotRemembered`）→ 该格的身份断言失败。
 
-        let ok = FileSecretStore::new(dir.clone(), FlipSealer);
-        ok.save("k", "pw").unwrap();
-        assert!(ok.load("k").is_some());
+        // 五种现场，每种一个独立目录，互不干扰。
+        let missing = FileSecretStore::new(tmpdir(), FlipSealer);
 
-        let broken = FileSecretStore::new(dir.clone(), FailingSealer);
-        assert!(broken.load("k").is_none());
+        let unreadable = FileSecretStore::new(tmpdir(), FlipSealer);
+        std::fs::create_dir_all(unreadable.path_for("k")).unwrap();
 
-        for key in ["nope", "k"] {
-            for store in [&miss, &ok] {
-                assert_eq!(
-                    store.load(key).is_some(),
-                    matches!(store.load_outcome(key), LoadOutcome::Loaded(_)),
-                    "load 与 load_outcome 对 {key} 的说法不一致"
-                );
-            }
+        let unseal_failed_dir = tmpdir();
+        FileSecretStore::new(unseal_failed_dir.clone(), FlipSealer)
+            .save("k", "pw")
+            .unwrap();
+        let unseal_failed = FileSecretStore::new(unseal_failed_dir, FailingSealer);
+
+        let not_utf8 = FileSecretStore::new(tmpdir(), NonUtf8Sealer);
+        not_utf8.save("k", "pw").unwrap();
+
+        let loaded = FileSecretStore::new(tmpdir(), FlipSealer);
+        loaded.save("k", "pw-123").unwrap();
+
+        // 长度由编译器钉住。`Box<dyn SecretStore>` 是因为几种现场的
+        // `Sealer` 类型不同，而 `load` 的默认实现正是要从 trait 这一侧
+        // 调进去。
+        let cases: [(&str, Box<dyn SecretStore>, &str); LoadOutcome::VARIANTS] = [
+            ("NotRemembered", Box::new(missing), "nope"),
+            ("Unreadable", Box::new(unreadable), "k"),
+            ("UnsealFailed", Box::new(unseal_failed), "k"),
+            ("NotUtf8", Box::new(not_utf8), "k"),
+            ("Loaded", Box::new(loaded), "k"),
+        ];
+
+        // 长度对了还要**是哪些格**也对，防"同一格写两遍、另一格没写"。
+        let listed: std::collections::BTreeSet<&str> = cases.iter().map(|(n, _, _)| *n).collect();
+        let declared: std::collections::BTreeSet<&str> =
+            LoadOutcome::VARIANT_NAMES.iter().copied().collect();
+        assert_eq!(
+            listed,
+            declared,
+            "表里漏了这些变体：{:?}",
+            declared.difference(&listed).collect::<Vec<_>>()
+        );
+
+        for (want_variant, store, key) in &cases {
+            let outcome = store.load_outcome(key);
+            assert_eq!(
+                outcome.variant_name(),
+                *want_variant,
+                "这一格造出来的不是 {want_variant}，而是 {outcome:?}"
+            );
+            let is_loaded = matches!(outcome, LoadOutcome::Loaded(_));
+            assert_eq!(
+                is_loaded,
+                *want_variant == "Loaded",
+                "{want_variant}：variant_name 与真实的变体对不上"
+            );
+
+            // ★ 守 M21 的两句：只有 `Loaded` 那一格交得出口令，其余四格
+            // 一律 `None`——**密码框里绝不能出现一段 `io::Error` 的说明
+            // 文字**。
+            assert_eq!(
+                store.load(key).is_some(),
+                is_loaded,
+                "{want_variant}：load 与 load_outcome 的说法不一致"
+            );
+            assert_eq!(
+                outcome.into_secret().is_some(),
+                is_loaded,
+                "{want_variant}：into_secret 交出了一个本不该存在的口令"
+            );
         }
+
+        // 而且 `Loaded` 那一格交出来的确实是存进去的那个口令——M21 交出
+        // 的是别的字符串，这一句连"内容对不对"也一并钉住。
+        let (_, loaded_store, loaded_key) = cases
+            .iter()
+            .find(|(n, _, _)| *n == "Loaded")
+            .expect("表里没有 Loaded 这一格");
+        assert_eq!(loaded_store.load(loaded_key).unwrap().as_str(), "pw-123");
     }
 
     // ============ W25：临时文件不能变成一份留在盘上的密文 ============
@@ -950,6 +1070,70 @@ mod tests {
 
         assert!(!tmp.exists(), "clear 之后 tmp 还在：{tmp:?}");
         assert!(files_in(&dir).is_empty(), "clear 之后目录里还有东西");
+    }
+
+    #[test]
+    fn clear_still_removes_the_tmp_file_when_removing_the_sealed_one_fails() {
+        // ★ W61 —— W25 的第三半。`clear` 写的是
+        // `let sealed = ...; let tmp = ...; sealed.and(tmp)`：**两步都
+        // 求值**，只报第一个错。评审实测 P2——改成
+        // `remove_if_present(&self.path_for(key))?;` 第一步就早退——
+        // **102 全绿**。而那正是用户点「不再记住密码」之后最不能发生的
+        // 事：`.sealed` 删失败，`.tmp` 里那份**完整、解得开**的密文原样
+        // 留在盘上。
+        //
+        // 造法：拿一个**目录**占住 `.sealed` 那个路径。`fs::remove_file`
+        // 冲着目录调用在各平台上都失败、且都不是 `NotFound`
+        // （Unix 上 `unlink` 给 EISDIR/EPERM；Windows 上 `DeleteFileW`
+        // 给 ERROR_ACCESS_DENIED，std 随后那个「忽略只读属性再删一次」的
+        // 兜底要 `CreateFileW` 打开它，而那一步没带
+        // `FILE_FLAG_BACKUP_SEMANTICS`、打不开目录，于是原样把
+        // ACCESS_DENIED 报回来）。所以**这条测试在 Windows 上照跑**，
+        // 不加 `#[cfg(unix)]`、不会在 Windows CI 上静默消失。断言只要求
+        // 「是个错」，不认具体的 `ErrorKind`。
+        //
+        // **两个方向都造**：只挡 `.sealed` 的话，把实现改成「先删 `.tmp`
+        // 用 `?` 早退、再删 `.sealed`」这个**镜像早退**照样全绿（实测
+        // N3，见 task-4-fix-1-report.md 的变异表）——那种写法在
+        // `.tmp` 删不掉时会把 `.sealed` 留在盘上，一样是把密文留给了
+        // 点过「不再记住密码」的用户。所以两个名字各挡一次。
+        //
+        // 改红：
+        // - `remove_if_present(&self.path_for(key))?;` 早退（P2）→
+        //   第一个方向的「另一个名字还在」失败；
+        // - `remove_if_present(&self.tmp_path_for(key))?;` 早退（N3）→
+        //   第二个方向的同一条失败；
+        // - 两句都改成 `let _ = ...; Ok(())` → 「报了成功」失败。
+        for block_sealed in [true, false] {
+            let s = FileSecretStore::new(tmpdir(), FlipSealer);
+            let sealed = s.path_for("k");
+            let tmp = s.tmp_path_for("k");
+
+            // 挡住的那个名字：放一个目录，`fs::remove_file` 必然失败。
+            // 另一个名字：放一份**解得开的密文**，它必须被删掉。
+            let (blocked, must_go) = if block_sealed {
+                (&sealed, &tmp)
+            } else {
+                (&tmp, &sealed)
+            };
+            std::fs::create_dir_all(blocked).unwrap();
+            std::fs::write(must_go, s.sealer.seal(b"pw-123").unwrap()).unwrap();
+            assert!(must_go.exists());
+
+            assert!(
+                s.clear("k").is_err(),
+                "block_sealed={block_sealed}：有一步根本删不掉，clear 却报了成功"
+            );
+            assert!(
+                !must_go.exists(),
+                "block_sealed={block_sealed}：一步失败之后另一步没跑，\
+                 能解开的密文留在了盘上：{must_go:?}"
+            );
+            assert!(
+                blocked.is_dir(),
+                "block_sealed={block_sealed}：占位的目录被删掉了，这一轮就白造了：{blocked:?}"
+            );
+        }
     }
 
     // ============ W26：创建那一刻就带上权限 ============
