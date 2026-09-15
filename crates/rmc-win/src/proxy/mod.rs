@@ -14,6 +14,11 @@
 //! 里，结果两条真实缺陷（`auto_detect` 从未真正生效、`lpszAutoConfigUrl`
 //! 违反 MSDN 的 NULL 前置条件）都藏在这台机器测不到的地方。见下方
 //! `autoproxy_flags` 与它的表驱动测试。
+//!
+//! [`pac_outcome`] 是同一个形状的第四块（W20.1）：`WinHttpGetProxyForUrl`
+//! 成功之后 `(dwAccessType, lpszProxy)` 这一对该怎么读，本来整段留在
+//! `winhttp.rs` 里、零自动化覆盖——复审实测把那两条 arm 对调，35 条
+//! 测试加两条 zigbuild 闸门全绿。搬到这里之后同样表驱动测。
 
 pub mod parse;
 #[cfg(windows)]
@@ -96,6 +101,53 @@ pub fn autoproxy_flags(auto_detect: bool, pac_url: Option<&str>) -> (u32, u32) {
     (flags, AUTO_DETECT_TYPE_DHCP | AUTO_DETECT_TYPE_DNS_A)
 }
 
+/// 同上，对应 `WINHTTP_ACCESS_TYPE_NO_PROXY`（Win32 头文件里是 1）。
+pub const ACCESS_TYPE_NO_PROXY: u32 = 1;
+/// 同上，对应 `WINHTTP_ACCESS_TYPE_NAMED_PROXY`（Win32 头文件里是 3）。
+pub const ACCESS_TYPE_NAMED_PROXY: u32 = 3;
+
+/// 一次 PAC 求值**成功**之后的结论。
+///
+/// W20.1：上一轮把它编码成一个字符串——`"DIRECT"` 这个字面量既当
+/// 「PAC 说直连」的信号、又混在真代理列表的语法里，跨层传一个魔法值。
+/// 形状上跟 W15 刚消掉的「空串当跨层信号」是同一个毛病，换成枚举之后
+/// 那个字面量在跨层接口上就不存在了。
+///
+/// 注意这个类型只表达「求值成功」的两种结论；「求值失败」是外面那层
+/// `Option` 的 `None`，两者不能再混。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PacOutcome {
+    /// PAC 脚本的决定是直连。
+    Direct,
+    /// PAC 脚本给出了代理，内容是 `WinHttpGetProxyForUrl` 回填的
+    /// `lpszProxy`（格式与手工配置的 `lpszProxy` 相同）。
+    Proxies(String),
+}
+
+/// `WinHttpGetProxyForUrl` 成功返回之后，`(dwAccessType, lpszProxy)`
+/// 这一对该怎么读。纯函数，不摸任何 Win32 符号。
+///
+/// W20.1：这段映射本来整个在 `winhttp.rs` 里，**零自动化覆盖**——复审
+/// 实测把 `NO_PROXY` 与 `NAMED_PROXY` 两条 arm 对调，35 passed 加两条
+/// zigbuild 闸门全绿。而它是 Task 2 后果最大的那条行为修复：PAC 说
+/// 直连时 `lpszProxy` 通常是 NULL，只看这个字段会把「PAC 成功地说了
+/// 直连」读成「PAC 求值失败」，于是任何用 PAC 且对 Gateway 返回
+/// DIRECT 的企业网络，客户端都会认定 PAC 坏了、去连一个本不该走的
+/// 静态代理。形状与 [`autoproxy_flags`] 一样，搬到这里表驱动测。
+///
+/// `None` 表示这次结果读不出结论——调用成功了，`dwAccessType` 却既不是
+/// 「不用代理」也不是「用这个代理」，或者说了「用这个代理」却没给出
+/// 代理是谁。这跟调用本身失败一样，都归到「求值失败」那一档。
+pub fn pac_outcome(access_type: u32, proxy_list: Option<String>) -> Option<PacOutcome> {
+    match access_type {
+        ACCESS_TYPE_NO_PROXY => Some(PacOutcome::Direct),
+        // `proxy_list` 为 `None` 时这里也是 `None`：说了「走代理」却
+        // 没说走哪个，读不出结论。
+        ACCESS_TYPE_NAMED_PROXY => proxy_list.map(PacOutcome::Proxies),
+        _ => None,
+    }
+}
+
 /// 取系统代理原始数据、对 PAC 求值——这两件事都要摸 Win32 API，抽成
 /// trait 是为了让 [`SystemProxyResolver`] 的判断逻辑不依赖具体实现，
 /// 测试时换上假实现即可跑在任何平台。
@@ -108,22 +160,24 @@ pub trait ProxySource: Send + Sync {
     /// 写法本身就是评审抓到的一个缺陷（当时会让 `lpszAutoConfigUrl`
     /// 指向一个非 NULL 的空宽字符串，违反 MSDN 的前置条件）。
     ///
-    /// 返回值只有两种合法形状：字面量 `"DIRECT"`（PAC 决定直连），或者
-    /// 跟手工代理配置同样格式的 `scheme=server:port[;...]` 列表——这不
-    /// 是本 trait 编出来的格式，是 `WinHttpGetProxyForUrl` 真正的输出
-    /// 形状（它已经替调用方从 PAC 脚本的原始返回值里剥掉了 `SOCKS`
-    /// 等非 HTTP 类型、并在遇到 `DIRECT` 时截断列表，`lpszProxy` 的
-    /// 文档格式跟手工配置的 `lpszProxy` 完全一样），实现见 `winhttp.rs`。
+    /// 求值成功时返回 [`PacOutcome`]：要么「脚本说直连」，要么「脚本
+    /// 给了这些代理」。代理列表的内容不是本 trait 编出来的格式，是
+    /// `WinHttpGetProxyForUrl` 真正的输出形状（它已经替调用方从 PAC
+    /// 脚本的原始返回值里剥掉了 `SOCKS` 等非 HTTP 类型、并在遇到
+    /// `DIRECT` 时截断列表，`lpszProxy` 的文档格式跟手工配置的
+    /// `lpszProxy` 完全一样），实现见 `winhttp.rs`。
+    ///
     /// `None` 表示求值本身失败（脚本下不下来、自动检测超时、
-    /// `WinHttpGetProxyForUrl` 报错等），**不是**"脚本说直连"——这两件
-    /// 事必须分开处理，混成同一个结果就是 progress.md W12 点名的那种
-    /// "测试通过但没验证名字声称的事"。见 [`ProxyDecision`]。
+    /// `WinHttpGetProxyForUrl` 报错、或者结果读不出结论），**不是**
+    /// "脚本说直连"——这两件事必须分开处理，混成同一个结果就是
+    /// progress.md W12 点名的那种"测试通过但没验证名字声称的事"。
+    /// 见 [`ProxyDecision`] 与 [`pac_outcome`]。
     fn eval_pac(
         &self,
         auto_detect: bool,
         pac_url: Option<&str>,
         target_url: &str,
-    ) -> Option<String>;
+    ) -> Option<PacOutcome>;
 }
 
 /// 一次代理解析的完整结果，比 [`ProxyResolver::resolve`] 需要的
@@ -241,8 +295,11 @@ impl<S: ProxySource + 'static> SystemProxyResolver<S> {
                 None
             });
             return match pac_result {
-                Some(result) => match parse_proxy_list(&result, target.host()) {
+                Some(PacOutcome::Direct) => ProxyDecision::PacDirect,
+                Some(PacOutcome::Proxies(list)) => match parse_proxy_list(&list, target.host()) {
                     Some(hp) => ProxyDecision::PacProxy(hp),
+                    // 列表里没有一项能用（例如整条都是 SOCKS，或者
+                    // 以 `DIRECT` 收尾）——PAC 的决定仍然是"别走代理"。
                     None => ProxyDecision::PacDirect,
                 },
                 None => manual_decision(target, &cfg, true),
@@ -328,23 +385,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dw_access_type_decides_direct_versus_named_proxy() {
+        // W20.1：这段映射原来整个在 `winhttp.rs`（`#[cfg(windows)]`）
+        // 里，一个字节的自动化保护都没有——复审实测把 NO_PROXY 与
+        // NAMED_PROXY 两条 arm 对调，35 passed 加两条 zigbuild 闸门
+        // **全绿**。对调之后的真实后果：任何用 PAC 且对 Gateway 返回
+        // DIRECT 的企业网络，客户端都会认定 PAC 坏了、去连一个本不该
+        // 走的静态代理。
+        //
+        // 改红：把 `pac_outcome` 里 `ACCESS_TYPE_NO_PROXY` 与
+        // `ACCESS_TYPE_NAMED_PROXY` 两条 arm 对调——第 1、2、3 行全红。
+        let cases = [
+            // dwAccessType 说"不用代理"，就是 PAC 说直连。lpszProxy
+            // 是不是 NULL 都不改变这个结论——这正是上一轮读错的地方。
+            (ACCESS_TYPE_NO_PROXY, None, Some(PacOutcome::Direct)),
+            (
+                ACCESS_TYPE_NO_PROXY,
+                Some("p.company.com:8080"),
+                Some(PacOutcome::Direct),
+            ),
+            (
+                ACCESS_TYPE_NAMED_PROXY,
+                Some("p.company.com:8080"),
+                Some(PacOutcome::Proxies("p.company.com:8080".into())),
+            ),
+            // 说了"走代理"却没说走哪个：读不出结论，归到求值失败。
+            (ACCESS_TYPE_NAMED_PROXY, None, None),
+            // WINHTTP_ACCESS_TYPE_DEFAULT_PROXY(0) /
+            // AUTOMATIC_PROXY(4)：`WinHttpGetProxyForUrl` 不该回填这两
+            // 个值，真回填了也读不出结论。
+            (0, Some("p.company.com:8080"), None),
+            (4, None, None),
+        ];
+        for (access_type, proxy_list, expected) in cases {
+            assert_eq!(
+                pac_outcome(access_type, proxy_list.map(str::to_string)),
+                expected,
+                "access_type={access_type}"
+            );
+        }
+    }
+
     /// 记录每次 `eval_pac` 收到的 `(auto_detect, pac_url, target_url)`，
     /// 比 brief 给的样例（只记 target_url）多验证两件事：只开自动检测、
     /// 没填显式地址时 `pac_url` 传的是 `None` 不是魔法空字符串；以及
     /// `auto_detect` 本身有没有原样转发过去（W15）。
     struct Fake {
         raw: RawProxyConfig,
-        pac_result: Option<String>,
+        pac_result: Option<PacOutcome>,
         pac_calls: Mutex<Vec<(bool, Option<String>, String)>>,
     }
 
     impl Fake {
-        fn new(raw: RawProxyConfig, pac_result: Option<&str>) -> Self {
+        fn new(raw: RawProxyConfig, pac_result: Option<PacOutcome>) -> Self {
             Self {
                 raw,
-                pac_result: pac_result.map(str::to_string),
+                pac_result,
                 pac_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        /// "PAC 求值成功，给出了这些代理"。
+        fn proxies(raw: RawProxyConfig, list: &str) -> Self {
+            Self::new(raw, Some(PacOutcome::Proxies(list.to_string())))
         }
     }
 
@@ -357,7 +461,7 @@ mod tests {
             auto_detect: bool,
             pac_url: Option<&str>,
             target_url: &str,
-        ) -> Option<String> {
+        ) -> Option<PacOutcome> {
             self.pac_calls.lock().unwrap().push((
                 auto_detect,
                 pac_url.map(str::to_string),
@@ -371,15 +475,45 @@ mod tests {
     /// 占住调用方所在的异步执行线程——见
     /// `blocking_proxy_source_calls_do_not_starve_the_async_runtime`。
     struct SlowFake {
-        sleep: Duration,
+        /// `current()` 里睡多久。
+        current_sleep: Duration,
+        /// `eval_pac()` 里睡多久。W20.1：上一轮只给 `current()` 加了
+        /// 睡眠，于是"eval_pac 也走了 spawn_blocking"这件事零覆盖——
+        /// 复审实测把 `eval_pac` 那次 `spawn_blocking` 换成同步调用，
+        /// 35 passed 全绿。而它才是真正会阻塞数秒的那个（自动检测要跑
+        /// DHCP INFORM + DNS wpad，MSDN 明说可能"several seconds"）。
+        pac_sleep: Duration,
+        /// 触发 PAC 那条路径要靠这个字段（`decide()` 看 `pac_active`）。
+        auto_detect: bool,
+    }
+
+    impl SlowFake {
+        fn slow_current(sleep: Duration) -> Self {
+            Self {
+                current_sleep: sleep,
+                pac_sleep: Duration::ZERO,
+                auto_detect: false,
+            }
+        }
+        fn slow_pac(sleep: Duration) -> Self {
+            Self {
+                current_sleep: Duration::ZERO,
+                pac_sleep: sleep,
+                auto_detect: true,
+            }
+        }
     }
 
     impl ProxySource for SlowFake {
         fn current(&self) -> RawProxyConfig {
-            std::thread::sleep(self.sleep);
-            RawProxyConfig::default()
+            std::thread::sleep(self.current_sleep);
+            RawProxyConfig {
+                auto_detect: self.auto_detect,
+                ..RawProxyConfig::default()
+            }
         }
-        fn eval_pac(&self, _: bool, _: Option<&str>, _: &str) -> Option<String> {
+        fn eval_pac(&self, _: bool, _: Option<&str>, _: &str) -> Option<PacOutcome> {
+            std::thread::sleep(self.pac_sleep);
             None
         }
     }
@@ -447,7 +581,7 @@ mod tests {
         let mut c = raw();
         c.proxy = Some("static.company.com:8080".into());
         c.pac_url = Some("http://wpad.company.com/wpad.dat".into());
-        let r = SystemProxyResolver::new(Fake::new(c, Some("PROXY pac.company.com:3128")));
+        let r = SystemProxyResolver::new(Fake::proxies(c, "PROXY pac.company.com:3128"));
         assert_eq!(
             r.resolve(&gw()).await.unwrap().to_string(),
             "pac.company.com:3128"
@@ -464,7 +598,7 @@ mod tests {
         // ——不是 brief 原样例只查 target_url 那种只验证一半的写法。
         let mut c = raw();
         c.pac_url = Some("http://wpad.company.com/wpad.dat".into());
-        let fake = Fake::new(c, Some("PROXY p:3128"));
+        let fake = Fake::proxies(c, "PROXY p:3128");
         let r = SystemProxyResolver::new(fake);
         r.resolve(&gw()).await;
         let calls = r.source().pac_calls.lock().unwrap().clone();
@@ -491,7 +625,7 @@ mod tests {
         let mut c = raw();
         c.pac_url = Some("http://wpad/wpad.dat".into());
         c.proxy = Some("static.company.com:8080".into());
-        let r = SystemProxyResolver::new(Fake::new(c, Some("DIRECT")));
+        let r = SystemProxyResolver::new(Fake::new(c, Some(PacOutcome::Direct)));
         assert_eq!(r.decide(&gw()).await, ProxyDecision::PacDirect);
         assert!(r.resolve(&gw()).await.is_none());
     }
@@ -585,7 +719,7 @@ mod tests {
         let mut c = raw();
         c.pac_url = Some("http://wpad.company.com/wpad.dat".into());
         c.bypass = Some("*.company.com".into());
-        let r = SystemProxyResolver::new(Fake::new(c, Some("PROXY pac.company.com:3128")));
+        let r = SystemProxyResolver::new(Fake::proxies(c, "PROXY pac.company.com:3128"));
         assert_eq!(
             r.decide(&gw()).await,
             ProxyDecision::PacProxy("pac.company.com:3128".parse().unwrap())
@@ -620,7 +754,7 @@ mod tests {
         // 会失败（第一条在 unwrap 处 panic）。
         let mut c = raw();
         c.auto_detect = true;
-        let fake = Fake::new(c, Some("PROXY wpad-found.company.com:3128"));
+        let fake = Fake::proxies(c, "PROXY wpad-found.company.com:3128");
         let r = SystemProxyResolver::new(fake);
         assert_eq!(
             r.decide(&gw()).await.into_target().unwrap().to_string(),
@@ -662,10 +796,26 @@ mod tests {
         // 换回直接同步调用 `source.current()`（不经过 spawn_blocking）
         // ——这条测试会从"超时"变成等满 500ms 的 sleep 之后才返回，
         // `outcome.is_err()` 断言失败。
-        let r = SystemProxyResolver::new(SlowFake {
-            sleep: Duration::from_millis(500),
-        });
+        let r = SystemProxyResolver::new(SlowFake::slow_current(Duration::from_millis(500)));
         let outcome = tokio::time::timeout(Duration::from_millis(50), r.resolve(&gw())).await;
         assert!(outcome.is_err(), "阻塞调用不该占用调用方的异步执行线程");
+    }
+
+    #[tokio::test]
+    async fn a_blocking_pac_evaluation_does_not_starve_the_async_runtime_either() {
+        // W20.1 的第二半：上一条只覆盖了 `current()`。复审实测把
+        // `eval_pac` 那次 `spawn_blocking` 换成同步调用，35 passed
+        // 全绿——而 `eval_pac` 才是真正会阻塞数秒的那个（自动检测要跑
+        // 完 DHCP INFORM + DNS wpad 才轮到 PAC 下载与执行，MSDN 对这
+        // 两个函数的原话是 "blocking, synchronous"）。
+        //
+        // 改红：把 decide() 里包着 `source.eval_pac(...)` 的那次
+        // `tokio::task::spawn_blocking` 去掉、直接同步调用——这条会从
+        // "超时"变成等满 500ms 才返回，`is_err()` 断言失败。
+        // （注意 `current()` 这一路仍然走 spawn_blocking，所以这条测试
+        // 单独钉住的就是 eval_pac 那一处。）
+        let r = SystemProxyResolver::new(SlowFake::slow_pac(Duration::from_millis(500)));
+        let outcome = tokio::time::timeout(Duration::from_millis(50), r.resolve(&gw())).await;
+        assert!(outcome.is_err(), "PAC 求值不该占用调用方的异步执行线程");
     }
 }

@@ -11,6 +11,9 @@ rmc-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 async-trait = "0.1"
+# 与 rmc-core 同一个版本；Cargo.lock 里本来就有这一项（rmc-core 的
+# known_hosts 指纹用它），这条依赖不新增任何依赖边。
+base64 = "0.22"
 zeroize.workspace = true
 
 # Win32 调用只在 windows target 上编译；纯逻辑模块（proxy::parse 等）不依赖

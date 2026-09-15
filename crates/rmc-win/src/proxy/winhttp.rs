@@ -2,10 +2,11 @@
 //! 本模块含 unsafe，逻辑都很短：判断"该不该用、用哪个"完全不在这里，
 //! 都在 [`super::SystemProxyResolver::decide`]（纯函数，跨平台可测）；
 //! 这里只做两件事——调 Win32 API、把结果转成 [`super::RawProxyConfig`]
-//! / `Option<String>` 这些普通 Rust 值。
+//! / [`super::PacOutcome`] 这些普通 Rust 值；连 `dwAccessType` 该怎么
+//! 读都不在这里，在 [`super::pac_outcome`]（W20.1）。
 #![allow(unsafe_code)]
 
-use super::{ProxySource, RawProxyConfig};
+use super::{PacOutcome, ProxySource, RawProxyConfig};
 use std::sync::Mutex;
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
@@ -26,6 +27,20 @@ const _: () = assert!(super::AUTOPROXY_AUTO_DETECT == WINHTTP_AUTOPROXY_AUTO_DET
 const _: () = assert!(super::AUTOPROXY_CONFIG_URL == WINHTTP_AUTOPROXY_CONFIG_URL);
 const _: () = assert!(super::AUTO_DETECT_TYPE_DHCP == WINHTTP_AUTO_DETECT_TYPE_DHCP);
 const _: () = assert!(super::AUTO_DETECT_TYPE_DNS_A == WINHTTP_AUTO_DETECT_TYPE_DNS_A);
+// W20.1：`pac_outcome` 判定「PAC 说直连」还是「PAC 给了代理」用的就是
+// 这两个数值，同样重新声明在 `mod.rs` 里跑表驱动测试，同样用 const
+// 断言守住不漂移。
+const _: () = assert!(super::ACCESS_TYPE_NO_PROXY == WINHTTP_ACCESS_TYPE_NO_PROXY.0);
+const _: () = assert!(super::ACCESS_TYPE_NAMED_PROXY == WINHTTP_ACCESS_TYPE_NAMED_PROXY.0);
+
+/// 中毒了也把里面的值拿出来接着用（W20.2）。
+///
+/// `lock().unwrap()` 对一个**长寿命单例**是个陷阱：一次 panic 之后，
+/// `eval_pac` 会永久地"PAC 求值失败"，`Drop` 会在栈展开中 abort 并且
+/// 漏掉句柄。这里守的纪律跟 `sspi.rs` 里那个同名函数一样。
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// WinHTTP 会话句柄，跨多次 [`WinHttpSource::eval_pac`] 调用复用。
 struct AutoProxySession(*mut core::ffi::c_void);
@@ -63,7 +78,11 @@ impl Default for WinHttpSource {
 
 impl Drop for WinHttpSource {
     fn drop(&mut self) {
-        if let Some(session) = self.session.lock().unwrap().take() {
+        // W20.2：不能用 `lock().unwrap()`。锁一旦中毒，这里会在 `Drop`
+        // 里自己 panic——如果本来就在栈展开中，那是直接 abort，而且
+        // 会话句柄不会被关掉。`into_inner` 把值拿出来照常清理：中毒
+        // 只说明"某个持锁的线程 panic 过"，句柄本身仍然要还给系统。
+        if let Some(session) = lock(&self.session).take() {
             // SAFETY: `session.0` 是本模块自己用 `WinHttpOpen` 拿到、
             // 且只有这一处持有所有权的有效句柄；`Drop::drop` 只运行
             // 一次，不会对同一句柄重复调用 `WinHttpCloseHandle`。
@@ -156,8 +175,10 @@ impl ProxySource for WinHttpSource {
         auto_detect: bool,
         pac_url: Option<&str>,
         target_url: &str,
-    ) -> Option<String> {
-        let mut guard = self.session.lock().unwrap();
+    ) -> Option<PacOutcome> {
+        // W20.2：同上。上一版这里的 `unwrap()` 会把一次偶发的中毒变成
+        // **永久性**的「PAC 求值失败」——每次重连都会再撞一次。
+        let mut guard = lock(&self.session);
         let session = match guard.as_ref() {
             Some(s) => s.0,
             None => {
@@ -230,6 +251,18 @@ impl ProxySource for WinHttpSource {
         if let Err(e) = &result {
             if e.code() == HRESULT::from_win32(ERROR_WINHTTP_LOGIN_FAILURE) {
                 options.fAutoLogonIfChallenged = true.into();
+                // W20.3：覆盖之前必须先把上一次可能已经写进去的两个字符
+                // 串还回去。上一版直接 `info = ..::default()`，如果第一
+                // 次调用已经回填了 lpszProxy/lpszProxyBypass 就是泄漏
+                // ——而且跟本文件下面那段自己的论证（"文档要求两个字段
+                // 都释放，不区分调用成功与否"）自相矛盾，两处必须一致。
+                // SAFETY: 与下方取值处的前提完全相同——这两个指针要么是
+                // NULL，要么是 `WinHttpGetProxyForUrl` 按文档约定分配、
+                // 需要 GlobalFree 释放的内存。
+                unsafe {
+                    free_pwstr(info.lpszProxy);
+                    free_pwstr(info.lpszProxyBypass);
+                }
                 info = WINHTTP_PROXY_INFO::default();
                 // SAFETY: 同上，重试只改了 `fAutoLogonIfChallenged`。
                 result =
@@ -267,13 +300,19 @@ impl ProxySource for WinHttpSource {
         // 而不是"PAC 成功地说了直连"——这正是本任务标题要解决的那类
         // 「直连」与「求值失败」混淆，藏在了上一轮测试没能覆盖到
         // 的这一层 Win32 边界上。
-        match info.dwAccessType {
-            WINHTTP_ACCESS_TYPE_NO_PROXY => Some("DIRECT".to_string()),
-            WINHTTP_ACCESS_TYPE_NAMED_PROXY => proxy_string,
-            other => {
-                tracing::warn!("WinHttpGetProxyForUrl 返回了未预期的 dwAccessType={other:?}");
-                None
-            }
+        // W20.1（复审）：这段映射本身搬到了 `super::pac_outcome`——纯
+        // 函数、在 macOS 上表驱动测得到。上一版留在这里的两条 arm
+        // 对调之后 35 条测试加两条 zigbuild 闸门全绿，等于完全没有
+        // 保护，而它是 Task 2 后果最大的那条行为修复。这里只剩"把
+        // Win32 的值原样递过去"。
+        let outcome = super::pac_outcome(info.dwAccessType.0, proxy_string);
+        if outcome.is_none() {
+            tracing::warn!(
+                "WinHttpGetProxyForUrl 的结果读不出结论：dwAccessType={}，lpszProxy 是否为空={}",
+                info.dwAccessType.0,
+                info.lpszProxy.is_null()
+            );
         }
+        outcome
     }
 }

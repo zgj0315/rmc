@@ -31,3 +31,4 @@
 
 pub mod proxy;
 pub mod single_instance;
+pub mod sspi;
