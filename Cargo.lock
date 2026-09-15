@@ -1395,6 +1395,7 @@ dependencies = [
  "async-trait",
  "base64",
  "rmc-core",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "windows",

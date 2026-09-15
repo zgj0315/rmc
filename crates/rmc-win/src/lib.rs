@@ -30,5 +30,6 @@
 //! 也没法在 CI 的非 Windows 阶段自动跑到。
 
 pub mod proxy;
+pub mod secret;
 pub mod single_instance;
 pub mod sspi;
