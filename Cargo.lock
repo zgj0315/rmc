@@ -1389,6 +1389,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmc-win"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rmc-core",
+ "tokio",
+ "tracing",
+ "windows",
+ "zeroize",
+]
+
+[[package]]
 name = "russh"
 version = "0.63.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

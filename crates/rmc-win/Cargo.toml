@@ -1,0 +1,35 @@
+[package]
+name = "rmc-win"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rmc-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+zeroize.workspace = true
+
+# Win32 调用只在 windows target 上编译；纯逻辑模块（proxy::parse 等）不依赖
+# 这一段，在 macOS/Linux 上原生可测。
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  # W6：SecHandle 在这个 feature 里。Task 3 的 AcquireCredentialsHandleW 等
+  # 四个 SSPI 符号缺了它会一起「不存在」——feature 表在骨架阶段先备好。
+  "Win32_Security_Credentials",
+  "Win32_System_Threading",
+  # W6：Task 4/5 会用到（DEVICE_NOTIFY_CALLBACK 等不在 System::Power 里）。
+  "Win32_System_SystemServices",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Networking_WinHttp",
+  "Win32_Security_Cryptography",
+  "Win32_Security_Authentication_Identity",
+  "Win32_System_Power",
+  "Win32_Networking_NetworkListManager",
+  "Win32_System_Com",
+] }

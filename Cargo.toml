@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rmc-core"]
+members = ["crates/rmc-core", "crates/rmc-win"]
 
 [workspace.package]
 edition = "2021"
@@ -20,3 +20,9 @@ thiserror = "2"
 zeroize = { version = "1", features = ["std"] }
 tracing = "0.1"
 rand = "0.8"
+rmc-core = { path = "crates/rmc-core" }
+# W6：计划原文写的是 0.58，但 russh 0.63 经 pageant 已经把 0.62.2 传递性拉进
+# Cargo.lock——用 0.58 会在 workspace 里并存两个大版本的 windows crate。
+# 0.62 下 rmc-win 的 Win32 代码原有的编译错误从 13 处降到 1 处（其余是本
+# workspace 自己代码的问题，不是版本问题）。
+windows = "0.62"
