@@ -41,11 +41,12 @@
 //! 出来——账本里第 18 个反例正是栽在这上面）；[`AuthOutcome`] 不带
 //! 任何一段 token 或 challenge 原文，日志里也只出现轮次与状态码。
 //!
-//! 唯一一处没有被 `Zeroizing` 覆盖的是 `next_token` 的返回值本身：
-//! rmc-core 的 trait 签名是 `Option<String>`，`http_connect` 又会把它
-//! `format!` 进一个普通 `String` 请求缓冲区。要堵上这一段需要同时改
-//! rmc-core 的 trait 与 `connect.rs`，不在本任务范围内，记在
-//! task-3-report.md 的遗留问题里。
+//! 这条纪律现在是**贯通的**（W36）：
+//! [`rmc_core::platform::ProxyAuthenticator::next_token`] 的返回类型
+//! 本身就是 `Option<Zeroizing<String>>`，`http_connect` 那一侧拼出来的
+//! `Proxy-Authorization` 值与整条请求缓冲也都是 `Zeroizing<String>`。
+//! 修复轮 1 之前，token 会在逃出本 crate 的那一刻被抄进两个 drop 时不
+//! 抹零的普通 `String`。
 
 use base64::Engine;
 use rmc_core::addr::HostPort;
@@ -135,6 +136,27 @@ pub trait ProxyEndpoint: Send + Sync {
 /// 协商器被调用时那次解析刚刚发生过。再解析一次意味着在企业网络上
 /// 再跑一遍 WPAD 发现（MSDN 明说可能"several seconds"），而且两次结果
 /// 未必一致——记下来才是准确的那一个。
+///
+/// # 这个类型假定「同一时刻只有一次解析在途」（W33）
+///
+/// `last` 是一格**全局的**、会被每一次 `resolve()` 覆盖的槽。它给出的
+/// 是"最近一次解析的结果"，不是"这次协商所属的那条连接用的代理"。
+/// 两者一致的前提是：一次 `resolve()` 与紧随其后的那次协商之间，没有
+/// 别人再调 `resolve()`。
+///
+/// **不是**并发建连打破它：Supervisor 的 `connecting_or_connected()`
+/// 已经挡住了同时建两条连接。真正的逃逸口是
+/// [`rmc_core::transport::Transport::effective_proxy`] 被文档标成"供
+/// 预检与界面显示使用"——Task 9 的诊断页、Task 10 的状态栏只要**轮询**
+/// 它（那是完全合理的界面写法，而且它就是这么被文档推荐的），就会在
+/// 一次协商进行到一半时改写这里的 `last`。后果是第二段协商拿着另一台
+/// 代理的 SPN 去谈，换回 `SEC_E_TARGET_UNKNOWN`；**没有任何测试会红**，
+/// 因为两边各自都是对的。
+///
+/// 要彻底解决得把"这次连接用哪个代理"沿调用链传下去，也就是再改一次
+/// `ProxyAuthenticator::next_token` 的签名。在那之前，Task 9/10 的派发
+/// 里必须写明：**不要轮询 `effective_proxy`**，界面要显示的代理从
+/// `TunnelEvent` 里取。
 pub struct ProxyEndpointRecorder {
     inner: Arc<dyn ProxyResolver>,
     last: Mutex<Option<HostPort>>,
@@ -177,6 +199,21 @@ impl ProxyEndpoint for ProxyEndpointRecorder {
 ///
 /// 参数收的是 [`HostPort`] 而不是 `&str`：端口从类型上就被分开了，
 /// "不小心把端口拼进 SPN"这件事构造不出来。
+///
+/// # 两种拼不出有意义 SPN 的输入（W33）
+///
+/// - **返回 `None`**：主机名去掉末尾的点之后是空的。`HostPort::new(".",
+///   8080)` 是一个**合法**的 `HostPort`（`valid_host` 放行只由 `.`
+///   组成的串），走到这里会变成空主机名——宁可返回 `None` 让结局记成
+///   [`AuthOutcome::UnknownProxyEndpoint`]，也不要拿一个 `HTTP/` 去换
+///   一个看不懂的 SSPI 错误码。见
+///   `a_proxy_host_that_is_only_a_dot_yields_no_spn`。
+/// - **返回一个对 Kerberos 无意义的 SPN**：代理配成 IP 字面量时，这里
+///   会拼出 `HTTP/10.1.2.3`。AD 里几乎不会有人给 IP 注册 SPN，
+///   Kerberos 那一段会失败（`SEC_E_TARGET_UNKNOWN`，诊断页会如实报
+///   出来），**但这不是死路**：Negotiate 会自己回落到 NTLM，而 NTLM
+///   根本不看 SPN。所以这里不拦——拦了就把一台本来能用 NTLM 连上的
+///   机器变成连不上。见 `an_ip_literal_proxy_still_yields_an_spn`。
 pub fn spn_for_proxy(proxy: &HostPort) -> Option<String> {
     let host = proxy.host().trim().trim_end_matches('.');
     if host.is_empty() {
@@ -195,8 +232,23 @@ pub fn spn_for_proxy(proxy: &HostPort) -> Option<String> {
 /// 拒绝了一份格式正确的凭据，后者是本机这边就没谈成）。
 pub enum SspiStep {
     /// 下一个要发出去的 token（还没做 base64）。
-    Token(Zeroizing<Vec<u8>>),
+    ///
+    /// `last` 为真表示**这是本次协商的最后一段**：SSPI 已经收工，这段
+    /// token 发出去之后本机这边没有东西可发了，代理接不接受是代理的事。
+    ///
+    /// 这个标志不是装饰（W31）：NTLM 的第二段与 Kerberos 的单段都是
+    /// **带着 token 收工**的，所以在真实 Windows 上
+    /// [`SspiStep::Done`] 几乎不会出现，"协商走完了"这件事只能从这里
+    /// 读出来。没有它的话，"凭据格式没问题、是代理不接受当前用户"
+    /// 这句诊断就挂在一个产不出来的状态上。
+    Token {
+        token: Zeroizing<Vec<u8>>,
+        last: bool,
+    },
     /// 协商正常结束，SSPI 没有更多 token 要发了。
+    ///
+    /// 注意它跟 `Token { last: true }` 的区别：这里是**连最后一段都
+    /// 没有**。HTTP 上的 Negotiate/NTLM 很少走到这一支。
     Done,
     /// 协商失败。字符串里只放状态码与原因，**绝不放 token 或
     /// challenge 的任何一段**。
@@ -211,7 +263,9 @@ pub enum SspiStep {
 impl fmt::Debug for SspiStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Token(t) => write!(f, "Token(<{} 字节，内容已隐去>)", t.len()),
+            Self::Token { token, last } => {
+                write!(f, "Token(<{} 字节，内容已隐去>, last={last})", token.len())
+            }
             Self::Done => write!(f, "Done"),
             Self::Failed(why) => write!(f, "Failed({why})"),
         }
@@ -321,13 +375,150 @@ pub fn describe_sspi_status(code: i32) -> String {
     format!("{why}，状态码 0x{:08X}", code as u32)
 }
 
+/// [`step_from`] 的产出：这一段协商的结果，加上 Win32 那一侧必须照做的
+/// 两件事。
+///
+/// 两个布尔为什么不能留在 `imp.rs` 里：它们决定的是句柄的所有权与上下文
+/// 的寿命，错一个就是"失败之后对一个未必有效的句柄调
+/// `DeleteSecurityContext`"或者"协商还要继续却把上下文标成结束"。
+#[derive(Debug)]
+pub struct StepDecision {
+    /// 交给上层的结果。
+    pub step: SspiStep,
+    /// 要不要把这次 `InitializeSecurityContextW` 产出的上下文句柄接管
+    /// 过来（接管了才会在 `Drop` 里 `DeleteSecurityContext`）。
+    pub adopt_context: bool,
+    /// 这个上下文是不是到此为止、后续再 `step` 一律拒绝。
+    pub finished: bool,
+}
+
+/// 一次 `InitializeSecurityContextW` 的返回码与输出 token → 这一段协商
+/// 该怎么算。**纯函数，没有一个 Win32 符号。**
+///
+/// # 为什么这 35 行必须待在这一层（W29）
+///
+/// 它原本写在 `imp.rs` 的 `match` 里，也就是 `#[cfg(windows)]` 那一块
+/// 零自动化覆盖的代码中。复审把 `Continue` 与 `Done` 两条 arm 的**函数
+/// 体整个对调**（语义上是灾难：要继续的一段被标成结束、要收工的一段被
+/// 当成还没完），实测结果是 `cargo zigbuild --tests` 绿、
+/// `cargo-zigbuild clippy -- -D warnings` 绿、零告警，macOS 上 62 条测试
+/// 一行都跑不到——**三条自动化防线全部双盲**。这已经是同一个坑的第三次
+/// （Task 2 的 `autoproxy_flags`、`dwAccessType`，然后是它）。
+///
+/// 搬到这里之后，那个对调在 macOS 上就能被
+/// `a_status_and_a_token_decide_the_step_the_context_and_the_finished_flag`
+/// 当场抓住。
+///
+/// # 三条真正的判断
+///
+/// 1. **说"还要继续"却没给 token**：协商推不下去了，算失败——不是
+///    "等下一轮"，因为没有东西可发给代理，下一轮永远不会来。
+/// 2. **说"谈完了"却还带着 token**：这一段**仍然要发出去**，代理靠它
+///    放行。NTLM 第二段与 Kerberos 单段走的都是这一支。
+/// 3. **失败时不接管 `new_ctx`**：`InitializeSecurityContext` 失败之后
+///    这个句柄的有效性没有文档保证，对一个未必有效的句柄调
+///    `DeleteSecurityContext` 比可能漏掉一次清理更危险；而且这条路径
+///    上协商已经结束，不会反复发生。
+///
+/// `code` 只用来拼那两句给人看的话（[`describe_sspi_status`] 与"要求
+/// 继续却没给 token"里的原始码）；分类本身在 `kind` 里，由
+/// [`classify_sspi_status`] 算好传进来。
+pub fn step_from(
+    kind: SspiStatusKind,
+    token: Option<Zeroizing<Vec<u8>>>,
+    package: SspiPackage,
+    code: i32,
+) -> StepDecision {
+    // 长度为 0 的输出缓冲等于没有 token：SSPI 在"没东西可发"时给的就是
+    // 一个空缓冲，不是 NULL。
+    let token = token.filter(|t| !t.is_empty());
+    match kind {
+        SspiStatusKind::Continue => match token {
+            Some(token) => StepDecision {
+                step: SspiStep::Token { token, last: false },
+                adopt_context: true,
+                finished: false,
+            },
+            None => StepDecision {
+                step: SspiStep::Failed(format!(
+                    "{} 要求继续协商却没有给出 token，状态码 0x{:08X}",
+                    package.package_name(),
+                    code as u32
+                )),
+                adopt_context: true,
+                finished: true,
+            },
+        },
+        SspiStatusKind::Done => match token {
+            // 最后一段 token 仍然要发出去，代理靠它放行。
+            Some(token) => StepDecision {
+                step: SspiStep::Token { token, last: true },
+                adopt_context: true,
+                finished: true,
+            },
+            // 连最后一段都没有：协商到此为止。
+            None => StepDecision {
+                step: SspiStep::Done,
+                adopt_context: true,
+                finished: true,
+            },
+        },
+        SspiStatusKind::Failed => StepDecision {
+            step: SspiStep::Failed(describe_sspi_status(code)),
+            adopt_context: false,
+            finished: true,
+        },
+    }
+}
+
 // =====================================================================
 // 协商结局：给诊断页的带类型出口
 // =====================================================================
 
+/// scheme 名进 [`AuthOutcome::UnsupportedScheme`] 之前的字符数上限。
+///
+/// auth-scheme 是一个 HTTP token，现实里最长的也就 `Negotiate` 这种
+/// 量级；64 个字符已经宽松到不可能误伤真实代理。
+const MAX_SCHEME_CHARS: usize = 64;
+
+/// 把一个来路不明的 scheme 名截断、并转义掉控制字符，再让它进结局与
+/// 诊断行（W32）。
+///
+/// 为什么要做：`next_token` 收到的 `scheme` 最终来自代理响应头，
+/// `read_response` 对它只做了"按第一个空白切开"，长度上限是整行的
+/// 16KB；它随后原样进 [`AuthOutcome::UnsupportedScheme`]，而那个变体
+/// 会被诊断页显示、被 `Debug` 打印。仓库对"不受信任的原文进用户可见
+/// 文案"已有规范与现成测试
+/// （`knownhosts::tests::damaged_line_error_message_is_bounded_in_length`
+/// 要求错误文案 < 1000 字节），这里照同一条办。
+///
+/// 转义控制字符的理由跟那边一样：本函数的输入不保证来自 `connect.rs`
+/// 的那条解析路径——这是一个公开 trait 的实现，任何调用方都能传进来
+/// 一段带 NUL 的字节。
+fn bounded_scheme(raw: &str) -> String {
+    let mut chars = raw.chars();
+    let head: String = chars.by_ref().take(MAX_SCHEME_CHARS).collect();
+    let truncated = chars.next().is_some();
+    let escaped: String = head
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<String>()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+    if truncated {
+        format!("{escaped}…（已截断）")
+    } else {
+        escaped
+    }
+}
+
 /// 一次（或一段）协商的结局。
 ///
-/// `next_token` 的返回值是 `Option<String>`，`None` 同时表示"scheme
+/// `next_token` 的返回值是 `Option<Zeroizing<String>>`，`None` 同时表示"scheme
 /// 不支持"、"challenge 是坏的"、"建不出上下文"、"协商走完了"、"协商
 /// 失败了"五件事——跟 Task 2 里 `resolve()` 的 `Option` 把"不走代理"
 /// 与"解析失败"压平是同一类问题，解法也一样：另开一个带类型的出口，
@@ -339,6 +530,11 @@ pub enum AuthOutcome {
     NotAttempted,
     /// 代理要求的 scheme 本机不做（Basic/Digest）。带的是 scheme 名，
     /// 不是任何凭据。
+    ///
+    /// **这个字符串一律经 [`bounded_scheme`] 截断过**（W32）：它的来源
+    /// 是代理响应头里未经长度约束的字节（`read_response` 按第一个空白
+    /// 切 scheme，整行上限 16KB），而它会直接进诊断行与 `Debug`。仓库
+    /// 的规范见 `knownhosts::redact_for_error`。
     UnsupportedScheme(String),
     /// 不知道当前经过哪个代理，SPN 构造不出来。
     UnknownProxyEndpoint,
@@ -348,9 +544,26 @@ pub enum AuthOutcome {
     ChallengeWithoutNegotiation,
     /// 建不出安全上下文：机器不在域里、包不可用、当前用户没有凭据。
     ContextUnavailable(SspiPackage),
-    /// 已经发出第 `round` 段 token，代理接不接受要看 CONNECT 的结果。
+    /// 已经发出第 `round` 段 token，而且协商**还要继续**（SSPI 说
+    /// `SEC_I_CONTINUE_NEEDED`）。
     TokenIssued { package: SspiPackage, round: usize },
-    /// 协商正常走完，SSPI 没有更多 token 可发，而代理仍在要求认证。
+    /// **最后一段** token 已经发出（共 `rounds` 段），本机这边收工，
+    /// 等代理裁决。
+    ///
+    /// 这一格是 W31 补的。在它之前，NTLM 第二段与 Kerberos 单段——
+    /// 也就是真实 Windows 上**绝大多数**协商的收尾——都落在
+    /// [`AuthOutcome::TokenIssued`] 上，跟"还要再谈一轮"分不开，于是
+    /// "凭据格式没问题、是代理不接受当前用户"这句最需要的话挂在了一个
+    /// 产不出来的状态上。
+    FinalTokenIssued { package: SspiPackage, rounds: usize },
+    /// 本机这边的协商已经走完，没有 token 可发了，而代理仍在要求认证。
+    ///
+    /// 两条路径都会到这里，而且**第二条才是现实中的那条**：
+    ///
+    /// 1. SSPI 直接给了 [`SspiStep::Done`]（连最后一段都没有）——HTTP 上
+    ///    的 Negotiate/NTLM 很少这样；
+    /// 2. 最后一段 token 已经发出（[`AuthOutcome::FinalTokenIssued`]），
+    ///    代理却又回了一个 407。那就是代理看过凭据之后**不接受**。
     Completed { package: SspiPackage, rounds: usize },
     /// 协商失败。`detail` 只有状态码与原因。
     Failed {
@@ -396,7 +609,15 @@ impl AuthOutcome {
             Self::TokenIssued { package, round } => (
                 None,
                 format!(
-                    "已向代理发出第 {round} 段 {} token，是否被接受要看 CONNECT 的结果",
+                    "已向代理发出第 {round} 段 {} token，协商还要继续",
+                    package.package_name()
+                ),
+            ),
+            Self::FinalTokenIssued { package, rounds } => (
+                None,
+                format!(
+                    "{} 协商的最后一段 token 已发出（共 {rounds} 段），等代理裁决；\
+                     代理若仍要求认证，说明凭据格式没问题，是代理不接受当前用户",
                     package.package_name()
                 ),
             ),
@@ -438,6 +659,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct Negotiation {
     context: Option<Box<dyn SspiContext>>,
     round: usize,
+    /// 最后一段 token 已经发出去了（[`SspiStep::Token`] 带 `last`），
+    /// 本机这边没有东西可发了，就等代理裁决。
+    ///
+    /// 有了它，"最后一段发完之后代理又要了一次"才能被如实说成"代理
+    /// 不接受当前用户"；没有它的话，那次调用会径直落到上下文的
+    /// `step` 上，换回一句 `这个上下文的协商已经结束` 的内部行话
+    /// （W31）。
+    concluded: bool,
 }
 
 struct Inner<F> {
@@ -466,15 +695,18 @@ pub struct SspiProxyAuthenticator<F> {
 
 impl<F> fmt::Debug for SspiProxyAuthenticator<F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 这个类型结构上就拿不到 token：它只存上下文（不透明）与
-        // 结局（按设计不带 token），所以这里能安全地打印结局。
+        // **只读 `outcome` 这一把短锁**（W33）。原来的版本顺手打印了一个
+        // `in_flight`，代价是要去取 `negotiation` 那把锁——而拆成两把锁
+        // 的全部理由就是"诊断页读结局时不该被一次正在进行的协商挡住"：
+        // 首段 Negotiate 可能真的去联系域控，那把锁会被 `spawn_blocking`
+        // 长时间持有。`last_outcome()` 守住了这条纪律，`Debug` 又把口子
+        // 开回来了——而 `Debug` 恰恰是最容易被顺手写进日志的那一个。
+        //
+        // 这个类型结构上就拿不到 token：`AuthOutcome` 按设计不带任何一段
+        // token 或 challenge 原文，所以打印结局是安全的。
         f.debug_struct("SspiProxyAuthenticator")
-            .field(
-                "in_flight",
-                &lock(&self.inner.negotiation).context.is_some(),
-            )
             .field("outcome", &*lock(&self.inner.outcome))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -515,7 +747,7 @@ where
         package: SspiPackage,
         start_new: bool,
         challenge: Option<Zeroizing<Vec<u8>>>,
-    ) -> Option<String> {
+    ) -> Option<Zeroizing<String>> {
         let mut neg = lock(&self.negotiation);
 
         if start_new {
@@ -541,6 +773,20 @@ where
             }
         }
 
+        // 最后一段 token 已经发出去了，代理却又回了一个 407：本机这边
+        // 的协商已经走完，没有东西可发。这才是"凭据格式没问题，是代理
+        // 不接受当前用户"在真实 Windows 上的到达路径（W31）——不把这一
+        // 格拦在这里，这次调用会落到上下文的 `step` 上，换回一句
+        // `这个上下文的协商已经结束` 的内部行话。
+        if neg.concluded {
+            let rounds = neg.round;
+            // 丢掉上下文（触发 Drop：DeleteSecurityContext +
+            // FreeCredentialsHandle），这次协商到此为止。
+            *neg = Negotiation::default();
+            self.set_outcome(AuthOutcome::Completed { package, rounds });
+            return None;
+        }
+
         // 收到 challenge 却没有在途协商：**不能**在这里新建一个上下文
         // 再把服务端的 challenge 当首段输入喂进去——真实 SSPI 的首段
         // 不接受服务端 token，那样只会换回一个看不懂的错误码。
@@ -557,12 +803,20 @@ where
         };
 
         match step {
-            SspiStep::Token(token) => {
-                self.set_outcome(AuthOutcome::TokenIssued { package, round });
-                // 先编码到一个会被抹掉的缓冲里；逃出去的那份是 rmc-core
-                // 的 trait 形状要求的普通 `String`（见模块文档末尾）。
-                let encoded = Zeroizing::new(b64().encode(token.as_slice()));
-                Some(encoded.as_str().to_string())
+            SspiStep::Token { token, last } => {
+                neg.concluded = last;
+                self.set_outcome(if last {
+                    AuthOutcome::FinalTokenIssued {
+                        package,
+                        rounds: round,
+                    }
+                } else {
+                    AuthOutcome::TokenIssued { package, round }
+                });
+                // 编码进一个会被抹掉的缓冲，**并且就这么交出去**：
+                // `next_token` 的返回类型本身就是 `Zeroizing<String>`
+                // （W36），不再需要在边界上抄一份普通 `String`。
+                Some(Zeroizing::new(b64().encode(token.as_slice())))
             }
             SspiStep::Done => {
                 neg.context = None;
@@ -590,10 +844,11 @@ impl<F> ProxyAuthenticator for SspiProxyAuthenticator<F>
 where
     F: Fn(SspiPackage, &str) -> Option<Box<dyn SspiContext>> + Send + Sync + 'static,
 {
-    async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<String> {
+    async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>> {
         let Some(package) = SspiPackage::from_http_scheme(scheme) else {
+            // 截断（W32）：这一段字节来自代理响应头，没有任何长度约束。
             self.inner
-                .set_outcome(AuthOutcome::UnsupportedScheme(scheme.to_string()));
+                .set_outcome(AuthOutcome::UnsupportedScheme(bounded_scheme(scheme)));
             return None;
         };
 
@@ -676,6 +931,14 @@ mod tests {
         "proxy.company.com:8080".parse().unwrap()
     }
 
+    /// `next_token` 的返回值 → `Option<String>`，只为让断言写得下去
+    /// （`Option<Zeroizing<String>>::as_deref()` 给的是 `Option<&String>`，
+    /// 跟字面量比不了）。传进来的那个 `Zeroizing` 在这里就被 drop 掉、
+    /// 照常抹零。
+    fn token_text(t: Option<Zeroizing<String>>) -> Option<String> {
+        t.map(|t| t.as_str().to_string())
+    }
+
     /// 固定答案的代理出口，替代真实的 `ProxyEndpointRecorder`。
     struct FixedEndpoint(Option<HostPort>);
 
@@ -697,13 +960,21 @@ mod tests {
         input: Option<Vec<u8>>,
     }
 
-    /// 协商走到第三次调用时怎么收尾。真实世界里这对应"SSPI 说没有更多
-    /// token 了"与"SSPI 报错"两种结局，它们折成同一个 `None` 返回给
-    /// `http_connect`，但诊断上必须分得开。
+    /// 这个假上下文怎么收尾。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Ending {
+        /// 第三次调用时 SSPI 说"没有更多 token 了"（`SspiStep::Done`）。
         Completed,
+        /// 第三次调用时 SSPI 报错。
+        ///
+        /// 这两种结局折成同一个 `None` 返回给 `http_connect`，但诊断上
+        /// 必须分得开。
         Failed,
+        /// **第二段就是最后一段**：token 带 `last = true`（W31）。
+        ///
+        /// 这才是真实 Windows 上的形状——NTLM 的第二段与 Kerberos 的单段
+        /// 都是带着要发的 token 收工的，根本走不到 `SspiStep::Done`。
+        FinalOnSecondLeg,
     }
 
     /// **挑剔的**假上下文：它模拟 NTLM 客户端一侧的真实约束——首轮必须
@@ -729,16 +1000,25 @@ mod tests {
                 input: input.map(|b| b.to_vec()),
             });
             match (self.round, input) {
-                (1, None) => SspiStep::Token(Zeroizing::new(NEGOTIATE_MSG.to_vec())),
+                (1, None) => SspiStep::Token {
+                    token: Zeroizing::new(NEGOTIATE_MSG.to_vec()),
+                    last: false,
+                },
                 (1, Some(_)) => SspiStep::Failed("首轮不该带 challenge".into()),
-                (2, Some(bytes)) if bytes == CHALLENGE_MSG => {
-                    SspiStep::Token(Zeroizing::new(AUTHENTICATE_MSG.to_vec()))
-                }
+                (2, Some(bytes)) if bytes == CHALLENGE_MSG => SspiStep::Token {
+                    token: Zeroizing::new(AUTHENTICATE_MSG.to_vec()),
+                    last: self.ending == Ending::FinalOnSecondLeg,
+                },
                 (2, Some(_)) => SspiStep::Failed("第二轮收到的不是 Type-2 challenge".into()),
                 (2, None) => SspiStep::Failed("第二轮缺少 challenge".into()),
                 _ => match self.ending {
                     Ending::Completed => SspiStep::Done,
                     Ending::Failed => SspiStep::Failed("代理不接受这次协商".into()),
+                    // 走不到：`FinalOnSecondLeg` 的第二段之后，协商器
+                    // 自己就把这次协商收掉了，不会再 `step` 第三次。
+                    // 这一支一旦真的被跑到，测试里那条"legs 只有两条"
+                    // 的断言会先失败。
+                    Ending::FinalOnSecondLeg => SspiStep::Failed("这个上下文的协商已经结束".into()),
                 },
             }
         }
@@ -827,7 +1107,7 @@ mod tests {
         for scheme in ["Negotiate", "negotiate", "NTLM", "ntlm"] {
             let (a, _h) = scripted(endpoint(), Ending::Completed);
             assert_eq!(
-                a.next_token(scheme, None).await.as_deref(),
+                token_text(a.next_token(scheme, None).await).as_deref(),
                 Some(NEGOTIATE_B64),
                 "scheme={scheme}"
             );
@@ -859,7 +1139,7 @@ mod tests {
         // challenge"返回 Failed，token 变成 None。
         let (a, h) = scripted(endpoint(), Ending::Completed);
         assert_eq!(
-            a.next_token("Negotiate", None).await.as_deref(),
+            token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64)
         );
         assert_eq!(
@@ -880,9 +1160,7 @@ mod tests {
         let (a, h) = scripted(endpoint(), Ending::Completed);
         a.next_token("Negotiate", None).await.unwrap();
         assert_eq!(
-            a.next_token("Negotiate", Some(CHALLENGE_B64))
-                .await
-                .as_deref(),
+            token_text(a.next_token("Negotiate", Some(CHALLENGE_B64)).await).as_deref(),
             Some(AUTHENTICATE_B64)
         );
         assert_eq!(h.legs()[1].input.as_deref(), Some(CHALLENGE_MSG));
@@ -972,7 +1250,7 @@ mod tests {
 
         // 第二条连接：重连之后代理又要求认证，必须能从头协商。
         assert_eq!(
-            a.next_token("Negotiate", None).await.as_deref(),
+            token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
             "重连之后必须能开一个全新的上下文"
         );
@@ -1015,7 +1293,7 @@ mod tests {
 
         // 断线重连：必须从一个全新的上下文重新开始。
         assert_eq!(
-            a.next_token("Negotiate", None).await.as_deref(),
+            token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
             "重连必须换一个新上下文，不能接着用上一条连接那个"
         );
@@ -1052,7 +1330,7 @@ mod tests {
         assert!(matches!(a.last_outcome(), AuthOutcome::Failed { .. }));
 
         assert_eq!(
-            a.next_token("Negotiate", None).await.as_deref(),
+            token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
             "上一次协商失败不该让后面每一次重连都失败"
         );
@@ -1081,7 +1359,7 @@ mod tests {
 
     #[tokio::test]
     async fn finishing_and_failing_both_return_none_but_stay_distinguishable() {
-        // 一正一反成对：`next_token` 的 `Option<String>` 把"协商正常
+        // 一正一反成对：`next_token` 的 `Option<_>` 把"协商正常
         // 走完"与"协商失败"压成同一个 `None`（跟 Task 2 里 `resolve()`
         // 把"不走代理"和"解析失败"压平是同一类问题），解法也一样——
         // 另开一个带类型的出口。
@@ -1126,6 +1404,11 @@ mod tests {
         // 就是又一条"测试通过 ≠ 验证了名字声称的事"。
         //
         // 改红：让 `TokenIssued` 那一支返回 `(Some(true), ...)`。
+        //
+        // 这一条只钉 `TokenIssued` 一格；"十个变体没有一个给
+        // `Some(true)`"由
+        // `every_outcome_gives_the_diagnostic_line_its_own_verdict_and_its_own_words`
+        // 整张表守着（W30）。
         let (a, _) = scripted(endpoint(), Ending::Completed);
         a.next_token("Negotiate", None).await.unwrap();
         assert!(matches!(
@@ -1295,7 +1578,7 @@ mod tests {
         });
         assert!(a.next_token("Negotiate", None).await.is_none());
         assert_eq!(
-            a.next_token("Negotiate", None).await.as_deref(),
+            token_text(a.next_token("Negotiate", None).await).as_deref(),
             Some(NEGOTIATE_B64),
             "一次 panic 不该让协商器永久失效"
         );
@@ -1310,7 +1593,10 @@ mod tests {
         //
         // 改红：给 `SspiStep` 加 `#[derive(Debug)]`（删掉手写的那个
         // impl）——十进制那条断言会失败。
-        let step = SspiStep::Token(Zeroizing::new(AUTHENTICATE_MSG.to_vec()));
+        let step = SspiStep::Token {
+            token: Zeroizing::new(AUTHENTICATE_MSG.to_vec()),
+            last: true,
+        };
         let rendered = format!("{step:?}");
         assert!(!rendered.contains("SECRET"), "{rendered}");
         assert!(!rendered.contains(AUTHENTICATE_B64), "{rendered}");
@@ -1416,5 +1702,520 @@ mod tests {
             describe_sspi_status(0x8009_0399u32 as i32).contains("0x80090399"),
             "未知状态码必须原样带出"
         );
+    }
+
+    // ================= W29：状态码 + token → 这一段算什么 =============
+
+    /// 把一个 [`SspiStep`] 压成一个好断言的标签。
+    fn shape(step: &SspiStep) -> &'static str {
+        match step {
+            SspiStep::Token { last: false, .. } => "token(还要继续)",
+            SspiStep::Token { last: true, .. } => "token(最后一段)",
+            SspiStep::Done => "done",
+            SspiStep::Failed(_) => "failed",
+        }
+    }
+
+    #[test]
+    fn a_status_and_a_token_decide_the_step_the_handle_and_the_finished_flag() {
+        // ★ W29。这 35 行原本写在 `imp.rs` 的 `match` 里，也就是
+        // `#[cfg(windows)]` 那块零覆盖的代码中。复审把 `Continue` 与
+        // `Done` 两条 arm 的**函数体整个对调**（语义上是灾难：要继续的
+        // 一段被标成结束），实测 zigbuild 绿、clippy 绿、零告警、macOS
+        // 62 条一行跑不到——三条防线全部双盲。搬到这一层之后：
+        //
+        // 改红：把 `step_from` 里 `Continue` 与 `Done` 两条 arm 的函数体
+        // 对调——第 1、2、4、5 行同时失败（形状、finished 都对不上）。
+        let tok = || Some(Zeroizing::new(b"TOKEN-BYTES".to_vec()));
+        let code = SEC_STATUS_CONTINUE_NEEDED;
+        /// 一行表：说明、输入的两样东西、期望的三样东西。
+        struct Case {
+            why: &'static str,
+            kind: SspiStatusKind,
+            token: Option<Zeroizing<Vec<u8>>>,
+            shape: &'static str,
+            adopt: bool,
+            finished: bool,
+        }
+        let case = |why, kind, token, shape, adopt, finished| Case {
+            why,
+            kind,
+            token,
+            shape,
+            adopt,
+            finished,
+        };
+        let cases = [
+            // 说明, kind, token, 期望形状, 接管句柄, finished
+            case(
+                "还要继续，而且给了 token",
+                SspiStatusKind::Continue,
+                tok(),
+                "token(还要继续)",
+                true,
+                false,
+            ),
+            case(
+                "说还要继续却没给 token：协商推不下去了",
+                SspiStatusKind::Continue,
+                None,
+                "failed",
+                true,
+                true,
+            ),
+            case(
+                "零长输出缓冲等于没给 token",
+                SspiStatusKind::Continue,
+                Some(Zeroizing::new(Vec::new())),
+                "failed",
+                true,
+                true,
+            ),
+            case(
+                "谈完了但还带着最后一段 token——真实 NTLM/Kerberos 走这一支",
+                SspiStatusKind::Done,
+                tok(),
+                "token(最后一段)",
+                true,
+                true,
+            ),
+            case(
+                "谈完了，连最后一段都没有",
+                SspiStatusKind::Done,
+                None,
+                "done",
+                true,
+                true,
+            ),
+            case(
+                "失败：不接管句柄",
+                SspiStatusKind::Failed,
+                None,
+                "failed",
+                false,
+                true,
+            ),
+            case(
+                "失败时哪怕 SSPI 写了一段 token，也不接管句柄",
+                SspiStatusKind::Failed,
+                tok(),
+                "failed",
+                false,
+                true,
+            ),
+        ];
+        assert_eq!(cases.len(), 7);
+        for c in cases {
+            let d = step_from(c.kind, c.token, SspiPackage::Negotiate, code);
+            assert_eq!(shape(&d.step), c.shape, "{}", c.why);
+            assert_eq!(d.adopt_context, c.adopt, "{}", c.why);
+            assert_eq!(d.finished, c.finished, "{}", c.why);
+        }
+    }
+
+    #[test]
+    fn the_failure_texts_name_the_cause_and_never_carry_the_token() {
+        // "要求继续却没给 token" 要带上包名与原始状态码，否则现场只能
+        // 看到一句"协商失败"。
+        //
+        // 改红：把那句 `format!` 换成一个不带 `code` 的固定串。
+        let d = step_from(
+            SspiStatusKind::Continue,
+            None,
+            SspiPackage::Ntlm,
+            SEC_STATUS_CONTINUE_NEEDED,
+        );
+        let SspiStep::Failed(why) = &d.step else {
+            panic!("应当是 Failed：{:?}", d.step);
+        };
+        assert!(why.contains("NTLM"), "{why}");
+        assert!(why.contains("0x00090312"), "{why}");
+
+        // 失败那一支的说明来自 `describe_sspi_status`，不是一句空话。
+        let d = step_from(
+            SspiStatusKind::Failed,
+            Some(Zeroizing::new(b"SECRET-TOKEN".to_vec())),
+            SspiPackage::Negotiate,
+            SEC_STATUS_LOGON_DENIED,
+        );
+        let SspiStep::Failed(why) = &d.step else {
+            panic!("应当是 Failed：{:?}", d.step);
+        };
+        assert_eq!(why, &describe_sspi_status(SEC_STATUS_LOGON_DENIED));
+        // 一正一反：token 的字节绝不能顺着失败文案漏出去。
+        assert!(!why.contains("SECRET"), "{why}");
+        assert!(!format!("{:?}", d.step).contains("SECRET"), "{:?}", d.step);
+    }
+
+    // ================= W31：最后一段 token =================
+
+    #[tokio::test]
+    async fn the_final_leg_is_reported_apart_from_the_middle_ones() {
+        // ★ W31。NTLM 的第二段与 Kerberos 的单段都是**带着要发的 token
+        // 收工**的，于是在改之前，真实 Windows 上绝大多数协商的收尾都落
+        // 在 `TokenIssued` 上，跟"还要再谈一轮"分不开。
+        //
+        // 改红：把 `advance` 里 `neg.concluded = last;` 与那个
+        // `if last { FinalTokenIssued } else { TokenIssued }` 换回无条件
+        // 的 `TokenIssued`——倒数第二条断言失败。
+        let (a, h) = scripted(endpoint(), Ending::FinalOnSecondLeg);
+        a.next_token("Negotiate", None).await.unwrap();
+        assert!(matches!(
+            a.last_outcome(),
+            AuthOutcome::TokenIssued { round: 1, .. }
+        ));
+
+        // 最后一段 token **仍然要发出去**，代理靠它放行。
+        assert_eq!(
+            token_text(a.next_token("Negotiate", Some(CHALLENGE_B64)).await).as_deref(),
+            Some(AUTHENTICATE_B64)
+        );
+        assert_eq!(
+            a.last_outcome(),
+            AuthOutcome::FinalTokenIssued {
+                package: SspiPackage::Negotiate,
+                rounds: 2
+            }
+        );
+        // 仍然"没有结论"：代理接不接受只有 CONNECT 知道。
+        assert_eq!(a.last_outcome().diagnostic().0, None);
+        assert_eq!(h.legs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_asks_again_after_the_final_token_is_refusing_the_user() {
+        // ★ W31 的正题：这是"凭据格式没问题，是代理不接受当前用户"在
+        // 真实 Windows 上的到达路径。改之前它挂在 `AuthOutcome::Completed`
+        // 上，而那一格只有"SSPI 给了 Done 且没有输出 token"才到得了——
+        // NTLM 与 Kerberos 都到不了。现场真正会看到的是一句
+        // `Failed(这个上下文的协商已经结束)` 的内部行话。
+        //
+        // 改红：把 `advance` 里 `if neg.concluded { ... }` 整块删掉——
+        // 这次调用会落到上下文的 `step` 上，结局变成 `Failed`，文案里是
+        // 那句内部行话。
+        let (a, h) = scripted(endpoint(), Ending::FinalOnSecondLeg);
+        a.next_token("Negotiate", None).await.unwrap();
+        a.next_token("Negotiate", Some(CHALLENGE_B64))
+            .await
+            .unwrap();
+
+        // 代理又回了一个 407：它看过凭据了，不接受。
+        assert!(a
+            .next_token("Negotiate", Some(CHALLENGE_B64))
+            .await
+            .is_none());
+        assert_eq!(
+            a.last_outcome(),
+            AuthOutcome::Completed {
+                package: SspiPackage::Negotiate,
+                rounds: 2
+            }
+        );
+        let (ok, text) = a.last_outcome().diagnostic();
+        assert_eq!(ok, Some(false));
+        assert!(text.contains("不接受当前用户"), "{text}");
+        assert!(
+            !text.contains("这个上下文的协商已经结束"),
+            "不能把内部行话推给现场工程师：{text}"
+        );
+        assert_eq!(
+            h.legs().len(),
+            2,
+            "最后一段发完之后不该再去打扰那个已经收工的上下文"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_the_final_token_starts_a_fresh_context() {
+        // 生命周期那三条测试的第四个场景：第一条连接**认证成功**（最后
+        // 一段发完代理就回了 200），几小时后断线重连。`concluded` 这个
+        // 新状态位必须跟着 `Negotiation::default()` 一起被清掉，否则重连
+        // 的首段会撞上"最后一段已发出"那一支，直接报 `Completed`。
+        //
+        // 改红：把 `advance` 里 `if start_new` 那支的
+        // `*neg = Negotiation::default();` 换成只清 `context`
+        // （`neg.context = None; neg.round = 0;`）——重连的首段返回 None，
+        // `unwrap()` 当场 panic。
+        let (a, h) = scripted(endpoint(), Ending::FinalOnSecondLeg);
+        a.next_token("Negotiate", None).await.unwrap();
+        a.next_token("Negotiate", Some(CHALLENGE_B64))
+            .await
+            .unwrap();
+        assert!(matches!(
+            a.last_outcome(),
+            AuthOutcome::FinalTokenIssued { rounds: 2, .. }
+        ));
+
+        assert_eq!(
+            token_text(a.next_token("Negotiate", None).await).as_deref(),
+            Some(NEGOTIATE_B64),
+            "重连必须换一个新上下文"
+        );
+        assert_eq!(h.built().len(), 2);
+        assert_eq!(
+            h.legs().last().unwrap(),
+            &Leg {
+                ctx_id: 1,
+                round: 1,
+                input: None
+            }
+        );
+    }
+
+    // ================= W30：诊断行的每一格 =================
+
+    /// 一个结局的变体名。**故意不写 `_ =>` 兜底**：往 [`AuthOutcome`]
+    /// 加变体时这里会编译不过，逼着新变体也进下面那张表——否则又会出现
+    /// "九个分支只有三个被断言碰过"。
+    fn variant_name(o: &AuthOutcome) -> &'static str {
+        match o {
+            AuthOutcome::NotAttempted => "NotAttempted",
+            AuthOutcome::UnsupportedScheme(_) => "UnsupportedScheme",
+            AuthOutcome::UnknownProxyEndpoint => "UnknownProxyEndpoint",
+            AuthOutcome::MalformedChallenge => "MalformedChallenge",
+            AuthOutcome::ChallengeWithoutNegotiation => "ChallengeWithoutNegotiation",
+            AuthOutcome::ContextUnavailable(_) => "ContextUnavailable",
+            AuthOutcome::TokenIssued { .. } => "TokenIssued",
+            AuthOutcome::FinalTokenIssued { .. } => "FinalTokenIssued",
+            AuthOutcome::Completed { .. } => "Completed",
+            AuthOutcome::Failed { .. } => "Failed",
+        }
+    }
+
+    #[test]
+    fn every_outcome_gives_the_diagnostic_line_its_own_verdict_and_its_own_words() {
+        // ★ W30。改之前十个分支只有三个被断言碰过，**`NotAttempted`
+        // 连身份测试都没有**——而它正是绝大多数没有代理的现场唯一会看到
+        // 的那一行。复审把六个分支的文案全清空、并把 `NotAttempted` 的
+        // 判定从 `None` 翻成 `Some(false)`，62 条全绿；后果是没有代理的
+        // 机器上诊断页报一条硬失败，没有任何闸门会响。
+        //
+        // 改红：
+        // - 把任意一格的文案清空 → 关键词那条断言 +「十句话两两不同」
+        //   那条同时失败；
+        // - 把 `NotAttempted` 翻成 `Some(false)` → 第一格的 `ok` 对不上；
+        // - 把任意一格写成 `Some(true)` → 「永不为 Some(true)」那条失败。
+        let cases: Vec<(AuthOutcome, Option<bool>, &str)> = vec![
+            (AuthOutcome::NotAttempted, None, "代理没有要求认证"),
+            (
+                AuthOutcome::UnsupportedScheme("Basic".into()),
+                Some(false),
+                "代理要求 Basic 认证",
+            ),
+            (
+                AuthOutcome::UnknownProxyEndpoint,
+                Some(false),
+                "无法构造 SPN",
+            ),
+            (AuthOutcome::MalformedChallenge, Some(false), "base64"),
+            (
+                AuthOutcome::ChallengeWithoutNegotiation,
+                Some(false),
+                "协商状态不一致",
+            ),
+            (
+                AuthOutcome::ContextUnavailable(SspiPackage::Negotiate),
+                Some(false),
+                "请确认本机已加入域",
+            ),
+            (
+                AuthOutcome::TokenIssued {
+                    package: SspiPackage::Negotiate,
+                    round: 1,
+                },
+                None,
+                "协商还要继续",
+            ),
+            (
+                AuthOutcome::FinalTokenIssued {
+                    package: SspiPackage::Ntlm,
+                    rounds: 2,
+                },
+                None,
+                "等代理裁决",
+            ),
+            (
+                AuthOutcome::Completed {
+                    package: SspiPackage::Negotiate,
+                    rounds: 3,
+                },
+                Some(false),
+                "代理仍要求认证",
+            ),
+            (
+                AuthOutcome::Failed {
+                    package: SspiPackage::Negotiate,
+                    round: 2,
+                    detail: "域拒绝了这次登录（SEC_E_LOGON_DENIED）".into(),
+                },
+                Some(false),
+                "SEC_E_LOGON_DENIED",
+            ),
+        ];
+
+        // 每个变体都在表里，而且只出现一次。
+        let names: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(o, _, _)| variant_name(o)).collect();
+        assert_eq!(
+            names.len(),
+            cases.len(),
+            "表里有重复的变体，说明有一格没被覆盖到：{names:?}"
+        );
+
+        for (outcome, want_ok, keyword) in &cases {
+            let (ok, text) = outcome.diagnostic();
+            assert_eq!(ok, *want_ok, "{}", variant_name(outcome));
+            assert_ne!(
+                ok,
+                Some(true),
+                "{}：协商器只知道自己发出了什么，「代理接受了」只有拿到 200 的 CONNECT 知道",
+                variant_name(outcome)
+            );
+            assert!(
+                text.contains(keyword),
+                "{} 的诊断行里没有「{keyword}」：{text}",
+                variant_name(outcome)
+            );
+        }
+
+        // 十句话两两不同：两个结局给出同一句话，等于现场工程师看到的还是
+        // 同一条信息。
+        let texts: std::collections::BTreeSet<String> =
+            cases.iter().map(|(o, _, _)| o.diagnostic().1).collect();
+        assert_eq!(texts.len(), cases.len(), "有两个结局给出了同一句话");
+    }
+
+    // ================= W32：scheme 名的长度上限 =================
+
+    #[tokio::test]
+    async fn an_absurdly_long_scheme_never_reaches_the_diagnostic_line_intact() {
+        // ★ W32。`UnsupportedScheme` 收的是代理响应头里未加长度约束的
+        // 字节（`read_response` 按第一个空白切 scheme，整行上限 16KB），
+        // 而它直接进诊断行与 `Debug`。仓库已有规范与现成测试：
+        // `knownhosts::tests::damaged_line_error_message_is_bounded_in_length`
+        // 要求 < 1000 字节。
+        //
+        // 改红：把 `bounded_scheme(scheme)` 换回 `scheme.to_string()`。
+        let junk = "x".repeat(20_000);
+        let a = SspiProxyAuthenticator::new(endpoint(), |_: SspiPackage, _: &str| {
+            panic!("不支持的 scheme 不该创建上下文")
+        });
+        assert!(a.next_token(&junk, None).await.is_none());
+
+        let outcome = a.last_outcome();
+        let text = outcome.diagnostic().1;
+        assert!(text.len() < 1000, "诊断行没有被截断：{} 字节", text.len());
+        assert!(
+            format!("{outcome:?}").len() < 1000,
+            "Debug 没有被截断：{} 字节",
+            format!("{outcome:?}").len()
+        );
+        assert!(text.contains("xxxx"), "至少要保留可读的一部分：{text}");
+    }
+
+    #[tokio::test]
+    async fn control_bytes_in_a_scheme_are_escaped_before_they_reach_a_diagnostic() {
+        // W32 的另一半（同 `knownhosts` 那条 R31 的成对测试）：这是一个
+        // 公开 trait 的实现，调用方传什么进来不由本模块决定。
+        let a = SspiProxyAuthenticator::new(endpoint(), |_: SspiPackage, _: &str| {
+            panic!("不支持的 scheme 不该创建上下文")
+        });
+        assert!(a.next_token("Neg\u{0}otiate", None).await.is_none());
+        let rendered = format!("{:?} {}", a.last_outcome(), a.last_outcome().diagnostic().1);
+        assert!(
+            !rendered.contains('\u{0}'),
+            "NUL 被原样塞进了诊断文案：{rendered:?}"
+        );
+        assert!(
+            rendered.contains("Neg"),
+            "至少要保留可读的一部分：{rendered}"
+        );
+    }
+
+    // ================= W33：SPN 的两处边界 =================
+
+    #[test]
+    fn a_proxy_host_that_is_only_a_dot_yields_no_spn() {
+        // `HostPort::new(".", 8080)` 是**合法**的 `HostPort`——`valid_host`
+        // 放行只由 `.` 组成的串（它不是空的、字符集也允许），而
+        // `spn_for_proxy` 去掉尾点之后拿到的是空主机名。宁可返回 `None`
+        // 让结局记成 `UnknownProxyEndpoint`，也不要拿一个 `HTTP/` 去换
+        // 一个看不懂的 SSPI 错误码。
+        //
+        // 改红：把 `if host.is_empty() { return None; }` 删掉——会拼出
+        // `HTTP/`。
+        let only_a_dot = HostPort::new(".", 8080).expect("这个主机名是合法的——这正是要点");
+        assert_eq!(spn_for_proxy(&only_a_dot), None);
+
+        // 一正一反：尾点是 FQDN 的合法写法，去掉之后还有东西就照常出 SPN。
+        assert_eq!(
+            spn_for_proxy(&HostPort::new("proxy.company.com.", 8080).unwrap()).as_deref(),
+            Some("HTTP/proxy.company.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_without_a_usable_spn_is_reported_as_an_unknown_endpoint() {
+        // 上一条的下游：拼不出 SPN 时，工厂一次都不该被调用。
+        let a = SspiProxyAuthenticator::new(
+            Arc::new(FixedEndpoint(Some(HostPort::new(".", 8080).unwrap())))
+                as Arc<dyn ProxyEndpoint>,
+            |_: SspiPackage, _: &str| panic!("拼不出 SPN 时不该建上下文"),
+        );
+        assert!(a.next_token("Negotiate", None).await.is_none());
+        assert_eq!(a.last_outcome(), AuthOutcome::UnknownProxyEndpoint);
+    }
+
+    #[test]
+    fn an_ip_literal_proxy_still_yields_an_spn() {
+        // 代理配成 IP 字面量时会拼出 `HTTP/10.1.2.3`——对 Kerberos 基本
+        // 没有意义（AD 里几乎不会有人给 IP 注册 SPN）。**这里故意不拦**：
+        // Negotiate 拿不到票会自己回落 NTLM，而 NTLM 根本不看 SPN；拦掉
+        // 等于把一台本来能用 NTLM 连上的机器变成连不上。Kerberos 那一段
+        // 失败时诊断页会如实显示 SEC_E_TARGET_UNKNOWN。
+        //
+        // 这条测试钉的是"行为是这样，而且是想清楚之后这样的"，不是
+        // "这样最好"。
+        assert_eq!(
+            spn_for_proxy(&"10.1.2.3:8080".parse().unwrap()).as_deref(),
+            Some("HTTP/10.1.2.3")
+        );
+    }
+
+    // ================= W33：Debug 不许碰长持有的那把锁 =================
+
+    #[tokio::test]
+    async fn the_debug_rendering_does_not_wait_for_a_negotiation_in_flight() {
+        // 拆成 `negotiation` / `outcome` 两把锁的全部理由就是"诊断页读
+        // 结局时不该被一次正在进行的协商挡住"——首段 Negotiate 可能真的
+        // 去联系域控，那把锁会被 `spawn_blocking` 长时间持有。
+        // `last_outcome()` 守住了，`Debug` 原来又把口子开回来了，而
+        // `Debug` 恰恰是最容易被顺手写进日志的那一个。
+        //
+        // 改红：把 `impl Debug` 里的 `.field("in_flight",
+        // &lock(&self.inner.negotiation).context.is_some())` 加回来——
+        // 这次渲染会被在途协商挡满 600ms，`timeout` 先到。
+        let a = Arc::new(SspiProxyAuthenticator::new(
+            endpoint(),
+            |_: SspiPackage, _: &str| {
+                Some(Box::new(SlowContext(Duration::from_millis(600))) as Box<dyn SspiContext>)
+            },
+        ));
+        let running = Arc::clone(&a);
+        let handle = tokio::spawn(async move { running.next_token("Negotiate", None).await });
+        // 等协商真的进到 `spawn_blocking` 里、把 `negotiation` 锁拿住。
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let rendering = Arc::clone(&a);
+        let rendered = tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::task::spawn_blocking(move || format!("{rendering:?}")),
+        )
+        .await
+        .expect("诊断页读结局不该等一次正在进行的协商")
+        .unwrap();
+        assert!(rendered.contains("outcome"), "{rendered}");
+
+        let _ = handle.await;
     }
 }

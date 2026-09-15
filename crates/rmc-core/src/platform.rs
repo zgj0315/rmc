@@ -8,6 +8,7 @@
 use crate::addr::HostPort;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
+use zeroize::Zeroizing;
 
 /// 可读可写的字节流：TCP、经 HTTP CONNECT 打通的隧道、裹了 TLS 之后的
 /// 流，都实现这个 trait。任何同时满足 `AsyncRead + AsyncWrite + Send +
@@ -34,9 +35,23 @@ pub trait ProxyResolver: Send + Sync {
 /// 前缀，`http_connect` 会自己拼上）。返回 `None` 表示协商到此为止、
 /// 无法再往前推进——Negotiate/NTLM 的多轮协商由平台层的 SSPI 驱动，
 /// rmc-core 只负责把 challenge 转交、把结果的 token 塞进下一次请求。
+///
+/// # 返回值为什么是 [`Zeroizing<String>`]（W36）
+///
+/// 这一段 base64 看着人畜无害，装的却是域凭据的派生物：NTLM Type-3
+/// 消息里是 NT/LM response（离线爆破 NTLMv2 response 是成熟手法），
+/// Kerberos AP-REQ 里是用会话密钥加密的 authenticator。它确实不进日志
+/// 也不进错误（`send_request` 不打日志，`Error::ProxyAuthFailed` 只带
+/// scheme），但普通 `String` 在 drop 时不抹零，这段字节会以残影的形式
+/// 留在堆上直到被下一次分配覆盖——诊断包导出（Task 9）里一旦有人加进
+/// 程内存快照，那就是现成的凭据派生物。
+///
+/// 同一条纪律见 `http_connect`：它把 token 拼进去的
+/// `Proxy-Authorization` 头与整个请求缓冲也都是 `Zeroizing<String>`，
+/// 只改这里的签名是堵不住的。
 #[async_trait::async_trait]
 pub trait ProxyAuthenticator: Send + Sync {
-    async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<String>;
+    async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>>;
 }
 
 /// 系统事件。收到后 Supervisor（Task 10）清零退避计时并立即重连——
@@ -69,7 +84,11 @@ pub struct NoProxyAuth;
 
 #[async_trait::async_trait]
 impl ProxyAuthenticator for NoProxyAuth {
-    async fn next_token(&self, _scheme: &str, _challenge: Option<&str>) -> Option<String> {
+    async fn next_token(
+        &self,
+        _scheme: &str,
+        _challenge: Option<&str>,
+    ) -> Option<Zeroizing<String>> {
         None
     }
 }

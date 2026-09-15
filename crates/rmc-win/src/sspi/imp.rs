@@ -11,7 +11,7 @@
 //! task-3-report.md）。
 #![allow(unsafe_code)]
 
-use super::{SspiContext, SspiPackage, SspiStatusKind, SspiStep};
+use super::{SspiContext, SspiPackage, SspiStep};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     SEC_E_INVALID_TOKEN, SEC_E_LOGON_DENIED, SEC_E_NO_AUTHENTICATING_AUTHORITY,
@@ -157,6 +157,48 @@ unsafe fn take_token(out: &mut SecBuffer) -> Option<Zeroizing<Vec<u8>>> {
     Some(token)
 }
 
+/// 用一段输入字节搭出 `SecBufferDesc`，在**这个函数自己的栈帧上**，
+/// 然后把指向它的指针交给 `f`。
+///
+/// # 这个形状是干什么用的（W34）
+///
+/// 计划原文把 `SecBuffer` 建在 `match` 的分支块里、让 `SecBufferDesc`
+/// 记下它的地址，分支块一结束 `pBuffers` 就悬垂了——
+/// `InitializeSecurityContextW` 调用时读的是一段已经还给栈的内存。
+/// 那是本计划至今最严重的一处缺陷，而**三条自动化防线对它全部双盲**：
+/// 借用检查器看不见（`pBuffers` 是 `*mut SecBuffer`，`&mut buf` 在结构
+/// 体字段初始化的位置隐式强转，借用当场就结束了）；
+/// `cargo zigbuild --tests` 绿、零告警；`clippy -- -D warnings` 绿、
+/// 零告警；macOS 上整块 `#[cfg(windows)]` 被切掉，62 条测试一行都跑
+/// 不到。复审在仓库外的副本里忠实还原过原写法，逐条实测确认。
+///
+/// 第一版的修法是"把缓冲放到与调用同一个作用域"，对是对的，但**防复发
+/// 只有一条注释**——类型上没有任何东西挡住后人再把它挪回块里。改成闭包
+/// 之后，那对自引用的结构体被关进一个必然比 `f(...)` 长寿的栈帧，调用
+/// 方连"建在块里"这个形状都写不出来。
+///
+/// 另一条语义一并被类型吃掉了：**首段没有输入就必须传 NULL，不能传一个
+/// "长度为 0 的缓冲"**。这里用"`bytes` 空 ⇒ 交 `None`"表达——零长输入
+/// 缓冲对 SSPI 从来就不是一个合法输入，于是它也变成了写不出来的形状。
+fn with_input_desc<R>(bytes: &mut [u8], f: impl FnOnce(Option<*const SecBufferDesc>) -> R) -> R {
+    if bytes.is_empty() {
+        return f(None);
+    }
+    let mut buf = SecBuffer {
+        cbBuffer: bytes.len() as u32,
+        BufferType: SECBUFFER_TOKEN,
+        pvBuffer: bytes.as_mut_ptr().cast(),
+    };
+    let desc = SecBufferDesc {
+        ulVersion: SECBUFFER_VERSION,
+        cBuffers: 1,
+        pBuffers: &mut buf,
+    };
+    // `buf` 与 `desc` 都是本函数的局部变量，它们的存储活到本函数返回
+    // 为止——也就是必然覆盖下面这次 `f` 调用。
+    f(Some(&desc as *const SecBufferDesc))
+}
+
 impl SspiContext for NegotiateContext {
     fn step(&mut self, input: Option<&[u8]>) -> SspiStep {
         if self.finished {
@@ -178,51 +220,39 @@ impl SspiContext for NegotiateContext {
             pBuffers: &mut out_buf,
         };
 
-        // 输入缓冲。**这段字节必须活到 Win32 调用返回为止**：计划原文
-        // 把 `SecBuffer` 建在 `match` 的分支块里、让 `SecBufferDesc`
-        // 记下它的地址，分支块一结束 `pBuffers` 就悬垂了——借用检查器
-        // 看不见（`pBuffers` 是裸指针字段），只在 Windows 上才会现形的
-        // use-after-free。这里把它放在与调用同一个作用域。
+        // 输入缓冲。首段没有输入 → 空切片 → `with_input_desc` 交 NULL。
+        // 那个 helper 的文档解释了为什么这里必须是闭包形状（W34）。
         let mut in_bytes = Zeroizing::new(input.unwrap_or_default().to_vec());
-        let mut in_buf = SecBuffer {
-            cbBuffer: in_bytes.len() as u32,
-            BufferType: SECBUFFER_TOKEN,
-            pvBuffer: in_bytes.as_mut_ptr().cast(),
-        };
-        let in_desc = SecBufferDesc {
-            ulVersion: SECBUFFER_VERSION,
-            cBuffers: 1,
-            pBuffers: &mut in_buf,
-        };
-        // 首段没有输入就必须传 NULL，不能传一个"长度为 0 的缓冲"。
-        let pinput = input.map(|_| &in_desc as *const SecBufferDesc);
 
         let mut new_ctx = SecHandle::default();
         let mut attrs = 0u32;
         let mut expiry = 0i64;
-        // SAFETY: `cred` 是 `new` 里拿到、本对象持有到 `Drop` 的有效
-        // 凭据句柄；`self.ctx` 要么是上一段协商产出的有效上下文句柄，
-        // 要么是 `None`（首段）；`self.target` 是以 0 结尾的宽字符串，
-        // 活得比这次调用长；`pinput` 指向 `in_desc`，而 `in_desc` 与它
-        // 指向的 `in_buf`、`in_bytes` 都在本函数栈上、生命周期覆盖这次
-        // 调用；`out_desc`/`new_ctx`/`attrs`/`expiry` 都是本次调用独占的
-        // 栈上可变引用。
-        let status = unsafe {
-            InitializeSecurityContextW(
-                Some(&self.cred),
-                self.ctx.as_ref().map(|c| c as *const SecHandle),
-                Some(self.target.as_ptr()),
-                REQ_FLAGS,
-                0,
-                SECURITY_NATIVE_DREP,
-                pinput,
-                0,
-                Some(&mut new_ctx),
-                Some(&mut out_desc),
-                &mut attrs,
-                Some(&mut expiry),
-            )
-        };
+        let status = with_input_desc(&mut in_bytes, |pinput| {
+            // SAFETY: `cred` 是 `new` 里拿到、本对象持有到 `Drop` 的有效
+            // 凭据句柄；`self.ctx` 要么是上一段协商产出的有效上下文句柄，
+            // 要么是 `None`（首段）；`self.target` 是以 0 结尾的宽字符串，
+            // 活得比这次调用长；`pinput` 要么是 NULL，要么指向
+            // `with_input_desc` 栈帧上的 `SecBufferDesc`——那个栈帧覆盖
+            // 整个闭包调用，而它指向的 `in_bytes` 是本函数的局部变量；
+            // `out_desc`/`new_ctx`/`attrs`/`expiry` 都是本次调用独占的
+            // 栈上可变引用。
+            unsafe {
+                InitializeSecurityContextW(
+                    Some(&self.cred),
+                    self.ctx.as_ref().map(|c| c as *const SecHandle),
+                    Some(self.target.as_ptr()),
+                    REQ_FLAGS,
+                    0,
+                    SECURITY_NATIVE_DREP,
+                    pinput,
+                    0,
+                    Some(&mut new_ctx),
+                    Some(&mut out_desc),
+                    &mut attrs,
+                    Some(&mut expiry),
+                )
+            }
+        });
 
         // 少数包（Digest 之类）会要求补一次 `CompleteAuthToken` 才算把
         // token 做完。必须在归还输出缓冲**之前**做。
@@ -243,41 +273,23 @@ impl SspiContext for NegotiateContext {
         // `ISC_REQ_ALLOCATE_MEMORY` 分配出来的缓冲。
         let token = unsafe { take_token(&mut out_buf) };
 
-        match super::classify_sspi_status(status.0) {
-            SspiStatusKind::Continue => {
-                self.ctx = Some(new_ctx);
-                match token {
-                    Some(t) if !t.is_empty() => SspiStep::Token(t),
-                    // "还要继续"却没给 token，协商推不下去了。
-                    _ => {
-                        self.finished = true;
-                        SspiStep::Failed(format!(
-                            "{} 要求继续协商却没有给出 token，状态码 0x{:08X}",
-                            self.package.package_name(),
-                            status.0 as u32
-                        ))
-                    }
-                }
-            }
-            SspiStatusKind::Done => {
-                self.ctx = Some(new_ctx);
-                self.finished = true;
-                match token {
-                    // 最后一段 token 仍然要发出去，代理靠它放行。
-                    Some(t) if !t.is_empty() => SspiStep::Token(t),
-                    // 没有 token 可发了：协商到此为止。
-                    _ => SspiStep::Done,
-                }
-            }
-            SspiStatusKind::Failed => {
-                // 失败时**不**接管 `new_ctx`：`InitializeSecurityContext`
-                // 失败之后这个句柄的有效性没有文档保证，对一个未必有效的
-                // 句柄调用 `DeleteSecurityContext` 比可能漏掉一次清理更
-                // 危险；而且这条路径上这次协商已经结束，不会反复发生。
-                self.finished = true;
-                SspiStep::Failed(super::describe_sspi_status(status.0))
-            }
+        // 状态码 + 输出 token → 这一段算什么、句柄接不接管、上下文到没
+        // 到头。**判断本身一行都不留在这里**（W29）：全在
+        // `super::step_from` 那个纯函数里，在 macOS 上有表驱动测试守着。
+        // 这 35 行原本就在这个 `match` 里，而复审实测过：把 `Continue`
+        // 与 `Done` 两条 arm 的函数体对调，zigbuild、clippy、62 条测试
+        // 全绿、零告警。
+        let decision = super::step_from(
+            super::classify_sspi_status(status.0),
+            token,
+            self.package,
+            status.0,
+        );
+        if decision.adopt_context {
+            self.ctx = Some(new_ctx);
         }
+        self.finished = decision.finished;
+        decision.step
     }
 }
 

@@ -7,6 +7,7 @@ use rmc_core::transport::connect::http_connect;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use zeroize::Zeroizing;
 
 /// 起一个假代理，按 `replies` 顺序逐轮应答，收集收到的请求头。
 async fn fake_proxy(replies: Vec<&'static str>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
@@ -102,13 +103,13 @@ struct TwoLegNegotiate {
 
 #[async_trait::async_trait]
 impl ProxyAuthenticator for TwoLegNegotiate {
-    async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<String> {
+    async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>> {
         assert_eq!(scheme, "Negotiate");
         let mut seen = self.seen_challenges.lock().unwrap();
         seen.push(challenge.map(str::to_string));
         match seen.len() {
-            1 => Some("TlRMTVNTUAAB".into()),
-            2 => Some("TlRMTVNTUAAD".into()),
+            1 => Some(Zeroizing::new("TlRMTVNTUAAB".into())),
+            2 => Some(Zeroizing::new("TlRMTVNTUAAD".into())),
             _ => None,
         }
     }
@@ -164,12 +165,12 @@ struct RecordsChallenge {
 
 #[async_trait::async_trait]
 impl ProxyAuthenticator for RecordsChallenge {
-    async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<String> {
+    async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>> {
         assert_eq!(scheme, "Negotiate");
         if let Some(c) = challenge {
             *self.seen.lock().unwrap() = Some(c.to_string());
         }
-        Some("TlRMTVNTUAAD".into())
+        Some(Zeroizing::new("TlRMTVNTUAAD".into()))
     }
 }
 
@@ -203,7 +204,7 @@ async fn gives_up_when_authenticator_returns_none() {
     struct Refuses;
     #[async_trait::async_trait]
     impl ProxyAuthenticator for Refuses {
-        async fn next_token(&self, _: &str, _: Option<&str>) -> Option<String> {
+        async fn next_token(&self, _: &str, _: Option<&str>) -> Option<Zeroizing<String>> {
             None
         }
     }
@@ -240,8 +241,8 @@ async fn stops_after_five_rounds() {
     struct Endless;
     #[async_trait::async_trait]
     impl ProxyAuthenticator for Endless {
-        async fn next_token(&self, _: &str, _: Option<&str>) -> Option<String> {
-            Some("AAAA".into())
+        async fn next_token(&self, _: &str, _: Option<&str>) -> Option<Zeroizing<String>> {
+            Some(Zeroizing::new("AAAA".into()))
         }
     }
     let (port, srv) = fake_proxy(replies).await;
@@ -256,6 +257,102 @@ async fn stops_after_five_rounds() {
         5,
         "假代理实际看到的轮数应恰好等于上限 5；如果这个数字对不上，\
          要么上限被悄悄改动了，要么根本没有生效"
+    );
+}
+
+/// 记下协商器被问到的 scheme，永远给同一个 token。
+struct RecordsScheme {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ProxyAuthenticator for RecordsScheme {
+    async fn next_token(&self, scheme: &str, _: Option<&str>) -> Option<Zeroizing<String>> {
+        self.seen.lock().unwrap().push(scheme.to_string());
+        Some(Zeroizing::new("TlRMTVNTUAAB".into()))
+    }
+}
+
+/// ★ W35。企业代理同时通告 Basic / NTLM / Negotiate 是常态，而且很可能
+/// 把 Basic 排在最前面（顺序不由我们控制）。只取第一条
+/// `Proxy-Authenticate` 会把整个 SSPI 能力旁路掉：协商器被问的是
+/// `Basic`，它只能返回 None，`http_connect` 报 ProxyAuthFailed——而这台
+/// 机器明明能做 Negotiate。
+///
+/// 会让这条测试变红的改法：`read_response` 里恢复 `auth_scheme.is_none()`
+/// 那道"只收第一条"的守卫，或者把 `select_challenge` 换成
+/// `challenges.first()`——协商器会被问 `Basic`。
+#[tokio::test]
+async fn negotiate_is_picked_even_when_the_proxy_lists_basic_first() {
+    let (port, srv) = fake_proxy(vec![
+        "HTTP/1.1 407 Proxy Authentication Required\r\n\
+         Proxy-Authenticate: Basic realm=\"corp\"\r\n\
+         Proxy-Authenticate: NTLM\r\n\
+         Proxy-Authenticate: Negotiate\r\n\r\n",
+        "HTTP/1.1 200 Connection established\r\n\r\n",
+    ])
+    .await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth = RecordsScheme { seen: seen.clone() };
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    http_connect(&mut s, &target(), &auth).await.unwrap();
+
+    assert_eq!(seen.lock().unwrap().clone(), vec!["Negotiate".to_string()]);
+    let sent = srv.await.unwrap();
+    assert!(
+        sent[1].contains("Proxy-Authorization: Negotiate TlRMTVNTUAAB"),
+        "{}",
+        sent[1]
+    );
+}
+
+/// 同一件事的另一种写法：三个 scheme 挤在一行里用逗号分隔。
+#[tokio::test]
+async fn negotiate_is_picked_out_of_one_comma_separated_header_line() {
+    let (port, _srv) = fake_proxy(vec![
+        "HTTP/1.1 407 Proxy Authentication Required\r\n\
+         Proxy-Authenticate: Basic realm=\"corp\", NTLM, Negotiate\r\n\r\n",
+        "HTTP/1.1 200 Connection established\r\n\r\n",
+    ])
+    .await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth = RecordsScheme { seen: seen.clone() };
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    http_connect(&mut s, &target(), &auth).await.unwrap();
+    assert_eq!(seen.lock().unwrap().clone(), vec!["Negotiate".to_string()]);
+}
+
+/// 代理回 407 却一个 `Proxy-Authenticate` 都没给。
+///
+/// 旧实现在这里 `unwrap_or_else(|| "Basic".into())`，于是错误文案与诊断
+/// 页会说"代理要求 Basic 认证"——代理从没说过这句话，现场工程师会照着
+/// 去查一个不存在的 Basic 配置。
+///
+/// 会让这条测试变红的改法：把那句 `unwrap_or_else(|| "Basic")` 加回来
+/// ——协商器会被叫醒（`seen` 不再为空），错误文案里会出现 "Basic"。
+#[tokio::test]
+async fn a_407_without_any_scheme_is_not_reported_as_basic() {
+    let (port, _srv) = fake_proxy(vec![
+        "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Agent: corp\r\n\r\n",
+    ])
+    .await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth = RecordsScheme { seen: seen.clone() };
+
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let err = http_connect(&mut s, &target(), &auth).await.unwrap_err();
+    assert!(matches!(err, Error::ProxyAuthFailed(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        !text.contains("Basic"),
+        "不能编一个代理没说过的 scheme：{text}"
+    );
+    assert!(text.contains("Proxy-Authenticate"), "{text}");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "没有 scheme 时不该去叫醒协商器"
     );
 }
 
