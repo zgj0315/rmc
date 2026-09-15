@@ -220,11 +220,15 @@ fn with_input_desc<R>(bytes: &mut [u8], f: impl FnOnce(Option<*const SecBufferDe
 ///
 /// 顺带把两条顺序约束也变成结构性的：
 ///
-/// 1. **归还一定发生**——不论 `f` 走的是成功路径还是失败路径，
+/// 1. **归还一定发生**——不论 `f` 返回的是成功还是失败状态码，
 ///    `take_token` 都在 `f` 返回之后执行。`ISC_REQ_ALLOCATE_MEMORY`
 ///    下缓冲是 SSPI 分配的，必须 `FreeContextBuffer`，而**失败路径上
 ///    SSPI 也可能已经写进了一段**（例如要发给服务端的错误 token），
 ///    所以"失败就直接 return"是漏。
+///
+///    唯一的例外是 `f` 内部 panic 展开：那时 `take_token` 不执行，
+///    缓冲既不抹零也不归还。`f` 里眼下唯一可能 panic 的是
+///    `tracing::warn!`，实际到不了；真要说死得套一个 drop guard。
 /// 2. **`CompleteAuthToken` 一定排在归还之前**——它要读的就是这块还
 ///    没还回去的缓冲，所以它只能写在 `f` 内部。
 ///

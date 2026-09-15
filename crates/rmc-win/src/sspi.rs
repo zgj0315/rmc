@@ -597,6 +597,10 @@ macro_rules! declare_auth_outcome {
     };
 }
 
+// 下面这就是一个普通的 `pub enum`——包在宏里只为让编译器数得出变体
+// 个数（`std::mem::variant_count` 至今仍是 unstable），于是"诊断表漏了
+// 一格"从一条会绿的测试变成一个编译错误。展开后的真实声明用
+// `cargo expand -p rmc-win sspi` 看。
 declare_auth_outcome! {
     /// 一次（或一段）协商的结局。
     ///
@@ -1608,6 +1612,48 @@ mod tests {
         assert_eq!(
             a.last_outcome(),
             AuthOutcome::ContextUnavailable(SspiPackage::Negotiate)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_factory_that_failed_is_not_called_again_within_the_same_connection() {
+        // ★ 「一次连接尝试最多建一个安全上下文」这条约束的另一半：工厂
+        // **失败**之后，同一条连接里不许再调一次工厂。域机器上每调一次
+        // 都是一次 `AcquireCredentialsHandleW`，机器不在域里时那是一次
+        // 注定失败、却可能真的去找域控的往返。
+        //
+        // 载体是 `advance` 里 `neg.started = true;` 的**位置**：它排在
+        // 调用工厂**之前**，所以「工厂失败之后在同一条连接里再试一次」
+        // 连写都写不出来。清零只发生在 `Inner::begin_connection`，也就
+        // 是只发生在连接边界上。
+        //
+        // 改红（P3）：把 `neg.started = true;` 从工厂调用之前挪到工厂
+        // 成功之后（`Some(ctx) => { neg.context = Some(ctx); neg.started
+        // = true; }`）——第二次调用会再进一次那一支，工厂被调两次。
+        //
+        // 这条约束此前只靠**调用方的行为**成立（`http_connect` 拿到
+        // `None` 就立刻报 `ProxyAuthFailed` 退出，同一条连接里不存在
+        // 「工厂失败之后的下一次调用」），协商器这边没有回归保护。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let a = SspiProxyAuthenticator::new(endpoint(), move |_: SspiPackage, _: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+
+        a.begin_connection().await;
+        assert!(a.next_token("Negotiate", None).await.is_none());
+        assert_eq!(
+            a.last_outcome(),
+            AuthOutcome::ContextUnavailable(SspiPackage::Negotiate)
+        );
+
+        // 同一条连接里代理又要了一次：不许再去建第二个上下文。
+        assert!(a.next_token("Negotiate", None).await.is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "同一条连接尝试里工厂只该被调用一次"
         );
     }
 
