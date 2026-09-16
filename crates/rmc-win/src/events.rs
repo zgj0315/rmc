@@ -21,12 +21,20 @@
 //!
 //! - **纯逻辑**（不带 `#[cfg(windows)]`，macOS 上原生可测）：
 //!   [`EventHub`]、[`Debouncer`]、[`ConnectivityWatcher`]、
-//!   [`is_resume_event`]、[`debounce_ms`]。「窗口内第二次事件该不该
-//!   发」「一次连通性读数算不算变化」「哪个 `PBT_*` 码才算唤醒」这三
-//!   条判断**全部**在这一层，下面的测试模块就是在这台机器上跑的。
+//!   [`PowerGate`]、[`PowerCallbackState`]、[`install`]、
+//!   [`register_once`]、[`is_resume_event`]、[`debounce_ms`]。
+//!   「窗口内第二次事件该不该发」「一次连通性读数算不算变化」「哪个
+//!   `PBT_*` 码才算唤醒」「注册与占格子谁先谁后」这四条判断**全部**在
+//!   这一层，下面的测试模块就是在这台机器上跑的。
 //! - **Win32**：只有 `win` 子模块整块 `#[cfg(windows)]`，职责只到
-//!   「注册通知 / 轮询读数 / 把结果转成普通 Rust 值再交给上面那三条
+//!   「注册通知 / 轮询读数 / 把结果转成普通 Rust 值再交给上面那几条
 //!   判断」为止，自己不做任何判断。
+//!
+//! 修复轮 1 的 W84 是这个约定在**本模块内部**的第二次栽跟头：上一轮
+//! 网络那一路做对了（[`ConnectivityWatcher::observe`]），电源那一路的
+//! 同构判断（`is_resume_event(..) && debounce.allow_at(..)`）却整个留在
+//! `win` 的回调体里，六道闸门对它的两个反向变异一个字都没说。现在它是
+//! [`PowerGate::on_event`]。
 //!
 //! # 时刻是参数，不是 `Instant::now()`（W74）
 //!
@@ -67,6 +75,34 @@ pub fn debounce_ms() -> u64 {
 /// W83 的说明和实际数值待在一起，不会一个改了另一个没改。
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// [`EventHub`] 内部 `broadcast` 通道的容量（W88）。
+///
+/// 抽成常量的理由跟 [`POLL_INTERVAL`] 一样：让「这个数是多少」可以被
+/// 测试钉住。上一轮这个 16 是写死在 `broadcast::channel(16)` 里的字面
+/// 量，改成 1 六道闸门全绿。
+///
+/// **改小的后果不是丢一条事件，而是一次静默的降级**：`broadcast` 在
+/// 接收端落后于发送端时返回 `RecvError::Lagged`，而 Supervisor 那边
+/// （`supervisor.rs` 的 `Ok(event) = sys.recv()`）把 `Err` 整支丢掉、
+/// 一个字都不记（W94，与 W82 同一笔账，Task 10 一起处理）。也就是说
+/// 容量不够时，现场表现是「唤醒之后偶尔不重连」，而日志里什么都没有。
+///
+/// 16 的来历：同时在飞的事件最多是「唤醒 + 网络变化」两条，16 是给
+/// 「订阅者被别的任务挡住一会儿」留的余量，不是一个精算出来的数。
+pub const EVENT_CHANNEL_CAPACITY: usize = 16;
+
+// 区间守在编译期而不是写成一条 `#[test]`（同 Task 4 `MAX_SCHEME_CHARS`
+// 的先例：钉的是「有界且不小」这条性质，具体数值是可调产品参数）。
+//
+// 写成 `assert!(EVENT_CHANNEL_CAPACITY >= 8)` 放进测试模块是行不通的，
+// 实测被 clippy 的 `assertions_on_constants` 拦下：条件整个可以常量折叠，
+// 那条断言会被编译器优化掉，是一条**假的**测试。换成 `const _: () =`
+// 之后语义更强——数被改小连编译都过不去，闸门 1 就是红的。
+const _: () = assert!(
+    EVENT_CHANNEL_CAPACITY >= 8,
+    "容量被改小的表现是 Lagged，而 Supervisor 那边对 Err 零日志（W94）"
+);
+
 // =====================================================================
 // 事件总线
 // =====================================================================
@@ -81,7 +117,7 @@ pub struct EventHub {
 impl EventHub {
     pub fn new() -> Self {
         Self {
-            tx: broadcast::channel(16).0,
+            tx: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
         }
     }
 
@@ -293,6 +329,160 @@ pub fn is_resume_event(event_type: u32) -> bool {
     event_type == PBT_RESUME_AUTOMATIC
 }
 
+/// 把「这个码算不算唤醒 + 防抖放不放行」两件事合在一起，让电源回调
+/// 退化成「问一句 → 要么发要么不发」。
+///
+/// # 为什么它必须在这一层（W84）
+///
+/// 上一轮网络那一路做对了（[`ConnectivityWatcher::observe`]），电源这
+/// 一路的同构判断却整个留在了 `#[cfg(windows)] mod win` 的回调体里，
+/// 于是它在这台 macOS 上一行都编译不到。评审两枪实测、六道闸门全绿：
+///
+/// - 把 `if !is_resume_event(..)` 的 `!` 去掉——**真唤醒（18）时什么都
+///   不发，而「即将休眠」（4）和 `PBT_POWERSETTINGCHANGE`（32787）反而
+///   各发一条 `ResumedFromSleep`**，正好是本任务需求的反面；
+/// - 把防抖门的结果丢掉改成 `if true`——窗口内连发。
+///
+/// 这是 `lib.rs` 模块文档点名禁止的那件事在这个 crate 里的**第四次**，
+/// 也是本模块内部的第二次。现在它跟 `observe` 是同一个形状。
+pub struct PowerGate {
+    debounce: Debouncer,
+}
+
+impl PowerGate {
+    /// 用 [`debounce_ms`] 的窗口。
+    pub fn new() -> Self {
+        Self {
+            debounce: Debouncer::new(),
+        }
+    }
+
+    /// 自定义窗口，测试用。
+    pub fn with_window(window: Duration) -> Self {
+        Self {
+            debounce: Debouncer::with_window(window),
+        }
+    }
+
+    /// 收到一个 `PBT_*` 码，回答「该不该发 `ResumedFromSleep`」。
+    ///
+    /// 两个门是**串联**的，而且顺序跟 [`ConnectivityWatcher::observe`]
+    /// 里一样有意义：先问算不算唤醒，算了才去问防抖。反过来的话，
+    /// 「即将休眠」「电源方案变了」这些跟唤醒无关的码会一路刷新防抖
+    /// 时间戳——合盖前系统会连发好几条 `PBT_*`，紧接着的那次真唤醒就
+    /// 被自己挡掉了。
+    ///
+    /// `now` 是参数不是 `Instant::now()`，理由见模块文档的 W74 一节。
+    /// 整个函数体是 panic-free 的，这是它被 `extern "system"` 回调调用
+    /// 的前提条件（见 `win::on_power_event` 的 W75 一段）。
+    pub fn on_event(&self, event_type: u32, now: Instant) -> bool {
+        is_resume_event(event_type) && self.debounce.allow_at(now)
+    }
+}
+
+impl Default for PowerGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =====================================================================
+// 电源回调的进程级状态（纯逻辑，W85/W86）
+// =====================================================================
+
+/// 电源回调要用的两样东西**合成一个**（W76）。
+///
+/// 原先是 `HUB` 与 `DEBOUNCE` 两个独立的 `OnceLock`，回调里写
+/// `if let (Some(hub), Some(d)) = (HUB.get(), DEBOUNCE.get())` 去兜
+/// 「一个设了另一个没设」这种半截状态。合成一个之后那种状态在类型上
+/// 就不可表达了，回调里也只剩一次 `get()`。
+///
+/// 它住在纯逻辑层而不是 `win` 里（W85）：两个字段都是纯类型，
+/// [`install`] 又把格子本身**当参数收**——这正是 W74 对 `Instant` 用过
+/// 的同一招。上一轮的取舍是「`OnceLock` 是进程级 static，为它造抽象是
+/// 过度设计」，代价是 W76 那条修复零覆盖，而评审实测把 `.is_err()` 改成
+/// `.is_ok()`（语义翻成「第一次注册跳过、第二次才注册」，休眠恢复整个
+/// 不工作）六道闸门全绿。
+pub struct PowerCallbackState {
+    hub: std::sync::Arc<EventHub>,
+    gate: PowerGate,
+}
+
+impl PowerCallbackState {
+    /// 回调唯一要做的事：问一句闸，放行就发。
+    ///
+    /// 放在这里而不是让调用方写 `if state.gate.on_event(..) {
+    /// state.hub.emit(..) }`，是因为两个字段都是私有的；顺带让
+    /// `win` 那边的回调体里一条判断都不剩。
+    ///
+    /// 返回值只给测试看，产品代码忽略它。
+    pub fn on_power_event(&self, event_type: u32, now: Instant) -> bool {
+        let allow = self.gate.on_event(event_type, now);
+        if allow {
+            self.hub.emit(SystemEvent::ResumedFromSleep);
+        }
+        allow
+    }
+}
+
+/// 把回调要用的状态装进格子，返回「本次是不是真的装进去了」。
+///
+/// `false` 表示格子已经被占住——此前已经注册过一次，第二个 `hub` 在
+/// 这里被丢弃，事件仍然发往首次注册的那个总线。调用方必须**看**这个
+/// 返回值并记一条日志：静默丢弃的后果是界面上「唤醒后没反应」而日志
+/// 里一个字都没有。
+///
+/// 格子当参数传，所以测试可以 `new` 一个本地 `OnceLock` 真跑两遍，
+/// 不需要任何 mock，也不需要在 macOS 上编译 Win32。
+pub fn install(
+    cell: &std::sync::OnceLock<PowerCallbackState>,
+    hub: std::sync::Arc<EventHub>,
+) -> bool {
+    cell.set(PowerCallbackState {
+        hub,
+        gate: PowerGate::new(),
+    })
+    .is_ok()
+}
+
+/// 「还没注册过就注册一次，注册成功了才占格子」——把这个**顺序**也放进
+/// 纯逻辑层（W86）。
+///
+/// 返回 `Ok(true)` 表示本次真的注册并装好了，`Ok(false)` 表示此前已经
+/// 注册过、`register` 一次都没被调用，`Err` 表示注册失败——**失败时格子
+/// 保持空**，所以将来任何一条重试路径还能再试一次。
+///
+/// # 为什么这个顺序值得单独抽出来
+///
+/// 上一轮的写法是先 `POWER.set(..)` 再做 Win32 注册，于是 `.ok()?` 提前
+/// 返回时格子**已经被占住**：将来的重试会在「已经注册过吗」那一步直接
+/// 跳过并返回 `Ok(())`——休眠恢复功能永久关闭，而调用方拿到的是成功。
+/// 这正好是 W76 想堵的那个形状的镜像，也正好是 `lib.rs` 模块文档禁止的
+/// 那件事（把一条判断关进 `#[cfg(windows)]`）的又一次：写在 `win` 里的
+/// 顺序，在这台机器上一行都测不到。
+///
+/// `register` 当参数收进来（同 W74 对 `Instant`、W85 对格子的那一招），
+/// 测试于是可以喂一个「第一次失败、第二次成功」的闭包，在 macOS 上真跑
+/// 完整的重试序列，不需要任何 Win32。
+///
+/// # 一个明知的、小的代价
+///
+/// 注册已经生效、格子还空着，中间有几微秒。此刻真有一次唤醒打进来的
+/// 话，回调里 `OnceLock::get()` 返回 `None`，这一条事件被丢。后果是
+/// 「这一次唤醒不立刻重连，退避序列兜底」；而上面那个半截状态的后果是
+/// 「此后永远不重连」。两害相权，取这一头。
+pub fn register_once<E>(
+    cell: &std::sync::OnceLock<PowerCallbackState>,
+    hub: std::sync::Arc<EventHub>,
+    register: impl FnOnce() -> Result<(), E>,
+) -> Result<bool, E> {
+    if cell.get().is_some() {
+        return Ok(false);
+    }
+    register()?;
+    Ok(install(cell, hub))
+}
+
 // =====================================================================
 // Win32
 // =====================================================================
@@ -309,7 +499,7 @@ mod win {
     //! [`super`] 的纯逻辑层，在这台机器上被测到。
     #![allow(unsafe_code)]
 
-    use super::{ConnectivityWatcher, Debouncer, EventHub};
+    use super::{ConnectivityWatcher, EventHub, PowerCallbackState};
     use rmc_core::platform::SystemEvent;
     use std::sync::{Arc, OnceLock};
     use std::time::Instant;
@@ -324,17 +514,8 @@ mod win {
     const _: () = assert!(super::PBT_RESUME_SUSPEND == PBT_APMRESUMESUSPEND);
     const _: () = assert!(super::PBT_SUSPEND == PBT_APMSUSPEND);
 
-    /// 电源回调要用的两样东西**合成一个** static（W76）。
-    ///
-    /// 原先是 `HUB` 与 `DEBOUNCE` 两个独立的 `OnceLock`，回调里写
-    /// `if let (Some(hub), Some(d)) = (HUB.get(), DEBOUNCE.get())` 去兜
-    /// 「一个设了另一个没设」这种半截状态。合成一个之后那种状态在类型
-    /// 上就不可表达了，回调里也只剩一次 `get()`。
-    struct PowerCallbackState {
-        hub: Arc<EventHub>,
-        debounce: Debouncer,
-    }
-
+    /// 电源回调的进程级状态。类型与 [`super::install`] 都在纯逻辑层，
+    /// 这里只剩这一个格子（W85）。
     static POWER: OnceLock<PowerCallbackState> = OnceLock::new();
 
     /// 注册两类通知。失败只记日志，不影响其余功能：没有事件时客户端仍
@@ -362,18 +543,28 @@ mod win {
     /// 展开穿过它。两道防线一起上，理由如下：
     ///
     /// 1. **函数体本身 panic-free**，这是真正的保证：
-    ///    [`Debouncer::allow_at`] 容忍锁中毒、用饱和减法，
-    ///    [`EventHub::emit`] 吞掉「没有订阅者」，比较、`OnceLock::get`
-    ///    都不会 panic。
+    ///    [`super::PowerGate::on_event`] 里的 [`super::Debouncer`] 容忍锁
+    ///    中毒、用饱和减法，[`EventHub::emit`] 吞掉「没有订阅者」，
+    ///    比较、`OnceLock::get` 都不会 panic。
     /// 2. **外面再包一层 `catch_unwind`**，这是保险不是保证：
     ///    - 它挡不住 `panic = "abort"`（Task 10 的 app crate 如果那样
     ///      配置，这一层就是装饰品）；
     ///    - 但在默认的 unwind 配置下，它把「将来某次改动在这个回调里
     ///      写进一个 `unwrap()`」的代价从「客户端进程死掉」降到「丢一次
     ///      唤醒事件，下一次退避重连兜底」。
-    ///    - 而且这里确实有一段代码不归本模块管：`emit` 最终会去唤醒
-    ///      订阅者注册的 waker，那是 tokio 与上层任务的代码。
-    ///      （`broadcast` 自己的内部锁是容忍中毒的，这一点查过。）
+    ///    - 而且这个回调体里确实有**两段代码不归本模块管**（W89）：
+    ///      1. `tracing::info!` ——展开成一次 `Subscriber` 分发，而
+    ///         subscriber 是**用户在 `main` 里装的**（Task 10 的 app
+    ///         crate，以及任何嵌入本 crate 的人）。这是这个回调里最现实
+    ///         的外部 panic 源：自定义 layer、文件 appender 写盘失败、
+    ///         格式化实现里的一个 `unwrap()` 都会从这一行 panic 出来。
+    ///         Task 3 的 W56 在托盘回调上刚刚认定过同一件事。
+    ///      2. `emit` 最终会去唤醒订阅者注册的 waker，那是 tokio 与上层
+    ///         任务的代码。（`broadcast` 自己的内部锁是容忍中毒的，
+    ///         这一点查过。）
+    ///
+    ///    这两段都不在本模块的 panic-free 保证范围内，**正因如此第二道
+    ///    防线是对的**，不是冗余。
     ///
     /// 返回 0（`ERROR_SUCCESS`）——这个回调的返回值文档要求成功时返回它。
     unsafe extern "system" fn on_power_event(
@@ -383,14 +574,13 @@ mod win {
     ) -> u32 {
         // 闭包只捕获 `event_type: u32`（`Copy`，天然 `UnwindSafe`），
         // `POWER` 是 static、不算捕获，所以不需要 `AssertUnwindSafe`。
+        //
+        // W84：这里**一条判断都没有**——「算不算唤醒」「防抖放不放行」
+        // 全在 `PowerCallbackState::on_power_event` 里，在 macOS 上被测。
         let _ = std::panic::catch_unwind(|| {
-            if !super::is_resume_event(event_type) {
-                return;
-            }
             if let Some(state) = POWER.get() {
-                if state.debounce.allow_at(Instant::now()) {
+                if state.on_power_event(event_type, Instant::now()) {
                     tracing::info!("检测到休眠恢复，立即重连");
-                    state.hub.emit(SystemEvent::ResumedFromSleep);
                 }
             }
         });
@@ -414,6 +604,10 @@ mod win {
         };
         use windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_CALLBACK;
 
+        // 整个「还没注册过就注册一次、注册成功了才占格子」的顺序在
+        // `super::register_once` 里（W86），这里只负责那一次 Win32 调用
+        // 本身——本模块不做任何判断，见模块头。
+        //
         // W76：`OnceLock::set` 在已经设过时返回 `Err`，原先被 `let _` 吞
         // 掉。真被调用两次的话（Task 10 接线、或者将来加一条「重新注册」
         // 的路径），第二个 hub 会被**静默丢弃**，事件全发给第一个 hub，
@@ -422,64 +616,72 @@ mod win {
         // 这里既不静默、也不接着往下注册第二个 Win32 通知：注册两次的
         // 后果是每次唤醒回调被叫两遍，而两遍用的是同一个防抖器，第二遍
         // 必然被挡——也就是说第二次注册除了多占一个内核对象什么也不做。
-        if POWER
-            .set(PowerCallbackState {
-                hub,
-                debounce: Debouncer::new(),
-            })
-            .is_err()
-        {
+        let installed = super::register_once(&POWER, hub, || {
+            // 参数结构体 `Box::leak` 成 `'static`，不是图省事：MSDN 没有
+            // 承诺 `PowerRegisterSuspendResumeNotification` 会在返回前把
+            // 这个结构体拷走。放在栈上、函数一返回就失效，是在赌一个没人
+            // 写下来的实现细节；而这个函数现在**确实会返回**（见上面 W78
+            // 那段），赌输的表现是系统拿着一个悬垂指针去取回调地址。
+            // 一次、16 字节的泄漏，换掉这个赌局，划算。
+            //
+            // 泄漏发生在闭包里，也就是**只在真的要注册时**才发生：已经
+            // 注册过而跳过的那条路径一个字节都不漏。
+            let params: &'static DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS =
+                Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+                    Callback: Some(on_power_event),
+                    Context: std::ptr::null_mut(),
+                }));
+
+            let mut registration: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `DEVICE_NOTIFY_CALLBACK` 这个 flag 要求 `recipient`
+            // 指向一个 `DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS`，`params` 正是
+            // 它、而且是 `'static` 的；`registration` 是本闭包的局部变量，
+            // `&mut` 借用在调用期间有效，API 只往里写一个句柄。
+            unsafe {
+                PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_CALLBACK,
+                    HANDLE(
+                        params as *const DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS
+                            as *mut std::ffi::c_void,
+                    ),
+                    &mut registration,
+                )
+            }
+            .ok()?;
+
+            // W77：原先这里是 `std::mem::forget(registration)`，配一句注释
+            // 「句柄随进程存活，故意不注销」。查过 `windows` 0.62.2 之后：
+            //
+            // - 这个函数的出参在 0.62.2 里根本不是 `HPOWERNOTIFY`，而是裸
+            //   的 `*mut c_void`（签名：`registrationhandle: *mut *mut c_void`）；
+            // - 就算是 `HPOWERNOTIFY`，那也是
+            //   `#[repr(transparent)] struct HPOWERNOTIFY(pub isize)` + `derive(Copy)`，
+            //   **没有 `Drop` 实现**。它只实现 `windows_core::Free`，而
+            //   `Free` 只有经过 `windows_core::Owned<T>` 包装才会在 `Drop`
+            //   里被调用。（而且 `HPOWERNOTIFY::free` 调的是
+            //   `UnregisterPowerSettingNotification`，跟 suspend/resume
+            //   订阅根本不是一回事——将来想用 `Owned<HPOWERNOTIFY>` 来
+            //   「正确地」管这个句柄也是错的。）
+            //
+            // 两条合起来：`mem::forget` 在这里是彻底的空操作，那句注释在
+            // 骗下一个读代码的人——它让人以为「不 forget 就会注销」。
+            // （`Copy` 类型上的 `mem::forget` 还会触发 rustc 的
+            // `forgetting_copy_types` 警告，在 `-D warnings` 的 clippy 闸门
+            // 下直接是编译失败。）
+            //
+            // 真正为真的事实只有一条，写在这里：**我们故意永不调用
+            // `PowerUnregisterSuspendResumeNotification`**。订阅要活到进程
+            // 结束，没有「取消订阅」的产品路径；句柄随进程一起消失。
+            let _ = registration;
+            // 错误类型显式写出来：闭包体里只有 `.ok()?` 一个来源，而
+            // `windows::core::Error` 两头都有一堆 `From` 实现，编译器在
+            // 这里推不出 `E`（E0282/E0283，闸门 5 实测）。
+            Ok::<(), windows::core::Error>(())
+        })?;
+
+        if !installed {
             tracing::warn!("休眠恢复通知已经注册过，本次跳过；事件仍然发往首次注册的事件总线");
-            return Ok(());
         }
-
-        // 参数结构体 `Box::leak` 成 `'static`，不是图省事：MSDN 没有承诺
-        // `PowerRegisterSuspendResumeNotification` 会在返回前把这个结构体
-        // 拷走。放在栈上、函数一返回就失效，是在赌一个没人写下来的实现
-        // 细节；而这个函数现在**确实会返回**（见上面 W78 那段），赌输的
-        // 表现是系统拿着一个悬垂指针去取回调地址。一次、16 字节的泄漏，
-        // 换掉这个赌局，划算。
-        let params: &'static DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS =
-            Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
-                Callback: Some(on_power_event),
-                Context: std::ptr::null_mut(),
-            }));
-
-        let mut registration: *mut std::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: `DEVICE_NOTIFY_CALLBACK` 这个 flag 要求 `recipient` 指向
-        // 一个 `DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS`，`params` 正是它、而且
-        // 是 `'static` 的；`registration` 是本函数的局部变量，`&mut` 借用
-        // 在调用期间有效，API 只往里写一个句柄。
-        unsafe {
-            PowerRegisterSuspendResumeNotification(
-                DEVICE_NOTIFY_CALLBACK,
-                HANDLE(
-                    params as *const DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS as *mut std::ffi::c_void,
-                ),
-                &mut registration,
-            )
-        }
-        .ok()?;
-
-        // W77：原先这里是 `std::mem::forget(registration)`，配一句注释
-        // 「句柄随进程存活，故意不注销」。查过 `windows` 0.62.2 之后：
-        //
-        // - 这个函数的出参在 0.62.2 里根本不是 `HPOWERNOTIFY`，而是裸的
-        //   `*mut c_void`（签名：`registrationhandle: *mut *mut c_void`）；
-        // - 就算是 `HPOWERNOTIFY`，那也是
-        //   `#[repr(transparent)] struct HPOWERNOTIFY(pub isize)` + `derive(Copy)`，
-        //   **没有 `Drop` 实现**。它只实现 `windows_core::Free`，而 `Free`
-        //   只有经过 `windows_core::Owned<T>` 包装才会在 `Drop` 里被调用。
-        //
-        // 两条合起来：`mem::forget` 在这里是彻底的空操作，那句注释在骗
-        // 下一个读代码的人——它让人以为「不 forget 就会注销」。（`Copy`
-        // 类型上的 `mem::forget` 还会触发 rustc 的 `forgetting_copy_types`
-        // 警告，在 `-D warnings` 的 clippy 闸门下直接是编译失败。）
-        //
-        // 真正为真的事实只有一条，写在这里：**我们故意永不调用
-        // `PowerUnregisterSuspendResumeNotification`**。订阅要活到进程结
-        // 束，没有「取消订阅」的产品路径；句柄随进程一起消失。
-        let _ = registration;
         Ok(())
     }
 
@@ -529,7 +731,7 @@ pub use win::spawn_win32_listeners;
 mod tests {
     use super::*;
     use rmc_core::platform::{SystemEvent, SystemEvents};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use tokio::sync::broadcast::error::TryRecvError;
 
     // -----------------------------------------------------------------
@@ -582,6 +784,41 @@ mod tests {
         hub.emit(SystemEvent::ResumedFromSleep);
         assert_eq!(recv_soon(&mut a).await, SystemEvent::ResumedFromSleep);
         assert_eq!(recv_soon(&mut b).await, SystemEvent::ResumedFromSleep);
+    }
+
+    #[tokio::test]
+    async fn emitting_once_delivers_exactly_one_event() {
+        // W87：上一轮「`emit` 发且**只**发一条」没有任何测试——评审的
+        // 探针（`emit` 里把 `send` 写两遍）20 passed 全绿。多发一条在
+        // 产品里就是 Supervisor 多清一次退避、多打一次连接。
+        let hub = Arc::new(EventHub::new());
+        let mut rx = hub.subscribe();
+        hub.emit(SystemEvent::NetworkChanged);
+        assert_eq!(recv_soon(&mut rx).await, SystemEvent::NetworkChanged);
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "一次 emit 只该在通道里留下一条"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_full_of_events_reaches_a_subscriber_that_has_not_polled_yet() {
+        // 上一条钉常量本身，这一条钉 `EventHub` 真的用了它——把
+        // `broadcast::channel(EVENT_CHANNEL_CAPACITY)` 换回
+        // `channel(1)`，这条变红（第一次 `recv` 就是 `Lagged`）。
+        let hub = Arc::new(EventHub::new());
+        let mut rx = hub.subscribe();
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            hub.emit(SystemEvent::NetworkChanged);
+        }
+        for i in 0..EVENT_CHANNEL_CAPACITY {
+            assert_eq!(
+                recv_soon(&mut rx).await,
+                SystemEvent::NetworkChanged,
+                "第 {i} 条应当还在通道里，没有被挤掉"
+            );
+        }
     }
 
     #[tokio::test]
@@ -828,6 +1065,239 @@ mod tests {
         assert_eq!(PBT_RESUME_AUTOMATIC, 18);
         assert_eq!(PBT_RESUME_SUSPEND, 7);
         assert_eq!(PBT_SUSPEND, 4);
+    }
+
+    // -----------------------------------------------------------------
+    // 电源闸（W84）
+    //
+    // 上一轮这两个门整个留在 `#[cfg(windows)]` 的回调体里，这台机器上
+    // 一行都编译不到；评审的两枪（PW1 把 `!` 去掉、PW2b 把防抖门换成
+    // `if true`）六道闸门全绿。下面四条就是补上的那道检测。
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn only_a_wake_up_code_opens_the_power_gate() {
+        // PW1：把 `on_event` 里的 `is_resume_event(..)` 改成
+        // `!is_resume_event(..)`，这条变红——而产品里那一下的表现是
+        // **真唤醒时什么都不发，「即将休眠」反而触发重连**。
+        let base = t0();
+        let g = PowerGate::with_window(Duration::from_millis(800));
+        assert!(!g.on_event(PBT_SUSPEND, base), "即将休眠，此刻重连是徒劳的");
+        assert!(
+            !g.on_event(PBT_RESUME_SUSPEND, base),
+            "只在用户按键唤醒时附带，认它只会白挤防抖窗口"
+        );
+        assert!(
+            !g.on_event(32787, base),
+            "PBT_POWERSETTINGCHANGE，跟唤醒无关"
+        );
+        assert!(!g.on_event(0, base), "PBT_APMQUERYSUSPEND，跟唤醒无关");
+        assert!(
+            g.on_event(PBT_RESUME_AUTOMATIC, base),
+            "每次唤醒都发的那一条，必须放行"
+        );
+    }
+
+    #[test]
+    fn a_second_wake_up_inside_the_window_is_suppressed() {
+        // PW2b：把 `on_event` 里的 `&& self.debounce.allow_at(now)` 换成
+        // `&& true`（或直接去掉），这条变红。
+        let base = t0();
+        let g = PowerGate::with_window(Duration::from_millis(800));
+        assert!(g.on_event(PBT_RESUME_AUTOMATIC, base), "第一条放行");
+        assert!(
+            !g.on_event(PBT_RESUME_AUTOMATIC, base + Duration::from_millis(799)),
+            "窗口内的第二条挡掉"
+        );
+        assert!(
+            g.on_event(PBT_RESUME_AUTOMATIC, base + Duration::from_millis(800)),
+            "窗口之外要能再发"
+        );
+    }
+
+    #[test]
+    fn codes_that_are_not_wake_ups_do_not_consume_the_debounce_window() {
+        // 两个门串联的**顺序**：先问算不算唤醒，算了才去问防抖。
+        // 把 `on_event` 写成 `self.debounce.allow_at(now) &&
+        // is_resume_event(event_type)`，这条变红——合盖前系统会连发
+        // 好几条 `PBT_*`，紧接着的那次真唤醒就被自己挡掉了。
+        let base = t0();
+        let g = PowerGate::with_window(Duration::from_millis(800));
+        for offset in [0u64, 10, 20, 30] {
+            assert!(!g.on_event(PBT_SUSPEND, base + Duration::from_millis(offset)));
+        }
+        assert!(
+            g.on_event(PBT_RESUME_AUTOMATIC, base + Duration::from_millis(40)),
+            "前面那一串跟唤醒无关的码不该占掉防抖窗口"
+        );
+    }
+
+    #[test]
+    fn a_power_gate_built_from_the_product_constant_uses_that_window() {
+        // `PowerGate::new()` 真的用了 `debounce_ms()`，不是另一个写死的
+        // 数。把 `new()` 改成 `with_window(Duration::from_millis(1))`，
+        // 这条变红。
+        let g = PowerGate::new();
+        let base = t0();
+        assert!(g.on_event(PBT_RESUME_AUTOMATIC, base));
+        assert!(!g.on_event(
+            PBT_RESUME_AUTOMATIC,
+            base + Duration::from_millis(debounce_ms() - 1)
+        ));
+        assert!(g.on_event(
+            PBT_RESUME_AUTOMATIC,
+            base + Duration::from_millis(debounce_ms())
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // 电源回调的进程级状态（W85/W86）
+    //
+    // 格子当参数传（同 W74 对 `Instant` 的那一招），所以这两条在 macOS
+    // 上真跑，不需要任何 mock。上一轮这里零覆盖，评审的 PW3
+    // （`.is_err()` → `.is_ok()`）六道闸门全绿。
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_power_callback_emits_a_resume_event_only_for_a_wake_up() {
+        let base = t0();
+        let cell = OnceLock::new();
+        let hub = Arc::new(EventHub::new());
+        let mut rx = hub.subscribe();
+        assert!(install(&cell, Arc::clone(&hub)));
+        let state = cell.get().expect("刚刚装进去的");
+
+        assert!(!state.on_power_event(PBT_SUSPEND, base));
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "「即将休眠」不该发出任何事件"
+        );
+
+        assert!(state.on_power_event(PBT_RESUME_AUTOMATIC, base));
+        assert_eq!(
+            recv_soon(&mut rx).await,
+            SystemEvent::ResumedFromSleep,
+            "发的必须是唤醒事件，不是 NetworkChanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn installing_a_second_time_is_refused_and_keeps_the_first_hub() {
+        // PW3：把 `install` 里的 `.is_ok()` 改成 `.is_err()`，语义正好
+        // 翻成「第一次注册跳过、第二次才注册」，休眠恢复整个不工作。
+        // 这条的两个 `assert!` 同时变红。
+        let base = t0();
+        let cell = OnceLock::new();
+        let first = Arc::new(EventHub::new());
+        let second = Arc::new(EventHub::new());
+        let mut rx_first = first.subscribe();
+        let mut rx_second = second.subscribe();
+
+        assert!(install(&cell, Arc::clone(&first)), "第一次装得进去");
+        assert!(!install(&cell, Arc::clone(&second)), "第二次必须被拒");
+
+        // 格子里仍然是第一个 hub：事件发到 `first`，`second` 上什么都没有。
+        assert!(cell
+            .get()
+            .expect("装过了")
+            .on_power_event(PBT_RESUME_AUTOMATIC, base));
+        assert_eq!(
+            recv_soon(&mut rx_first).await,
+            SystemEvent::ResumedFromSleep
+        );
+        assert_eq!(
+            rx_second.try_recv(),
+            Err(TryRecvError::Empty),
+            "第二个 hub 被丢弃了，不该收到任何事件"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 注册顺序（W86）
+    //
+    // 「还没注册过就注册一次、注册成功了才占格子」这个顺序上一轮整个
+    // 写在 `win::register_power` 里，在这台机器上一行都测不到。现在
+    // `register` 当参数收进来，于是下面三条在 macOS 上真跑。
+    // -----------------------------------------------------------------
+
+    /// 测试用的注册失败，代替 `windows::core::Error`。
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakeRegisterError;
+
+    #[test]
+    fn a_failed_registration_leaves_the_cell_empty_so_a_retry_can_still_work() {
+        // 这就是 W86 那条半截状态：上一轮 `POWER.set(..)` 排在 Win32
+        // 注册**之前**，`.ok()?` 提前返回时格子已经被占住，将来任何重试
+        // 都会走进「已经注册过，本次跳过」并返回 `Ok(())`——功能永久
+        // 关闭却报成功。
+        //
+        // 把 `register_once` 里的 `register()?;` 挪到 `install(..)` 之后
+        // （也就是还原上一轮的顺序），这条的最后两个断言变红。
+        let cell = OnceLock::new();
+        let hub = Arc::new(EventHub::new());
+
+        assert_eq!(
+            register_once(&cell, Arc::clone(&hub), || Err(FakeRegisterError)),
+            Err(FakeRegisterError),
+            "注册失败要如实往上报"
+        );
+        assert!(cell.get().is_none(), "注册失败之后格子必须还是空的");
+
+        // 重试：这一次注册成功，功能必须真的起来。
+        assert_eq!(
+            register_once(&cell, Arc::clone(&hub), || Ok::<(), FakeRegisterError>(())),
+            Ok(true),
+            "重试必须能真的装上，而不是「已经注册过，跳过」"
+        );
+        assert!(cell.get().is_some());
+    }
+
+    #[test]
+    fn registering_a_second_time_does_not_touch_win32_at_all() {
+        // 已经注册过就连 `register` 都不调用——注册两次的唯一后果是多占
+        // 一个内核对象加一次 `Box::leak`，第二遍的回调必然被同一个防抖器
+        // 挡掉。把 `register_once` 开头那个 `if cell.get().is_some()` 去掉，
+        // 这条变红。
+        let cell = OnceLock::new();
+        let hub = Arc::new(EventHub::new());
+        let calls = std::cell::Cell::new(0u32);
+
+        assert_eq!(
+            register_once(&cell, Arc::clone(&hub), || {
+                calls.set(calls.get() + 1);
+                Ok::<(), FakeRegisterError>(())
+            }),
+            Ok(true)
+        );
+        assert_eq!(
+            register_once(&cell, Arc::clone(&hub), || {
+                calls.set(calls.get() + 1);
+                Ok::<(), FakeRegisterError>(())
+            }),
+            Ok(false),
+            "第二次要报「跳过」，不是「装上了」"
+        );
+        assert_eq!(calls.get(), 1, "第二次不该再碰一次 Win32");
+    }
+
+    #[tokio::test]
+    async fn a_successful_registration_wires_the_callback_to_that_hub() {
+        // 端到端一条：注册成功 → 格子装上 → 回调收到唤醒码 → 这个 hub
+        // 的订阅者收到 `ResumedFromSleep`。
+        let cell = OnceLock::new();
+        let hub = Arc::new(EventHub::new());
+        let mut rx = hub.subscribe();
+
+        assert_eq!(
+            register_once(&cell, Arc::clone(&hub), || Ok::<(), FakeRegisterError>(())),
+            Ok(true)
+        );
+        assert!(cell
+            .get()
+            .expect("注册成功之后格子必须装上了")
+            .on_power_event(PBT_RESUME_AUTOMATIC, t0()));
+        assert_eq!(recv_soon(&mut rx).await, SystemEvent::ResumedFromSleep);
     }
 
     #[test]
