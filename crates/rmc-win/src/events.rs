@@ -434,7 +434,7 @@ impl PowerCallbackState {
 ///
 /// 格子当参数传，所以测试可以 `new` 一个本地 `OnceLock` 真跑两遍，
 /// 不需要任何 mock，也不需要在 macOS 上编译 Win32。
-pub fn install(
+pub(crate) fn install(
     cell: &std::sync::OnceLock<PowerCallbackState>,
     hub: std::sync::Arc<EventHub>,
 ) -> bool {
@@ -471,6 +471,15 @@ pub fn install(
 /// 话，回调里 `OnceLock::get()` 返回 `None`，这一条事件被丢。后果是
 /// 「这一次唤醒不立刻重连，退避序列兜底」；而上面那个半截状态的后果是
 /// 「此后永远不重连」。两害相权，取这一头。
+///
+/// **这个窗口是可以彻底消掉的，只是不值得现在返工。**
+/// `DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS` 有一个 `Context: *mut c_void`
+/// 字段，系统会把它原样回传给回调的第一个参数（现在那个参数叫
+/// `_context`，被直接扔掉）。把状态 `Box::leak` 成 `'static` 塞进
+/// `Context`，状态就在注册**之前**已经存在，系统只可能在注册成功
+/// **之后**用那个指针调回调——没有格子、没有顺序、也就没有窗口。
+/// 纯逻辑层一个字不用改。代价是丢掉 `OnceLock` 兼职的「重复注册探测」，
+/// 得另配一个 `AtomicBool`。Task 10 接线时再定。
 pub fn register_once<E>(
     cell: &std::sync::OnceLock<PowerCallbackState>,
     hub: std::sync::Arc<EventHub>,
