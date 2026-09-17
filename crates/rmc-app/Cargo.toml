@@ -1,0 +1,42 @@
+[package]
+name = "rmc-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# W101：brief 漏了这一行。`license = "UNLICENSED"` 不是合法 SPDX 表达式，
+# `deny.toml` 的 `[licenses.private] ignore = true` 靠 `publish = false`
+# 才会跳过本 workspace 自己的源码——漏掉它，`cargo deny check licenses`
+# 会因为我们自己的包变红，跟第三方依赖无关。
+publish.workspace = true
+
+[dependencies]
+# W101：tracing 已在 `[workspace.dependencies]` 里，写死 "0.1" 会绕开
+# 统一版本管理。
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 界面框架。`wgpu` 与 `tiny-skia` 同时开启时，iced 在 wgpu 初始化失败
+# （RDP 会话、无 GPU 的虚拟机）时自动回落到软件渲染——现场工程师的笔记本
+# 经常就在这两种环境里。`tokio` 让 iced 的 runtime 用 tokio 而不是
+# async-std/smol，跟 rmc-core 用同一套 reactor；Task 7 起要把
+# `TunnelEvent` 的 channel 接进 `Subscription`，这条现在就得定下来。
+iced = { version = "0.13", default-features = false, features = [
+  "wgpu",
+  "tiny-skia",
+  "tokio",
+  "advanced",
+] }
+
+# Win32 调用只在 windows target 上编译。
+[target.'cfg(windows)'.dependencies]
+# 单实例互斥。不在 `[workspace.dependencies]` 里（rmc-core 不依赖它），
+# 用路径引。
+rmc-win = { path = "../rmc-win" }
+
+[lib]
+name = "rmc_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rmc"
+path = "src/main.rs"
