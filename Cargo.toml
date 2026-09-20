@@ -26,3 +26,26 @@ rmc-core = { path = "crates/rmc-core" }
 # 0.62 下 rmc-win 的 Win32 代码原有的编译错误从 13 处降到 1 处（其余是本
 # workspace 自己代码的问题，不是版本问题）。
 windows = "0.62"
+
+# 发布配置（Task 12）。便携包是「现场工程师从邮件里拿到一个 exe 双击」这种
+# 分发形态，体积与启动速度都直接算在体验里。
+[profile.release]
+# 界面是纯软件绘制（iced 只开 tiny-skia，没有 wgpu），"z" 理论上会拖慢
+# 光栅化——但这个窗口固定 520x720、内容是文字和几个按钮，只有「已连接时长」
+# 每秒触发一次重绘，不存在连续动画。判为看不出差别，先按体积优化。
+# 真机上若发现界面迟滞，第一件该试的事就是把这一行改成 3。
+opt-level = "z"
+lto = true
+codegen-units = 1
+# panic = "abort" 去掉展开表。全仓库 `should_panic` 与 `catch_unwind` 各
+# 零处（已 grep 核过），没有任何代码依赖栈展开；`cargo test` 走 test profile，
+# 不受这一行影响。
+#
+# **但它有代价，而且这个代价今天没有对冲**：`main.rs` 声明了
+# `windows_subsystem = "windows"`（不弹控制台），所以 panic 的那行文字写进
+# 一个没人接的 stderr，`strip` 又把符号表去掉了——现场崩一次，什么都留不下。
+# 装一个把 panic 写进 tracing 的钩子是几行的事，但那几行落在 `main()` 里，
+# 而 `main()` 至今零自动化证据（W216）。按用户方针「成本不随时间涨的记账
+# 不做」，记在 task-12-report.md 的「交付前还剩什么」表第 1 条。
+panic = "abort"
+strip = true

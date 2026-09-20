@@ -2,6 +2,18 @@
 //! GitHub Actions——写法与立意都照抄 `gateway/tests/test_ci_workflow.py`
 //! （见该文件顶部模块文档，那边有一次真实踩坑的完整记录）。
 //!
+//! # Task 12 的两处改动
+//!
+//! 1. 辅助函数搬进了 `tests/workflow_yaml/`，跟守 `app.yml` 的
+//!    `tests/app_workflow.rs` 共用。只有 `env_assignment_value()` 与
+//!    `major_minor()` 留在本文件里（另一份用不上它们，搬过去就是
+//!    dead_code）——理由与实测记录见那份文件顶部。
+//! 2. 新增 `dependency_audit_triggers_on_every_file_that_can_change_the_
+//!    dependency_graph`：`deny` job 一直都在（W219 的「cargo deny 根本不在
+//!    CI 里」不成立，订正见 task-12-report.md），但**它的触发条件原来没被
+//!    钉住**——`Cargo.lock` 与 `deny.toml` 从 paths 过滤器里掉出去，
+//!    依赖审计就会对一次 `cargo update` 视而不见。
+//!
 //! Task 12 要还的债是"本仓库至今没有任何 CI 会构建 Rust"，这份工作流
 //! 是还债的实物。但工作流本身是一份不会被 `cargo check` 校验的 YAML：
 //! 路径过滤器漏写一个目录、`--ignored` 被删掉、`if: always()` 被误删、
@@ -46,138 +58,25 @@
 //! msrv` 现在直接读 `rust-toolchain.toml` 的 `channel` 字段做交叉
 //! 校验，不是把同一个版本号分别硬编码在两处。
 
-use std::path::PathBuf;
-use yaml_rust2::{Yaml, YamlLoader};
+mod workflow_yaml;
+use workflow_yaml::*;
+use yaml_rust2::Yaml;
 
-fn workflow_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/core.yml")
+/// 这份测试守的是 `core.yml`。`app.yml` 由 `tests/app_workflow.rs` 守，
+/// 两边共用 `tests/workflow_yaml/` 里的辅助（搬过去的理由见那份文件顶部）。
+const WORKFLOW: &str = "core.yml";
+
+fn doc() -> Yaml {
+    load_workflow(WORKFLOW)
 }
 
-fn load_workflow() -> Yaml {
-    let text = std::fs::read_to_string(workflow_path())
-        .unwrap_or_else(|e| panic!("读取 {:?} 失败：{e}", workflow_path()));
-    let docs = YamlLoader::load_from_str(&text).expect("core.yml 不是合法的 YAML");
-    assert_eq!(docs.len(), 1, "工作流文件应该正好一个 YAML 文档");
-    docs.into_iter().next().unwrap()
-}
-
-/// 按 job 名取整份 job 定义，找不到直接 panic（列出现有 job 名）。
-fn job<'a>(doc: &'a Yaml, name: &str) -> &'a Yaml {
-    let jobs = &doc["jobs"];
-    let hash = jobs
-        .as_hash()
-        .unwrap_or_else(|| panic!("workflow 里没有 jobs 映射，或它不是一个 mapping"));
-    let names: Vec<String> = hash
-        .keys()
-        .map(|k| k.as_str().unwrap_or("<non-string>").to_string())
-        .collect();
-    let found = &jobs[name];
-    if found.is_badvalue() {
-        panic!("没有名为 {name:?} 的 job；现有 job：{names:?}");
-    }
-    found
-}
-
-fn steps(job: &Yaml) -> &Vec<Yaml> {
-    job["steps"]
-        .as_vec()
-        .unwrap_or_else(|| panic!("这个 job 没有 steps 序列"))
-}
-
-/// 按 step 的 `name` 字段精确定位，找不到（或撞了不止一个）就直接
-/// panic——不能退回子串匹配，也不能返回 -1/0 之类的哨兵值。
-fn step_index_by_name(steps: &[Yaml], name: &str) -> usize {
-    let matches: Vec<usize> = steps
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s["name"].as_str() == Some(name))
-        .map(|(i, _)| i)
-        .collect();
-    match matches.as_slice() {
-        [] => {
-            let names: Vec<Option<&str>> = steps.iter().map(|s| s["name"].as_str()).collect();
-            panic!("没有 name 精确等于 {name:?} 的 step；现有 step 名：{names:?}");
-        }
-        [i] => *i,
-        many => panic!("有不止一个 step 的 name 都是 {name:?}：下标 {many:?}"),
-    }
-}
-
-fn step_by_name<'a>(steps: &'a [Yaml], name: &str) -> &'a Yaml {
-    &steps[step_index_by_name(steps, name)]
-}
-
-fn run_text(step: &Yaml) -> &str {
-    step["run"].as_str().unwrap_or("")
-}
-
-/// `run_text` 去掉整行的 shell 注释之后的**代码**部分。
+/// 在一段 shell 脚本文本里找 `NAME=value` 这种环境变量赋值，取 `value`
+/// （到下一个空白字符或 `\` 续行符为止）。用于从 `docker run` 命令里挖出
+/// `-e RUSTUP_TOOLCHAIN=1.89.0` 这类参数的值。
 ///
-/// R96 实测踩到的坑：`等待测试环境就绪` 这一步第一版把"到点 exit 1 让
-/// 这一步失败"这句说明写在 `run:` 脚本体内的 `#` 注释里，而
-/// `readiness_gate_really_waits_for_the_services_and_fails_on_timeout`
-/// 断言的是 `run.contains("exit 1")`——于是把代码里真正的 `exit 1` 换成
-/// `echo '继续往下跑'` 之后，这条断言被那句注释满足，测试照样全绿。
-/// 一条"守住超时会让 CI 失败"的断言，被自己要守的那段文字喂饱了。
-///
-/// 这份文件里别的步骤没有这个问题：它们的说明是写在 `run:` **外面**的
-/// YAML 注释，压根不进 `run` 字符串（已逐条核对）。但这条防线不该依赖
-/// "后人也记得把注释写在外面"，所以凡是断言"脚本里真的有某个东西"的
-/// 地方一律走这个函数。
-///
-/// 只剥整行注释（`^\s*#`），不碰行尾注释——行尾注释在这份工作流里不
-/// 存在，而要正确处理它就得分辨 `#` 是不是在引号里，那是一个真正的
-/// 词法分析问题，不值得为了一个不存在的形状引进来。
-fn run_code(step: &Yaml) -> String {
-    run_text(step)
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn uses_text(step: &Yaml) -> Option<&str> {
-    step["uses"].as_str()
-}
-
-/// `step["if"]` 在 YAML 里可能是字符串（`"failure()"`）也可能是没加
-/// 引号的布尔字面量（`false`/`true` 会被解析成 `Yaml::Boolean`，不是
-/// `Yaml::String`）——只查 `as_str()` 会让 `if: false` 这种写法完全
-/// 从视野里消失（`as_str()` 对 `Boolean` 返回 `None`，看起来跟"这一步
-/// 压根没有 if 字段"一样）。这个函数把两种写法都判成"这一步被静默
-/// 关掉了吗"。
-fn step_is_disabled(step: &Yaml) -> bool {
-    match &step["if"] {
-        Yaml::Boolean(b) => !*b,
-        Yaml::String(s) => s.trim() == "false",
-        _ => false,
-    }
-}
-
-/// 从 `rust-toolchain.toml` 里读 `channel` 字段的值——这份文件的格式
-/// 固定是三行的 `[toolchain]` 表，手写一个只找这一个字段的小函数比
-/// 引入一个通用 TOML 解析器依赖更划算：跟本文件用 `yaml-rust2` 解析
-/// `core.yml` 是两种不同的取舍——`core.yml` 的结构本身就是这份测试
-/// 要盯住的对象（手写解析器的 bug 会掩盖它该盯住的回归，见模块文档），
-/// 而这里只是读一个格式早就固定死的配置文件里的一个字段，不存在这层
-/// 风险。
-fn toolchain_channel() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rust-toolchain.toml");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读取 {path:?} 失败：{e}"));
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("channel") {
-            if let Some(value) = rest.trim_start().strip_prefix('=') {
-                return value.trim().trim_matches('"').to_string();
-            }
-        }
-    }
-    panic!("{path:?} 里没找到 channel 字段");
-}
-
-/// 在一段 shell 脚本文本里找 `NAME=value` 这种环境变量赋值，取
-/// `value`（到下一个空白字符或 `\` 续行符为止）。用于从 `docker run`
-/// 命令里挖出 `-e RUSTUP_TOOLCHAIN=1.89.0` 这类参数的值。
+/// **没有搬进 `workflow_yaml`**：只有这份文件用得上（`app.yml` 里没有
+/// 容器），搬过去会在 `app_workflow.rs` 那个二进制里变成 dead_code，
+/// `cargo clippy --all-targets -- -D warnings` 当场变红。
 fn env_assignment_value<'a>(shell_text: &'a str, name: &str) -> Option<&'a str> {
     let needle = format!("{name}=");
     let start = shell_text.find(&needle)? + needle.len();
@@ -188,11 +87,10 @@ fn env_assignment_value<'a>(shell_text: &'a str, name: &str) -> Option<&'a str> 
     Some(&rest[..end])
 }
 
-/// 取字符串版本号的 `major.minor` 前缀（`"1.89.0"` -> `"1.89"`，
-/// `"1.89"` -> `"1.89"`）——比较镜像标签/`RUSTUP_TOOLCHAIN` 的值跟
-/// `rust-toolchain.toml` 的 `channel` 是不是同一个 MSRV 时，只关心
-/// major.minor，不关心具体 patch 号（patch 号会随镜像更新而变，不是
-/// 这里要盯住的漂移）。
+/// 取字符串版本号的 `major.minor` 前缀（`"1.89.0"` -> `"1.89"`）——比较
+/// 镜像标签/`RUSTUP_TOOLCHAIN` 的值跟 `rust-toolchain.toml` 的 `channel`
+/// 是不是同一个 MSRV 时，只关心 major.minor，不关心具体 patch 号（patch
+/// 号会随镜像更新而变，不是这里要盯住的漂移）。同上，不搬。
 fn major_minor(version: &str) -> String {
     let mut parts = version.split('.');
     let major = parts.next().unwrap_or("");
@@ -218,15 +116,8 @@ const STEP_CARGO_DENY: &str = "cargo-deny";
 
 #[test]
 fn workflow_file_parses_as_yaml_with_exactly_three_jobs() {
-    let doc = load_workflow();
-    let hash = doc["jobs"].as_hash().expect("jobs 应该是一个 mapping");
-    let mut names: Vec<String> = hash
-        .keys()
-        .map(|k| k.as_str().unwrap_or("<non-string>").to_string())
-        .collect();
-    names.sort();
     assert_eq!(
-        names,
+        job_names(&doc()),
         vec![
             DENY_JOB.to_string(),
             INTEGRATION_JOB.to_string(),
@@ -253,26 +144,67 @@ fn workflow_file_parses_as_yaml_with_exactly_three_jobs() {
 // 条件，少了任何一侧都会让一部分改动逃过 CI。
 #[test]
 fn paths_filter_covers_the_directories_and_files_this_workflow_depends_on() {
-    let doc = load_workflow();
-    for trigger in ["push", "pull_request"] {
-        let paths = doc["on"][trigger]["paths"]
-            .as_vec()
-            .unwrap_or_else(|| panic!("on.{trigger}.paths 应该是一个序列"));
-        let texts: Vec<&str> = paths.iter().filter_map(Yaml::as_str).collect();
-        for required in ["crates/**", "gateway/**", "rust-toolchain.toml"] {
-            assert!(
-                texts.contains(&required),
-                "on.{trigger}.paths 必须包含 {required:?}，实际 {texts:?}"
-            );
-        }
-    }
+    assert_paths_filter_covers(
+        &doc(),
+        WORKFLOW,
+        &[
+            "crates/**",
+            "gateway/**",
+            "Cargo.toml",
+            "Cargo.lock",
+            "deny.toml",
+            "rust-toolchain.toml",
+            ".github/workflows/core.yml",
+            ".github/workflows/app.yml",
+        ],
+    );
+}
+
+// Task 12 追加。**这条测试是对 W219 的订正的落地。**
+//
+// W219 的原话是「`cargo deny` 根本不在 CI 里……所有依赖审计的结论全部零
+// 强制」。这是**不成立的**：`deny` job 从 12f1ff2 起就在这份工作流里，
+// `deny_job_uses_the_cargo_deny_action` 与
+// `cargo_deny_step_checks_all_four_categories_not_a_narrowed_subset`
+// 两条测试一直钉着它。（那次 grep 大概是找字面的 `cargo deny` 命令，而这
+// 一步是 `uses: EmbarkStudios/cargo-deny-action@v2`。）
+//
+// 但顺着那条怀疑真查出来一个**小一号、真实存在**的洞：上面那条 paths 断言
+// 原来只要求 `crates/**`/`gateway/**`/`rust-toolchain.toml` 三条，
+// **`Cargo.lock` 与 `deny.toml` 谁都没钉**。一次只动 `Cargo.lock` 的
+// `cargo update`（引进一条新的 RUSTSEC 公告、或者一个新的许可证），在
+// 「有人手滑把 `Cargo.lock` 从 paths 里删掉」之后就再也不会触发
+// `deny` job——形状跟 W219 担心的一模一样，只是范围小得多。
+// `deny.toml` 同理：放宽豁免的那次提交本身必须重新跑一遍审计。
+//
+// 这条测试把「依赖图能被什么文件改动」与「改这些文件会不会触发 deny job」
+// 这两件事焊在一起。
+//
+// 会让这条测试变红的实现改法：把 `Cargo.lock`、`Cargo.toml`、`deny.toml`
+// 或 `crates/**` 里的任意一条从 `on.push.paths` / `on.pull_request.paths`
+// 删掉；或者删掉 `deny` job 本身。
+#[test]
+fn dependency_audit_triggers_on_every_file_that_can_change_the_dependency_graph() {
+    let doc = doc();
+    // 先正向确认审计这一步真的在——否则下面那组 paths 断言是在守一个不
+    // 存在的 job，全绿也说明不了任何事。
+    let step = step_by_name(steps(job(&doc, DENY_JOB)), STEP_CARGO_DENY);
+    assert!(
+        uses_text(step).is_some_and(|u| u.starts_with("EmbarkStudios/cargo-deny-action@")),
+        "deny job 的 {STEP_CARGO_DENY} 步骤不见了，下面的 paths 断言就没有意义：{step:?}"
+    );
+    assert_paths_filter_covers(
+        &doc,
+        WORKFLOW,
+        &["crates/**", "Cargo.toml", "Cargo.lock", "deny.toml"],
+    );
 }
 
 // 会让这条测试变红的实现改法：删掉 `-D warnings`（clippy 又能悄悄放行
 // 新告警了），或者把这一步的 `run` 换成别的命令。
 #[test]
 fn unit_job_runs_clippy_with_deny_warnings_and_fmt_check() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, UNIT_JOB));
 
     let fmt = run_code(step_by_name(steps, STEP_FMT));
@@ -302,7 +234,7 @@ fn unit_job_runs_clippy_with_deny_warnings_and_fmt_check() {
 // `channel`、不动这一步。
 #[test]
 fn unit_job_pins_the_toolchain_to_the_documented_msrv() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, UNIT_JOB));
     let step = step_by_name(steps, STEP_INSTALL_TOOLCHAIN);
     let uses = uses_text(step).unwrap_or_else(|| panic!("{STEP_INSTALL_TOOLCHAIN} 没有 uses 字段"));
@@ -332,7 +264,7 @@ fn unit_job_pins_the_toolchain_to_the_documented_msrv() {
 // 漂移而变红）。
 #[test]
 fn integration_job_container_toolchain_matches_the_documented_msrv() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
     let channel = toolchain_channel();
@@ -359,7 +291,7 @@ fn integration_job_container_toolchain_matches_the_documented_msrv() {
 // 裸跑 `cargo test -p rmc-core`。
 #[test]
 fn unit_test_step_has_an_inner_timeout_wrapper() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, UNIT_JOB));
     let run = run_code(step_by_name(steps, STEP_UNIT_TESTS));
     assert!(
@@ -381,7 +313,7 @@ fn unit_test_step_has_an_inner_timeout_wrapper() {
 // 或者在前面插入任何内容。
 #[test]
 fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, UNIT_JOB));
     let run = run_code(step_by_name(steps, STEP_UNIT_TESTS));
     let trimmed = run.trim();
@@ -405,7 +337,7 @@ fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
 // `--build` 删掉。
 #[test]
 fn compose_up_step_always_rebuilds_the_images() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let run = run_code(step_by_name(steps, STEP_COMPOSE_UP));
     assert!(
@@ -424,7 +356,7 @@ fn compose_up_step_always_rebuilds_the_images() {
 // 集成测试"后面（等的时机不对，等于没等）。
 #[test]
 fn integration_steps_run_in_the_documented_order() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let compose_up = step_index_by_name(steps, STEP_COMPOSE_UP);
     let ready = step_index_by_name(steps, STEP_WAIT_READY);
@@ -464,7 +396,7 @@ fn integration_steps_run_in_the_documented_order() {
 // 或者把 `until` 循环换成一句无上限的死等。
 #[test]
 fn readiness_gate_really_waits_for_the_services_and_fails_on_timeout() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let step = step_by_name(steps, STEP_WAIT_READY);
     let run = run_code(step);
@@ -513,7 +445,7 @@ fn readiness_gate_really_waits_for_the_services_and_fails_on_timeout() {
 // （或者在 run 里把命令接上 `|| true`）。
 #[test]
 fn ignored_tests_step_really_runs_the_ignored_tests_and_can_fail_the_build() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let step = step_by_name(steps, STEP_IGNORED_TESTS);
     let run = run_code(step);
@@ -537,7 +469,7 @@ fn ignored_tests_step_really_runs_the_ignored_tests_and_can_fail_the_build() {
 // 需要特权的步骤）。
 #[test]
 fn ignored_tests_run_inside_a_container_with_network_host_and_add_host() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
     assert!(run.contains("--network host"), "{run:?}");
@@ -550,7 +482,7 @@ fn ignored_tests_run_inside_a_container_with_network_host_and_add_host() {
 // 会让这条测试变红的实现改法：把 run 里的 `timeout 1200` 删掉。
 #[test]
 fn ignored_tests_step_has_an_inner_timeout_wrapper() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
     assert!(
@@ -567,7 +499,7 @@ fn ignored_tests_step_has_an_inner_timeout_wrapper() {
 // 挪到"运行 --ignored 集成测试"前面。
 #[test]
 fn log_export_step_runs_only_on_failure_after_the_tests() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let idx = step_index_by_name(steps, STEP_LOG_EXPORT);
     let ignored_idx = step_index_by_name(steps, STEP_IGNORED_TESTS);
@@ -585,7 +517,7 @@ fn log_export_step_runs_only_on_failure_after_the_tests() {
 // "运行 --ignored 集成测试"前面。
 #[test]
 fn cleanup_step_always_tears_down_after_every_test_related_step() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, INTEGRATION_JOB));
     let idx = step_index_by_name(steps, STEP_CLEANUP);
     assert_eq!(steps[idx]["if"].as_str(), Some("always()"));
@@ -611,7 +543,7 @@ fn cleanup_step_always_tears_down_after_every_test_related_step() {
 // workflow_file_parses_as_yaml_with_exactly_three_jobs）。
 #[test]
 fn deny_job_uses_the_cargo_deny_action() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, DENY_JOB));
     let step = step_by_name(steps, STEP_CARGO_DENY);
     let uses = uses_text(step).unwrap_or_else(|| panic!("{STEP_CARGO_DENY} 没有 uses 字段"));
@@ -631,7 +563,7 @@ fn deny_job_uses_the_cargo_deny_action() {
 // 的输入。
 #[test]
 fn cargo_deny_step_checks_all_four_categories_not_a_narrowed_subset() {
-    let doc = load_workflow();
+    let doc = doc();
     let steps = steps(job(&doc, DENY_JOB));
     let step = step_by_name(steps, STEP_CARGO_DENY);
     assert!(
@@ -651,7 +583,7 @@ fn cargo_deny_step_checks_all_four_categories_not_a_narrowed_subset() {
 // 结果无条件运行）。
 #[test]
 fn no_job_has_a_continue_on_error_or_a_top_level_conditional() {
-    let doc = load_workflow();
+    let doc = doc();
     for name in [UNIT_JOB, INTEGRATION_JOB, DENY_JOB] {
         let j = job(&doc, name);
         assert!(
@@ -677,7 +609,7 @@ fn no_job_has_a_continue_on_error_or_a_top_level_conditional() {
 // `if: false`。
 #[test]
 fn no_step_in_any_job_is_silently_disabled_with_if_false() {
-    let doc = load_workflow();
+    let doc = doc();
     for job_name in [UNIT_JOB, INTEGRATION_JOB, DENY_JOB] {
         for step in steps(job(&doc, job_name)) {
             let name = step["name"].as_str().unwrap_or("<unnamed>");
@@ -697,7 +629,7 @@ fn no_step_in_any_job_is_silently_disabled_with_if_false() {
 // 或者把它调得比这里的下限更大。
 #[test]
 fn every_job_has_a_bounded_timeout() {
-    let doc = load_workflow();
+    let doc = doc();
     for (name, at_most) in [(UNIT_JOB, 20), (INTEGRATION_JOB, 30), (DENY_JOB, 10)] {
         let minutes = job(&doc, name)["timeout-minutes"]
             .as_i64()
@@ -713,13 +645,10 @@ fn every_job_has_a_bounded_timeout() {
 // step，一个漏了 name 的 step 会让上面那些查找悄悄绕过它。
 #[test]
 fn every_step_in_every_job_has_a_name() {
-    let doc = load_workflow();
+    let doc = doc();
     for job_name in [UNIT_JOB, INTEGRATION_JOB, DENY_JOB] {
-        for (i, step) in steps(job(&doc, job_name)).iter().enumerate() {
-            assert!(
-                step["name"].as_str().is_some(),
-                "job {job_name} 的第 {i} 个 step 没有 name"
-            );
+        for (i, name) in step_names(job(&doc, job_name)).iter().enumerate() {
+            assert!(name.is_some(), "job {job_name} 的第 {i} 个 step 没有 name");
         }
     }
 }

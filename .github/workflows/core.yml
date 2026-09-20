@@ -20,11 +20,21 @@ name: core
 # "MSRV 1.89 真的够用"这件事就没人在验证。见下面
 # `unit_job_pins_the_toolchain_to_the_documented_msrv` 测试与
 # task-12-report.md。
+#
+# R（Task 12 追加）：`.github/workflows/app.yml` 也在里面，理由是一条
+# 真实的「安静地不跑」：守住 app.yml 的那份测试
+# （`crates/rmc-core/tests/app_workflow.rs`，跟 ci_workflow.rs 共用
+# `tests/workflow_yaml/` 的辅助）跑在 `cargo test -p rmc-core` 里，而
+# `app.yml` 自己的两个 job 跑的是 `-p rmc-win -p rmc-app`——没有这一行，
+# 只改 app.yml 的提交不会触发任何会执行那份守卫测试的工作流。
+# `app_workflow.rs` 的
+# `editing_app_yml_triggers_the_workflow_that_runs_its_guard_test`
+# 钉住这一行。
 on:
   push:
-    paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml"]
+    paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml", ".github/workflows/app.yml"]
   pull_request:
-    paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml"]
+    paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml", ".github/workflows/app.yml"]
 
 jobs:
   # 普通 `cargo test -p rmc-core` 覆盖的部分：格式、clippy（-D

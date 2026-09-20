@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!-- 明确声明不需要管理员权限，避免 UAC 提权提示。
+       方案 §3.9「不需要管理员权限」的实物就是这一段：没有清单时 Windows
+       会对可执行文件做「安装程序检测」启发式（文件名里带 setup/install/
+       update/patch 之类就自动要求提权），rmc.exe 今天碰巧躲得过，但那是
+       靠文件名碰巧，不是靠声明。 -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- PerMonitorV2：winit 启动时也会调 SetProcessDpiAwarenessContext，
+           这里是双保险，而且清单那一份在进程创建时就生效、早于任何 Rust
+           代码。固定 520x720 的窗口在 150% 缩放下够不够放，是人工验收清单
+           「窗口与缩放」那一节的事（W106），不是这一行能解决的。 -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <!-- 日志与诊断包都写在 %LOCALAPPDATA%\rmc 下，域环境里重定向过的
+           用户目录很容易把路径顶过 MAX_PATH。 -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

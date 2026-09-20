@@ -30,6 +30,10 @@
 pub mod diag;
 pub mod form;
 pub mod logs;
+/// Windows 清单嵌入的判断。被 `build.rs` 用 `include!` 引过去——构建脚本
+/// 不是 crate 的一部分，`cargo test` 碰不到它，判断留在那边就是零覆盖，
+/// 而它的失败形态是**静默什么都不做**。理由见该模块文档。
+pub mod manifest_embed;
 pub mod model;
 pub mod remember;
 pub mod theme;

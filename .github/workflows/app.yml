@@ -1,0 +1,142 @@
+name: app
+
+# Task 12——这份工作流要还的债是 W199/W208：**677 条测试里有 395 条 CI
+# 一次都不跑**。`core.yml` 只跑 `cargo test -p rmc-core`，而托盘那 114 行
+# unsafe、整个 DPAPI 封装、SSPI 协商、以及日志页 `monospace_family()` 挑
+# Consolas 的那一档，全都住在 rmc-win / rmc-app 里。
+#
+# 下面的 `windows-build` job 是这 395 条的**唯一出口**：只有在真 Windows
+# 上，`#[cfg(windows)]` 那一大片才会被编译器看一眼，`cargo test -p rmc-win
+# -p rmc-app` 才会把它们跑起来。它同时也关掉 W204——闸门 5（`cargo
+# zigbuild --tests`）只编译、不带 `-D warnings`，`#[must_use]` 与 clippy
+# 对 Win32 代码形同虚设；这里的 `cargo clippy -p rmc-win -p rmc-app
+# --all-targets -- -D warnings` 是 Windows 上**原生**跑的第一道 clippy。
+#
+# 签名**刻意不在这里做**，证书不进仓库：从这个工作流下载 `rmc-portable`
+# 产物，在持有代码签名证书的那台机器上执行
+#   signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /a rmc.exe
+#   signtool verify /pa /v rmc.exe
+#
+# 路径过滤器：`rust-toolchain.toml` 是目录级 override，优先级比下面
+# `dtolnay/rust-toolchain` 那一步高——它才是 CI 实际用的编译器，所以必须
+# 进过滤器（同 core.yml 顶部那段说明）。这份文件自己也在里面。
+#
+# **`deny.toml` 刻意不在这里**：依赖审计由 `core.yml` 的 `deny` job 跑
+# （`EmbarkStudios/cargo-deny-action@v2`，不带 `with:` 即四类全查），它的
+# 过滤器已经覆盖 `crates/**`/`Cargo.toml`/`Cargo.lock`/`deny.toml`——改
+# rmc-app 的任何依赖都会触发它。在这里再跑一遍是纯重复，见
+# task-12-report.md 对 W219 的订正与 `ci_workflow.rs` 的
+# `dependency_audit_triggers_on_every_file_that_can_change_the_dependency_graph`。
+on:
+  push:
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/app.yml"]
+  pull_request:
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/app.yml"]
+
+jobs:
+  # Linux 这一侧跑的是两个 crate 的**平台中立**部分：rmc-win 的纯逻辑层
+  # （proxy::parse、SspiProxyAuthenticator、EventHub、FileSecretStore、
+  # tray 的图标与文本编码）与 rmc-app 的全部（`iced_test` 是无头模拟器，
+  # 不创建窗口）。它挡的是「只在 Windows 上编过、在别处编不过」这类回归，
+  # 也让 PR 在便宜的 runner 上先红一次。
+  #
+  # **没有 apt-get 步骤，这是故意的**（W223）。brief 原文装了
+  # `libxkbcommon-dev libwayland-dev pkg-config`，核过之后三个都不需要：
+  # iced 是 `default-features = false`，0.14 把 x11/wayland 放在 default
+  # 里，所以依赖图里**根本没有 wayland-sys 之类的 -sys crate**；唯一沾边的
+  # `xkbcommon-dl` 是 dlopen 绑定（依赖 `dlib`，没有 build.rs、不链任何
+  # 系统库）；`cargo tree --target x86_64-unknown-linux-gnu` 出来的 228 个
+  # 包里带 `-sys` 的只有 `linux-raw-sys`（纯 Rust）和 `sys-locale`（纯
+  # Rust）。装一堆用不上的系统依赖会让下一个人以为那是必需的。
+  linux-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy -p rmc-win -p rmc-app --all-targets -- -D warnings
+
+      # 外层 timeout 的理由同 core.yml 的单测步骤：这条流水线抓到的第 21 个
+      # 假绿形态是「不是绿，是永不结束」，卡死时要有一条清楚的「超时被杀」，
+      # 而不是干等到 job 级超时、什么诊断都没有。
+      - name: 界面与平台层测试
+        run: timeout 900 cargo test -p rmc-win -p rmc-app
+
+  # 395 条 Windows 专属测试的唯一出口，也是唯一会产出便携包的地方。
+  #
+  # **这个 job 里没有 `timeout` 包装**：runner 的默认 shell 是 pwsh，
+  # 没有 coreutils 的 `timeout`；卡死只能靠 job 级 `timeout-minutes: 35`
+  # 兜住（代价是没有诊断输出）。记在 task-12-report.md 的「交付前还剩
+  # 什么」表里。
+  windows-build:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: clippy
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy -p rmc-win -p rmc-app --all-targets -- -D warnings
+
+      - name: 界面与平台层测试
+        run: cargo test -p rmc-win -p rmc-app
+
+      - name: 构建发布二进制
+        run: cargo build --release -p rmc-app
+
+      # 清单是方案 §3.9「不需要管理员权限」的唯一实物，而 `build.rs` 里那
+      # 两个链接器参数在这台机器上（macOS）一次都没跑过——**这一步是它唯一
+      # 的验证**。
+      #
+      # 不用 brief 原文那句 `Get-Content $exe -Raw -Encoding Byte |
+      # ForEach-Object { [char]$_ }`：`-Encoding Byte` 在 PowerShell 7
+      # （`shell: pwsh` 就是 7）**已经删掉了**，改叫 `-AsByteStream`；
+      # 而且逐字节过 `ForEach-Object` 要对十几 MB 的 exe 跑上几分钟。
+      # `File.ReadAllBytes` + `Encoding.ASCII.GetString` 一遍过。
+      #
+      # 三条正向断言（asInvoker/PerMonitorV2/longPathAware 都得在）配一条
+      # 反向断言（requireAdministrator 不许出现）：只写反向那条的话，
+      # 「清单压根没嵌进去」也是绿的。
+      - name: 确认清单已嵌入
+        shell: pwsh
+        run: |
+          $exe = "target/release/rmc.exe"
+          if (-not (Test-Path $exe)) { throw "没有产出 $exe" }
+          $size = (Get-Item $exe).Length
+          Write-Host "rmc.exe 大小 $([math]::Round($size/1MB,2)) MB"
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+          foreach ($needle in 'asInvoker', 'PerMonitorV2', 'longPathAware') {
+            if (-not $text.Contains($needle)) { throw "rmc.exe 里找不到 $needle：清单没有嵌进去" }
+            Write-Host "清单断言通过：$needle"
+          }
+          if ($text.Contains('requireAdministrator')) { throw "清单里出现了 requireAdministrator" }
+
+      # `if-no-files-found: error` 不能省：默认是 `warn`，exe 没产出时会
+      # 上传一个**空产物**并让这一步变绿——发布的人下载下来才发现是空的。
+      - name: 上传便携包
+        uses: actions/upload-artifact@v4
+        with:
+          name: rmc-portable
+          path: target/release/rmc.exe
+          if-no-files-found: error
