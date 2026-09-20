@@ -214,6 +214,18 @@ fn file_name_for(d: time::OffsetDateTime) -> String {
     )
 }
 
+/// 今天这一份审计日志在 `dir` 下的路径。**不创建任何东西、不碰时钟以外
+/// 的任何状态**。
+///
+/// 存在的理由：日志页（rmc-app）要读的就是这个文件，而它手里只有一个
+/// 目录，没有也不该有一个 [`Audit`] 实例（拿一个只为问路径，会顺带
+/// `create_dir_all` 一次）。写成自由函数之后，"日志叫什么名字"在整个
+/// 产品里仍然只有 [`file_name_for`] 一份——[`Audit::current_path`] 也
+/// 走它，两边不可能漂移。
+pub fn current_path_in(dir: &Path) -> PathBuf {
+    dir.join(file_name_for(today()))
+}
+
 /// 一条日志行的完整文本，含末尾换行。调用方保证 `message` 里已经没有
 /// 换行（见 [`Audit::record`]）。时间戳带显式的 `±HH:MM` 偏移量——
 /// 见模块文档 R87。
@@ -388,6 +400,8 @@ impl Audit {
         Self { dir, clock }
     }
 
+    /// 今天这一份日志的路径。跟 [`current_path_in`] 走同一个
+    /// [`file_name_for`]，区别只在这里用的是本实例可注入的时钟。
     pub fn current_path(&self) -> PathBuf {
         self.dir.join(file_name_for((self.clock)()))
     }

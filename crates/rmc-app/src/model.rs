@@ -40,18 +40,21 @@ pub enum Action {
     ExportDiagnostics,
     /// 诊断页：把检查结果复制到剪贴板。
     CopyDiagnostics,
+    /// 日志页：在文件管理器里打开日志目录。
+    OpenLogDir,
 }
 
 impl Action {
     /// 全部动作。[`action_enabled`] 那张表用它证明自己一格都没漏——
     /// 加一个动作而忘了回答「它什么时候可按」，测试会当场说出漏的是谁。
-    pub const ALL: [Action; 6] = [
+    pub const ALL: [Action; 7] = [
         Action::Start,
         Action::Cancel,
         Action::Stop,
         Action::RetryNow,
         Action::ExportDiagnostics,
         Action::CopyDiagnostics,
+        Action::OpenLogDir,
     ];
 }
 
@@ -127,6 +130,10 @@ impl Model {
                 self.host_key = Some((fingerprint, first_seen));
             }
             TunnelEvent::ConnectedSince(t) => self.connected_since = Some(t),
+            // W152/W173：诊断页那三行的唯一来路。**界面不得自己去查**，
+            // 理由见 [`crate::diag`] 的 W160 一节与 rmc-core 的
+            // [`rmc_core::diagnostic::ProxyObservation`]。
+            TunnelEvent::Proxy(o) => self.proxy = crate::diag::ProxyStatus::observed(&o),
         }
     }
 
@@ -291,9 +298,34 @@ pub fn action_enabled(action: Action, form_ready: bool) -> bool {
         Action::Start => form_ready,
         Action::Cancel | Action::Stop | Action::RetryNow => true,
         // 诊断页那两个**尤其**不能跟表单绑在一起：现场需要导出诊断包的
-        // 时候，恰恰就是表单填不对、连不上的时候。
-        Action::ExportDiagnostics | Action::CopyDiagnostics => true,
+        // 时候，恰恰就是表单填不对、连不上的时候。日志页那个同理。
+        Action::ExportDiagnostics | Action::CopyDiagnostics | Action::OpenLogDir => true,
     }
+}
+
+/// 状态从 `before` 变成 `after` 之后，界面该不该把口令抹掉。
+///
+/// # 为什么是「回到 Idle」而不是「认证失败」
+///
+/// brief 写的是「认证失败时 core 会把状态推回 `Idle`，此时调用
+/// `form.clear_password()`」。照字面做不到：推回来的那条事件是
+/// `State::Idle`，**它不带任何"为什么"**——认证被拒、用户点了停止、
+/// 地址关系校验没过，三条路推上来的是同一个 `Idle`。
+///
+/// 而三条路上 rmc-core 都已经把自己那份凭据丢掉了（`Ctx::stop_everything`
+/// 与认证失败那条出口都清 `ctx.creds`）。所以界面这边留着口令不是"省得
+/// 重新输"——下一次 `Start` 本来就要把口令重新发一遍，留着只是让一份
+/// 明文在内存里多待着，而用户以为它已经没了。
+///
+/// 代价写在这里：**用户点一次「停止」再点「开启」要重新输口令**。这是
+/// 方案 §3.8「默认不保存密码」那条的直接后果，不是疏漏；真要免这一次，
+/// 那是「记住密码」那个勾选框的事（DPAPI，见
+/// [`crate::wiring::Core::secrets`]）。
+///
+/// `before == after == Idle` 时不清：那不是一次状态转移（比如一条迟到的
+/// 重复事件），清了会把用户正在输的口令无端抹掉。
+pub fn should_clear_password(before: &State, after: &State) -> bool {
+    !matches!(before, State::Idle) && matches!(after, State::Idle)
 }
 
 /// 字节数的人读写法。会话列表每条要用两次。
@@ -969,6 +1001,8 @@ mod tests {
             (Action::ExportDiagnostics, false, true),
             (Action::CopyDiagnostics, true, true),
             (Action::CopyDiagnostics, false, true),
+            (Action::OpenLogDir, true, true),
+            (Action::OpenLogDir, false, true),
         ];
         // 数量对而某个动作写了两遍、另一个没写，在这里当场说出漏的是谁。
         for action in Action::ALL {
@@ -987,6 +1021,59 @@ mod tests {
             action_enabled(Action::Start, true),
             action_enabled(Action::Start, false)
         );
+    }
+
+    /// **什么时候抹口令**：只有"从别的状态回到 `Idle`"这一种。
+    ///
+    /// # 改实现的哪一行会让它红
+    ///
+    /// - 去掉 `!matches!(before, State::Idle)`（也就是"收到 Idle 就抹"）
+    ///   → 第一格红：用户正在未开启页上输口令，一条迟到的重复 `Idle`
+    ///   事件会把他输了一半的口令抹掉；
+    /// - 把 `matches!(after, State::Idle)` 换成
+    ///   `matches!(after, State::Failed { .. })` → 中间那几格红，而
+    ///   认证被拒之后口令会一直留在内存里（认证失败走的是 `Idle`，
+    ///   不是 `Failed`，见 `supervisor.rs` 的
+    ///   `auth_failure_returns_to_idle_and_does_not_retry`）。
+    #[test]
+    fn the_password_is_wiped_only_when_the_session_really_ends() {
+        let connected = State::Connected { degraded: false };
+        let failed = State::Failed {
+            class: ErrorClass::Fatal,
+            message: "host key 不一致".into(),
+        };
+        let backoff = State::Backoff {
+            attempt: 1,
+            delay: Duration::from_secs(1),
+        };
+        let cases = [
+            // 不是一次转移：重复的 Idle 不许动用户正在输的口令。
+            (State::Idle, State::Idle, false),
+            // 会话真的结束了（用户点停止 / 认证被拒 / 地址校验没过）。
+            (connected.clone(), State::Idle, true),
+            (State::Connecting, State::Idle, true),
+            (backoff.clone(), State::Idle, true),
+            (State::Stopping, State::Idle, true),
+            (failed.clone(), State::Idle, true),
+            // 会话还活着（或者还在重试），口令必须留着——断线重连要用
+            // 同一份凭据，没有界面能替它再问一遍。
+            (State::Idle, State::Preflight, false),
+            (State::Preflight, State::Connecting, false),
+            (State::Connecting, connected.clone(), false),
+            (connected.clone(), backoff.clone(), false),
+            (backoff, State::Connecting, false),
+            (connected, failed, false),
+        ];
+        for (before, after, want) in cases {
+            assert_eq!(
+                should_clear_password(&before, &after),
+                want,
+                "{before:?} → {after:?}"
+            );
+        }
+        // 反向自证：两格真的都出现过，不是一条恒 true/恒 false 的判断。
+        assert!(should_clear_password(&State::Stopping, &State::Idle));
+        assert!(!should_clear_password(&State::Idle, &State::Idle));
     }
 
     /// 三个量级各钉一格，外加两个边界。brief 那版一个字都没测它。

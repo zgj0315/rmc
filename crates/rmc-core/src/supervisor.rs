@@ -887,6 +887,9 @@ async fn run(
     initial: Option<(String, Zeroizing<String>, ValidatedAddresses)>,
 ) {
     let mut sys = deps.events.subscribe();
+    // W82/W94：事件源关掉之后就不要再 poll 它了，见下面 `sys.recv()`
+    // 那条分支上的说明。
+    let mut sys_open = true;
     let jitter = deps.jitter;
     // 审计日志目录初始化失败（权限、磁盘）不是 Fatal——不能因为记不下
     // 日志就拒绝启动整个 Supervisor，那样"一次正在进行的维护会话"甚至
@@ -1107,7 +1110,34 @@ async fn run(
                 handle_msg(&mut ctx, msg, &mut probe_at, &mut connect_rx, &pending_handle).await;
             }
 
-            Ok(event) = sys.recv() => {
+            // W82/W94：**不能写成 `Ok(event) = sys.recv()`**。broadcast 的
+            // `Err(Lagged)` 与 `Err(Closed)` 都不匹配那个模式，于是被静默
+            // 跳过、零日志——EventHub 一旦被 drop，系统事件从此永久停摆，
+            // 「唤醒立刻重连」静默退化成「等满退避」，而没有任何地方会说
+            // 一句。分类本身在 [`classify_system_event`]（纯函数，有表）。
+            //
+            // `sys_open` 这个 guard 不是可选的：`Closed` 之后 `recv()` 会
+            // **立刻**返回 `Err(Closed)`，没有它这条分支会变成一个满速
+            // 空转的忙循环——那不是"绿"，是烧着一个核什么也不干。
+            received = sys.recv(), if sys_open => {
+                match classify_system_event(received) {
+                    SystemEventInput::Closed => {
+                        sys_open = false;
+                        tracing::warn!("系统事件源已关闭，唤醒与切网之后不再立即重连");
+                        ctx.audit.record(Level::Warn, SYSTEM_EVENTS_CLOSED);
+                    }
+                    SystemEventInput::Lagged(missed) => {
+                        // 积压意味着**真的漏掉了**若干条唤醒/切网通知。
+                        // 不致命（下一条照样收得到，退避序列也还在跑），
+                        // 但必须说一句——它是"事件源的节奏比我们快"的
+                        // 唯一征兆。
+                        tracing::warn!(missed, "系统事件积压，漏掉了若干条唤醒/网络变化通知");
+                        ctx.audit.record(
+                            Level::Warn,
+                            &format!("系统事件积压，漏掉了 {missed} 条唤醒或网络变化通知"),
+                        );
+                    }
+                    SystemEventInput::Event(event) => {
                 // 网络变化与休眠恢复都清零退避并立刻重试。
                 //
                 // R75：准入判断也改看同步字段，不看 `ctx.state`——原来
@@ -1129,6 +1159,8 @@ async fn run(
                         msg_rx = new_msg_rx;
                         connect_rx = new_connect_rx;
                         pending_handle = new_pending_handle;
+                    }
+                }
                     }
                 }
             }
@@ -1174,6 +1206,10 @@ fn handle_connect_event(ctx: &mut Ctx, event: ConnectEvent, pending_handle: &Pen
         ConnectEvent::EnteredPreflight => ctx.set_state(State::Preflight),
         ConnectEvent::PreflightReport(report) => {
             let _ = ctx.ev.send(TunnelEvent::Preflight(report));
+            // W173：界面要显示的代理只有这一条来路。预检的第四步刚刚用
+            // `Transport::connect` 真的拨过一次号，这时 `last_proxy()`
+            // 说的就是"这条链路实际走的那一跳"。
+            emit_proxy(ctx);
         }
         ConnectEvent::PreflightFailed { class, message } => {
             ctx.connect_task = None;
@@ -1194,12 +1230,85 @@ fn handle_connect_event(ctx: &mut Ctx, event: ConnectEvent, pending_handle: &Pen
             ctx.port_busy_attempt = 0;
             ctx.backoff.reset();
             let _ = ctx.ev.send(TunnelEvent::ConnectedSince(SystemTime::now()));
+            // 建隧道那一次拨号可能跟预检那一次走了不同的跳（系统代理配置
+            // 在这几秒里变过，或者预检压根没跑）。再送一次，界面上画的
+            // 永远是最后一次真的走过的那一跳。
+            emit_proxy(ctx);
             ctx.set_state(State::Connected { degraded: false });
         }
         ConnectEvent::Failed(e) => {
             ctx.connect_task = None;
+            // 失败这一刻**尤其**要送：现场工程师要看的正是"这次到底经没
+            // 经过代理、代理认证谈成什么样"。
+            emit_proxy(ctx);
             schedule_retry(ctx, e);
         }
+    }
+}
+
+/// 把「这次连接实际经过了什么」送给界面。
+///
+/// # W173：这是界面上那三行代理信息的唯一来路
+///
+/// rmc-app 侧有一道源码扫描（`diag.rs` 的
+/// `this_crate_never_polls_the_transport_for_the_current_proxy`）把
+/// 「界面自己去查 `Transport::effective_proxy`」整条路封死了，理由见
+/// [`crate::diagnostic::ProxyObservation`] 与 rmc-win 的
+/// `ProxyEndpointRecorder`：界面每重画一帧查一次，会在一次协商进行到
+/// 一半时改写协商器拼 SPN 用的那一格，而没有任何测试会因此变红。
+///
+/// `last_proxy()` 是**读记录，不发起解析**，所以这里可以放心地每次连接
+/// 都调一遍。返回 `None` 只在"这个进程还一次都没连过"时出现——那时候
+/// 没有任何真话可说，不送事件。
+fn emit_proxy(ctx: &Ctx) {
+    if let Some(observation) = ctx.deps.transport.last_proxy() {
+        let _ = ctx.ev.send(TunnelEvent::Proxy(observation));
+    }
+}
+
+/// 事件源关掉时写进审计日志（也就是日志页）的那一行。
+///
+/// 提成常量是为了让测试能逐字比对——它是 W82/W94 那条"静默停摆"唯一
+/// 会留下的痕迹，测试写一份、实现写一份的话，改一个字就再也对不上了。
+pub const SYSTEM_EVENTS_CLOSED: &str =
+    "系统事件源已关闭：从睡眠唤醒或切换网络之后不会再立即重连，只按退避序列重试";
+
+/// `sys.recv()` 这一次到底拿到了什么。
+///
+/// # W82/W94：`Ok(event) = sys.recv()` 把两种失败都吃掉了
+///
+/// `tokio::sync::broadcast` 的 `recv()` 有三种结局，而 `select!` 里的
+/// `Ok(event) = ...` 只接住其中一种；另外两种不匹配模式，`select!` 会
+/// **静默地禁用这条分支再重新 poll**，一行日志都没有：
+///
+/// - `Err(Lagged(n))`：事件来得比我们处理得快，**真的漏掉了 n 条**
+///   唤醒/切网通知；
+/// - `Err(Closed)`：所有发送端都没了（`EventHub` 被 drop）。此后系统
+///   事件**永久停摆**，「唤醒立刻重连」静默退化成「等满退避」。
+///
+/// 两种都不是致命的，但两种都必须被说出来。把这个判断做成一个不碰
+/// `select!`、不碰 `Ctx` 的纯函数，是为了让它在 macOS 上被表驱动测试
+/// 逐格钉住——`select!` 分支体里的东西一条测试都看不见。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemEventInput {
+    /// 收到了一条事件。
+    Event(SystemEvent),
+    /// 积压丢了 `n` 条。事件源还活着，下一条照样收得到。
+    Lagged(u64),
+    /// 事件源没了，此后不会再有任何事件。
+    Closed,
+}
+
+/// 把 `broadcast::Receiver::recv()` 的三种结局分类。**穷尽 match，没有
+/// 兜底分支**：`RecvError` 将来多一个变体会在这里编译不过，而不是被
+/// 悄悄吃掉。
+pub fn classify_system_event(
+    received: std::result::Result<SystemEvent, broadcast::error::RecvError>,
+) -> SystemEventInput {
+    match received {
+        Ok(event) => SystemEventInput::Event(event),
+        Err(broadcast::error::RecvError::Lagged(missed)) => SystemEventInput::Lagged(missed),
+        Err(broadcast::error::RecvError::Closed) => SystemEventInput::Closed,
     }
 }
 
@@ -1672,17 +1781,46 @@ mod tests {
     }
 
     fn deps(factory: Arc<dyn TunnelFactory>, events: Arc<dyn SystemEvents>) -> Deps {
-        Deps {
+        deps_with_transport(
             factory,
-            transport: Arc::new(Transport::new(
+            events,
+            Arc::new(Transport::new(
                 Arc::new(NoProxy),
                 Arc::new(NoProxyAuth),
                 TlsRoots::webpki(),
             )),
+        )
+    }
+
+    /// W173：同一份 `Deps`，但 `Transport` 由调用方给——测试要在 Supervisor
+    /// 起来之前先让它记下"这条链路走的是哪一跳"。
+    fn deps_with_transport(
+        factory: Arc<dyn TunnelFactory>,
+        events: Arc<dyn SystemEvents>,
+        transport: Arc<Transport>,
+    ) -> Deps {
+        Deps {
+            factory,
+            transport,
             preflight: Arc::new(AlwaysPassPreflight),
             events,
             jitter: || Box::new(FixedJitter(1.0)),
         }
+    }
+
+    /// 一次性的审计日志目录，跑完不清理（靠系统温度清理，同
+    /// `test_log_dir` 的惯例）。要单独读回日志内容的测试用它，不跟别的
+    /// 测试共用一份文件。
+    fn private_log_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rmc-audit-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn start() -> Command {
@@ -4254,5 +4392,216 @@ mod tests {
             message: "账号或口令不正确".into()
         })
         .contains('{'));
+    }
+
+    // =================================================================
+    // W82/W94：系统事件源的三种结局，一种都不许被静默吃掉
+    // =================================================================
+
+    /// 事件源**自己不持有发送端**：`subscribe()` 给出的接收端，其发送端
+    /// 归测试所有。
+    ///
+    /// 为什么不能用 [`ManualEvents`] 来做这条测试：`Deps.events` 是
+    /// `Arc<dyn SystemEvents>`，Supervisor 把它一直拿到自己结束，而
+    /// `ManualEvents` 内部就装着发送端——外面再怎么 drop，发送端都还
+    /// 活着，`Closed` 永远到不了。**这同时也是一条实情**：按本轮
+    /// `rmc_app::wiring` 那样把 `EventHub` 交给 `Deps`，`Closed` 在生产
+    /// 路径上今天不可达（可达的是 `Lagged`，见 rmc-win 的
+    /// `EVENT_CHANNEL_CAPACITY`）。这个假实现刻画的是另一种合法形状：
+    /// 发事件的那一方（比如注册电源回调的那个线程）先走了。
+    struct BorrowedEvents(broadcast::Receiver<SystemEvent>);
+
+    impl SystemEvents for BorrowedEvents {
+        fn subscribe(&self) -> broadcast::Receiver<SystemEvent> {
+            self.0.resubscribe()
+        }
+    }
+
+    /// `classify_system_event` 的三格。**穷尽**：`RecvError` 只有两个
+    /// 变体，加上 `Ok` 正好三格。
+    ///
+    /// # 改实现的哪一行会让它红
+    ///
+    /// 把 `Err(Lagged(n))` 那一支写成 `SystemEventInput::Closed`
+    /// （也就是"积压等于关闭"）→ 第二格红；把 `Err(Closed)` 写成
+    /// `Lagged(0)` → 第三格红。
+    #[test]
+    fn every_recv_outcome_is_classified_into_its_own_bucket() {
+        use broadcast::error::RecvError;
+        assert_eq!(
+            classify_system_event(Ok(SystemEvent::ResumedFromSleep)),
+            SystemEventInput::Event(SystemEvent::ResumedFromSleep)
+        );
+        assert_eq!(
+            classify_system_event(Ok(SystemEvent::NetworkChanged)),
+            SystemEventInput::Event(SystemEvent::NetworkChanged)
+        );
+        assert_eq!(
+            classify_system_event(Err(RecvError::Lagged(7))),
+            SystemEventInput::Lagged(7)
+        );
+        assert_eq!(
+            classify_system_event(Err(RecvError::Closed)),
+            SystemEventInput::Closed
+        );
+        // 三格两两不同，上面的表不能靠"三行填同一个值"糊过去。
+        let mut seen = std::collections::BTreeSet::new();
+        for got in [
+            classify_system_event(Ok(SystemEvent::NetworkChanged)),
+            classify_system_event(Err(RecvError::Lagged(1))),
+            classify_system_event(Err(RecvError::Closed)),
+        ] {
+            seen.insert(format!("{got:?}"));
+        }
+        assert_eq!(seen.len(), 3, "{seen:?}");
+    }
+
+    /// **事件源被 drop 之后，日志里恰好留下一行，而且只留一行。**
+    ///
+    /// 这条同时钉住 W82/W94 的两头：
+    ///
+    /// - **至少一行**：原来的 `Ok(event) = sys.recv()` 把 `Err(Closed)`
+    ///   静默跳过，零日志。EventHub 一旦被 drop，「唤醒立刻重连」永久
+    ///   退化成「等满退避」，而没有任何地方会说一句。改回那种写法，
+    ///   `contains` 那条当场红。
+    /// - **至多一行**：`Closed` 之后 `recv()` 会立刻返回，没有 `sys_open`
+    ///   这个 guard 就是一个满速空转的忙循环。删掉 guard（或者把
+    ///   `sys_open = false` 那一行删掉），这条测试不会"变绿得更久"——
+    ///   它会因为日志里出现成千上万行而红。**这正是本项目抓到的第 21 个
+    ///   形状（不是绿，是永不结束）的反制**：不靠"跑得慢"去察觉忙循环，
+    ///   靠一个数得出来的痕迹。
+    ///
+    /// 用真实时钟（不加 `start_paused`）：虚拟时钟下 `tokio::time::sleep`
+    /// 会瞬间跳过去，忙循环根本来不及转出第二行。
+    #[tokio::test]
+    async fn a_closed_system_event_source_is_logged_exactly_once() {
+        guard(async {
+            let dir = private_log_dir("sysclosed");
+            let mut cfg = config();
+            cfg.log_dir = dir.clone();
+
+            let (hub, rx0) = broadcast::channel(8);
+            let events = Arc::new(BorrowedEvents(rx0));
+            let (factory, _calls) = Scripted::new(vec![]);
+            let (tx, _rx) = Supervisor::spawn(cfg, deps(factory, events));
+
+            // 反向自证：事件源还活着的时候，日志里没有这一行。
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let before =
+                std::fs::read_to_string(crate::audit::current_path_in(&dir)).unwrap_or_default();
+            assert!(
+                !before.contains(SYSTEM_EVENTS_CLOSED),
+                "事件源还活着就报了关闭：{before}"
+            );
+
+            // 把唯一的发送端丢掉。
+            drop(hub);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let text =
+                std::fs::read_to_string(crate::audit::current_path_in(&dir)).unwrap_or_default();
+            let hits = text.matches(SYSTEM_EVENTS_CLOSED).count();
+            assert_eq!(
+                hits, 1,
+                "事件源关闭这件事要么没留痕（W82/W94 的静默停摆），\
+                 要么留了 {hits} 行（`sys_open` 这个 guard 没了，分支在空转）：\n{text}"
+            );
+
+            // 事件源没了，Supervisor 本身还得活着、还得听命令。
+            assert!(tx.send(Command::Stop).await.is_ok(), "Supervisor 已经死了");
+        })
+        .await;
+    }
+
+    // =================================================================
+    // W173：代理由内核送上来
+    // =================================================================
+
+    /// 固定答案的假代理解析器。
+    struct FixedProxy(Option<HostPort>);
+
+    #[async_trait::async_trait]
+    impl crate::platform::ProxyResolver for FixedProxy {
+        async fn resolve(&self, _target: &HostPort) -> Option<HostPort> {
+            self.0.clone()
+        }
+    }
+
+    /// **Supervisor 真的把「这次走了哪一跳」送给界面。**
+    ///
+    /// 断的是哪一根线：`Transport::last_proxy()` 有自己的单测
+    /// （`transport::tests`），rmc-app 那边 `Model::apply` 处理
+    /// `TunnelEvent::Proxy` 也有单测，**中间这一段没人守**——就是
+    /// `handle_connect_event` 里那三处 `emit_proxy(ctx)`。删掉它们，
+    /// 诊断页那三行在真实运行里一行都不会出现（W152 记的就是这件事），
+    /// 而在这条测试之前没有任何闸门会红。
+    ///
+    /// 测试先自己拨一次号把 `Transport` 的记录做出来（真实建连在这台
+    /// 机器上跑不起来），再让 Supervisor 跑一轮。
+    #[tokio::test]
+    async fn the_supervisor_tells_the_ui_which_hop_the_connection_took() {
+        guard(async {
+            // 一个绑上就立刻关掉的端口：拨过去必然瞬间被拒，不碰 DNS、
+            // 不碰真实网络。
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy: HostPort = listener.local_addr().unwrap().to_string().parse().unwrap();
+            drop(listener);
+
+            let transport = Arc::new(Transport::new(
+                Arc::new(FixedProxy(Some(proxy.clone()))),
+                Arc::new(NoProxyAuth),
+                TlsRoots::webpki(),
+            ));
+            // 反向自证：还没拨过号时没有任何记录，下面收到的事件不可能
+            // 是"恰好有个默认值"。
+            assert!(transport.last_proxy().is_none());
+            let _ = transport
+                .connect(&"ops.example.com:443".parse().unwrap())
+                .await;
+            assert!(transport.last_proxy().is_some(), "拨号之后该有记录");
+
+            let (factory, _calls) = Scripted::new(vec![Outcome::Err(Error::AuthRejected)]);
+            let (tx, mut rx) = Supervisor::spawn(
+                config(),
+                deps_with_transport(factory, Arc::new(NoSystemEvents::default()), transport),
+            );
+            tx.send(start()).await.unwrap();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut seen = Vec::new();
+            let got = loop {
+                if tokio::time::Instant::now() > deadline {
+                    panic!("没等到 TunnelEvent::Proxy，已见：{seen:?}");
+                }
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                    Ok(Ok(TunnelEvent::Proxy(o))) => break o,
+                    Ok(Ok(other)) => seen.push(format!("{other:?}")),
+                    Ok(Err(e)) => panic!("事件通道异常：{e}"),
+                    Err(_) => panic!("等 TunnelEvent::Proxy 超时，已见：{seen:?}"),
+                }
+            };
+
+            match got {
+                crate::diagnostic::ProxyObservation::Via {
+                    endpoint,
+                    connect,
+                    auth,
+                } => {
+                    assert_eq!(endpoint, proxy, "送上来的不是这条链路实际走的那台代理");
+                    assert_eq!(
+                        connect,
+                        crate::diagnostic::ConnectOutcome::Failed,
+                        "端口是关的，CONNECT 不可能建立"
+                    );
+                    assert_eq!(
+                        auth,
+                        crate::diagnostic::ProxyAuthSummary::NotAttempted,
+                        "NoProxyAuth 没被要求过认证"
+                    );
+                }
+                other => panic!("这条链路明明经过了代理：{other:?}"),
+            }
+        })
+        .await;
     }
 }

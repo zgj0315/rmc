@@ -64,6 +64,18 @@ pub mod color {
     /// 比 [`FAILED`]（`#c42b1c`，画在图标与红字提示上）更深一点——一整行
     /// 正文要压在淡底上，对比度不够会糊。
     pub const ROW_FAIL_TEXT: Color = rgb(0xa4, 0x26, 0x2c);
+
+    /// 日志页上警告那一行的底色。画板 `design/body-Logs.html` 写的就是
+    /// 这个值。
+    ///
+    /// 跟 `tint(BACKOFF)`（`#f7f2eb`）**不是一个颜色**，跟诊断页那条
+    /// `ROW_FAIL_BG` 的处境一样：画板各自定过，合并等于单方面改画板。
+    pub const ROW_WARN_BG: Color = rgb(0xfd, 0xf9, 0xea);
+    /// 日志页上警告那一行的文字色。画板同上。
+    pub const ROW_WARN_TEXT: Color = rgb(0x6b, 0x4a, 0x00);
+    /// 日志页左边那一列时间戳的颜色。画板同上——比 [`TEXT_SUB`] 再淡
+    /// 一点，200 行时间戳不该跟正文抢眼睛。
+    pub const LOG_TIME: Color = rgb(0x9a, 0x9a, 0x9a);
 }
 
 /// 状态卡的浅色底：把状态色按 [`TINT_ALPHA`] 的比例叠在白底上。
@@ -148,6 +160,76 @@ pub fn row_palette(verdict: Verdict) -> RowPalette {
             background: None,
             text: color::IDLE,
         },
+    }
+}
+
+/// 日志页上一行的取色。
+///
+/// 三样东西各有各的颜色，画板上就是这么画的：左边那列时间戳恒定是
+/// [`color::LOG_TIME`]（不在这个结构里，三种等级下都一样），中间的等级
+/// 标签、右边的正文、以及整行的底色跟着等级走。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogRowPalette {
+    /// 整行的底色。`None` 表示压在卡片的白底上。
+    pub background: Option<Color>,
+    /// 中间那一列等级标签（`INFO`/`WARN`/`ERROR`）。
+    pub tag: Color,
+    /// 右边的正文。
+    pub text: Color,
+}
+
+/// 日志页一行按等级取色。
+///
+/// W143 / crate 级约定：这是判断，不许留在 `view::logs` 里——留在那里
+/// 就没有任何东西看得见它（`iced_test` 的选择器只能看到文本、id 与
+/// bounds，**看不到任何样式**）。表驱动三格在下面，而「算出来的颜色真的
+/// 进了控件」由 `view/logs.rs` 自己的差分快照守（W146）。
+pub fn log_row_palette(level: crate::logs::LogLevel) -> LogRowPalette {
+    use crate::logs::LogLevel;
+    match level {
+        // 信息占九成以上，一行一行全是底色反而看不出重点。
+        LogLevel::Info => LogRowPalette {
+            background: None,
+            tag: color::IDLE,
+            text: color::TEXT,
+        },
+        LogLevel::Warn => LogRowPalette {
+            background: Some(color::ROW_WARN_BG),
+            tag: color::BACKOFF,
+            text: color::ROW_WARN_TEXT,
+        },
+        LogLevel::Error => LogRowPalette {
+            background: Some(color::ROW_FAIL_BG),
+            tag: color::FAILED,
+            text: color::ROW_FAIL_TEXT,
+        },
+    }
+}
+
+/// 筛选标签（那四个胶囊）的取色。
+///
+/// 同上：判断在这里，视图只摆控件。选中的那个是实心强调色配白字，
+/// 其余是白底配灰边——画板 `design/body-Logs.html` 上就是这么画的。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChipPalette {
+    pub background: Color,
+    pub border: Color,
+    pub text: Color,
+}
+
+pub fn chip_style(is_active: bool) -> ChipPalette {
+    if is_active {
+        ChipPalette {
+            background: color::ACCENT,
+            border: color::ACCENT,
+            text: color::CARD,
+        }
+    } else {
+        ChipPalette {
+            background: color::CARD,
+            border: color::BORDER,
+            text: color::TEXT,
+        }
     }
 }
 
@@ -250,6 +332,70 @@ mod tests {
         assert_eq!(
             row_palette(Verdict::Fail).background.map(to_hex),
             Some("#fdf2f1".to_string())
+        );
+    }
+
+    /// 日志页那三个颜色也钉住十六进制值，跟画板对得上。
+    #[test]
+    fn log_row_colors_match_the_approved_palette() {
+        assert_eq!(to_hex(color::ROW_WARN_BG), "#fdf9ea");
+        assert_eq!(to_hex(color::ROW_WARN_TEXT), "#6b4a00");
+        assert_eq!(to_hex(color::LOG_TIME), "#9a9a9a");
+    }
+
+    /// 三个等级各取自己的色，**而且两两不同**。
+    ///
+    /// # 改实现的哪一行会让它红
+    ///
+    /// - 把 `Warn` 与 `Error` 两支的 `background` 对调（复制粘贴最容易
+    ///   犯的错，而且对调之后界面照样"有颜色"）→「警告用的是警告底色」
+    ///   那一格红；
+    /// - 给 `Info` 配上任何一个底色 → 只有警告与错误有底色那条红；
+    /// - 把 `Error` 的 `text` 改成 `TEXT` → 三格两两不同那条红。
+    #[test]
+    fn every_log_level_takes_its_own_row_colors() {
+        use crate::logs::LogLevel;
+        let cases = [
+            (LogLevel::Info, None, color::IDLE, color::TEXT),
+            (
+                LogLevel::Warn,
+                Some(color::ROW_WARN_BG),
+                color::BACKOFF,
+                color::ROW_WARN_TEXT,
+            ),
+            (
+                LogLevel::Error,
+                Some(color::ROW_FAIL_BG),
+                color::FAILED,
+                color::ROW_FAIL_TEXT,
+            ),
+        ];
+        assert_eq!(cases.len(), LogLevel::COUNT, "表里漏了一个等级");
+        let mut seen = std::collections::BTreeSet::new();
+        for (level, bg, tag, text) in cases {
+            let p = log_row_palette(level);
+            assert_eq!(p.background.map(to_hex), bg.map(to_hex), "{level:?} 的底色");
+            assert_eq!(to_hex(p.tag), to_hex(tag), "{level:?} 的等级标签色");
+            assert_eq!(to_hex(p.text), to_hex(text), "{level:?} 的正文色");
+            seen.insert((p.background.map(to_hex), to_hex(p.tag), to_hex(p.text)));
+        }
+        assert_eq!(seen.len(), 3, "三个等级里有两个长得一模一样：{seen:?}");
+    }
+
+    /// 选中的胶囊跟没选中的必须真的不同。
+    #[test]
+    fn chip_style_marks_only_the_active_chip() {
+        assert_ne!(chip_style(true), chip_style(false));
+        // 选中的是实心强调色配白字——白底配白字会让那一格整个看不见。
+        assert_eq!(to_hex(chip_style(true).background), to_hex(color::ACCENT));
+        assert_ne!(
+            to_hex(chip_style(true).background),
+            to_hex(chip_style(true).text),
+            "选中的胶囊底色与文字色撞了，那一格会是空白"
+        );
+        assert_ne!(
+            to_hex(chip_style(false).background),
+            to_hex(chip_style(false).text)
         );
     }
 

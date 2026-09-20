@@ -12,6 +12,7 @@ use iced::{Border, Element, Length};
 
 pub mod chrome;
 pub mod diagnostics;
+pub mod logs;
 pub mod maintain;
 
 /// 分组小标题。

@@ -6,6 +6,7 @@
 //! 可选项。
 
 use crate::addr::HostPort;
+use crate::diagnostic::ProxyAuthSummary;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use zeroize::Zeroizing;
@@ -90,6 +91,26 @@ pub trait ProxyAuthenticator: Send + Sync {
     async fn begin_connection(&self);
 
     async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>>;
+
+    /// 最近一次协商的结局，**平台中立**，供诊断页显示。
+    ///
+    /// # 为什么这条在 trait 上（W173）
+    ///
+    /// 诊断页「代理认证」那一行的内容只有协商器自己知道（rmc-win 的
+    /// `SspiProxyAuthenticator::last_outcome`），而界面**不许**去碰
+    /// 协商器——它连 rmc-win 这个类型都不认识（见
+    /// [`crate::diagnostic`] 的 W158 一节）。这条方法是那句话上到
+    /// [`crate::state::TunnelEvent::Proxy`] 的唯一一条路。
+    ///
+    /// **按设计不带任何一段 token**：[`ProxyAuthSummary`] 的每一个变体
+    /// 都只有包名、轮次与状态说明，这一点由 rmc-win 的
+    /// `no_auth_outcome_or_line_leaks_a_token` 守着。
+    ///
+    /// 默认实现返回「没被要求过认证」——不做协商的实现
+    /// （[`NoProxyAuth`]）照这个语义就是对的。
+    fn auth_summary(&self) -> ProxyAuthSummary {
+        ProxyAuthSummary::NotAttempted
+    }
 }
 
 /// 系统事件。收到后 Supervisor（Task 10）清零退避计时并立即重连——

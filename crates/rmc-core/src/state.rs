@@ -5,6 +5,7 @@
 //! [`Command`]，不直接持有或修改 [`State`]。
 
 use crate::addr::HostPort;
+use crate::diagnostic::ProxyObservation;
 use crate::error::ErrorClass;
 use crate::preflight::PreflightReport;
 use std::time::{Duration, SystemTime};
@@ -97,6 +98,13 @@ pub enum TunnelEvent {
         first_seen: bool,
     },
     ConnectedSince(SystemTime),
+    /// 这次连接实际经过了什么：直连，还是某一台代理。
+    ///
+    /// **W173：界面要显示的代理只有这一条来路。** rmc-app 侧有一道源码
+    /// 扫描（`this_crate_never_polls_the_transport_for_the_current_proxy`）
+    /// 把「界面自己去查 `Transport::effective_proxy`」整条路封死了，理由
+    /// 见 [`crate::diagnostic::ProxyObservation`]。
+    Proxy(ProxyObservation),
 }
 
 #[cfg(test)]

@@ -29,13 +29,20 @@
 
 pub mod diag;
 pub mod form;
+pub mod logs;
 pub mod model;
 pub mod theme;
 pub mod view;
+pub mod wiring;
 
 use form::Form;
-use model::Model;
+use logs::{LogFilter, LogTail};
+use model::{Action, Model};
+use rmc_core::state::{Command, TunnelEvent};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 use theme::{Tab, WINDOW_SIZE};
+use wiring::Core;
 use zeroize::Zeroizing;
 
 /// 窗口标题，也是标题栏里画的那行字。
@@ -130,13 +137,69 @@ pub fn window_settings() -> iced::window::Settings {
 /// `p.title(..)`，要走泛型参数 `P: iced::Program<..>`（见 `tests`）——
 /// 完全限定写法要先给 `Application<impl Program<..>>` 起类型别名，
 /// 而那在 1.89 上是 `error[E0658]: impl Trait in type aliases is unstable`。
-pub fn program() -> iced::application::Application<
+pub fn program(
+    core: Option<Core>,
+) -> iced::application::Application<
     impl iced::Program<State = App, Message = Message, Theme = iced::Theme>,
 > {
-    iced::application(App::default, App::update, App::view)
+    iced::application(move || App::with_core(core.clone()), App::update, App::view)
         .title(WINDOW_TITLE)
         .theme(APP_THEME)
         .window(window_settings())
+        // W150：brief 的 `Message::Tick` 被 Task 8 静默丢掉了，后果是
+        // 「已连接 HH:MM:SS」不会自己走字。这一行是它回来的地方，另一半
+        // 在 [`subscription`]。
+        .subscription(subscription)
+}
+
+/// 每秒一跳。计时器与日志刷新都跟着它。
+///
+/// 一秒是「已连接时长」那个 `HH:MM:SS` 的最小刻度定的——再慢秒数会跳，
+/// 再快是白烧电。
+pub const TICK: Duration = Duration::from_secs(1);
+
+/// 这一轮要订阅什么。
+///
+/// 两条：每秒一跳的 [`TICK`]，以及内核推上来的那条事件流。
+///
+/// **不看 `state`**：两条订阅在任何页签、任何状态下都该活着。日志页不在
+/// 前台时也要收事件（状态卡在维护页上），计时器不在 `Connected` 时也要
+/// 跳（`Model::elapsed` 自己会在别的状态下返回 `None`）。按状态开关订阅
+/// 是 iced 里最容易写出"某个状态下界面就不动了"的地方。
+pub fn subscription(_state: &App) -> iced::Subscription<Message> {
+    iced::Subscription::batch([
+        iced::time::every(TICK).map(tick_message),
+        iced::Subscription::run(core_events),
+    ])
+}
+
+/// 每一跳变成一条 [`Message::Tick`]。
+///
+/// 写成具名函数而不是闭包 `|_| Message::Tick`，是为了让这条订阅**可以
+/// 被认出来**：`Subscription::map` 的 recipe 把映射函数的 `TypeId` 拌进
+/// 哈希里，而每一处闭包字面量都是一个**独立的匿名类型**——测试里另写
+/// 一个 `|_| Message::Tick` 算出来的哈希跟这里的对不上，那条
+/// 「Tick 真的被订阅了」就只能退化成数个数。见
+/// [`tests::the_ui_subscribes_to_a_one_second_tick_and_to_the_core_events`]。
+fn tick_message(_now: std::time::Instant) -> Message {
+    Message::Tick
+}
+
+/// 内核事件 → 界面消息。
+///
+/// 函数指针，不是闭包：`Subscription::run` 收的就是 `fn() -> impl
+/// Stream`（订阅身份要能跨帧被认出来）。事件源从哪儿来见
+/// [`wiring::subscribe_installed`] 上那段关于"为什么这里必须有一个
+/// 全局"的说明。
+fn core_events() -> iced::futures::stream::BoxStream<'static, Message> {
+    use iced::futures::StreamExt;
+    match wiring::subscribe_installed() {
+        Some(rx) => wiring::events_into(rx, Message::CoreEvent).boxed(),
+        // 没有内核（测试、或者装配失败）：一条永远不出东西、也永远不
+        // 结束的流。**不是空流**——iced 对自己结束的订阅会打一行警告，
+        // 而"没有内核"不是异常，是一个合法的状态。
+        None => iced::futures::stream::pending().boxed(),
+    }
 }
 
 /// 界面消息。
@@ -164,6 +227,12 @@ pub enum Message {
     RememberToggled(bool),
     ActionPressed(model::Action),
     DisconnectSession(u64),
+    /// W150：每秒一跳。「已连接 HH:MM:SS」靠它走字，日志页靠它刷新。
+    Tick,
+    /// 内核推上来的一条事件。
+    CoreEvent(TunnelEvent),
+    LogFilterSelected(LogFilter),
+    LogQueryChanged(String),
 }
 
 impl std::fmt::Debug for Message {
@@ -199,6 +268,10 @@ impl std::fmt::Debug for Message {
             Message::RememberToggled(v) => plain!(RememberToggled, v),
             Message::ActionPressed(v) => plain!(ActionPressed, v),
             Message::DisconnectSession(v) => plain!(DisconnectSession, v),
+            Message::Tick => f.write_str(stringify!(Tick)),
+            Message::CoreEvent(v) => plain!(CoreEvent, v),
+            Message::LogFilterSelected(v) => plain!(LogFilterSelected, v),
+            Message::LogQueryChanged(v) => plain!(LogQueryChanged, v),
         }
     }
 }
@@ -210,9 +283,25 @@ impl std::fmt::Debug for Message {
 #[derive(Debug)]
 pub struct App {
     tab: Tab,
-    /// 视图模型。Task 10 把 `TunnelEvent` 接进来之后由 [`App::apply`] 推进。
+    /// 视图模型。由 [`App::apply`] 按内核推上来的事件推进。
     model: Model,
     form: Form,
+    /// 现在几点。**由 [`Message::Tick`] 推进，不是 `view` 里现取**
+    /// （W150）——现取的话「已连接 HH:MM:SS」只在别的消息顺带触发重画时
+    /// 才动一下，看起来就是一个偶尔跳一大格的计时器。
+    now: SystemTime,
+    /// 日志页读到的那一份。三种结局各说各的话，见 [`logs::LogTail`]。
+    log_tail: LogTail,
+    log_filter: LogFilter,
+    log_query: String,
+    /// 底部那行字里的文件名。跟着 [`Self::reload_logs`] 一起更新——
+    /// 日志按天滚动，跨过零点之后读的是另一个文件，这行字得跟上。
+    log_file_name: String,
+    /// 通往内核的那根线。`None` 表示没接上（测试，或者装配失败）——
+    /// 此时界面照常能画、按钮照常点得动，只是命令发不出去。
+    core: Option<Core>,
+    /// 上一次导出的诊断包落在哪儿。
+    last_export: Option<PathBuf>,
     /// 诊断页底部那行环境信息。
     ///
     /// 算一次存着，不是每帧调一次 [`diag::environment_line`]：`view` 要
@@ -229,14 +318,152 @@ impl Default for App {
             model: Model::default(),
             form: Form::default(),
             environment: diag::environment_line(),
+            now: SystemTime::now(),
+            // **不在这里读文件**：`Default` 应当是纯的，而且测试里的
+            // `App::default()` 不该去摸开发机上的 `~/.rmc`。真正的第一次
+            // 读在 [`App::with_core`] 与每一跳 [`Message::Tick`] 上。
+            log_tail: LogTail::NotWrittenYet,
+            log_filter: LogFilter::default(),
+            log_query: String::new(),
+            // 文件**名**算得出来（它只跟日期有关），文件**内容**要等
+            // 第一次 `reload_logs`。底部那行字因此在任何状态下都完整。
+            log_file_name: wiring::current_log_name(),
+            core: None,
+            last_export: None,
         }
     }
 }
 
 impl App {
+    /// 接上内核。`program()` 的 boot 走这条。
+    pub fn with_core(core: Option<Core>) -> Self {
+        let mut app = Self {
+            core,
+            ..Self::default()
+        };
+        app.reload_logs();
+        app
+    }
+
     /// 当前选中的页签。
     pub fn tab(&self) -> Tab {
         self.tab
+    }
+
+    pub fn log_tail(&self) -> &LogTail {
+        &self.log_tail
+    }
+
+    pub fn log_filter(&self) -> LogFilter {
+        self.log_filter
+    }
+
+    /// 上一次导出的诊断包。`None` 表示这一轮还没导出过。
+    pub fn last_export(&self) -> Option<&std::path::Path> {
+        self.last_export.as_deref()
+    }
+
+    /// 重读一次日志尾部。
+    fn reload_logs(&mut self) {
+        // 名字只跟日期有关（跨过零点之后读的是另一个文件，底部那行字
+        // 得跟上）；内容只有接上内核之后才读得到。
+        self.log_file_name = wiring::current_log_name();
+        self.log_tail = wiring::read_tail(self.core.as_ref());
+    }
+
+    /// 走一跳。`now` 显式传进来，[`Message::Tick`] 那条路上传的是
+    /// `SystemTime::now()`——这样"时间往前走了之后界面画什么"在测试里
+    /// 是可控的，不用去睡真实的一秒。
+    pub fn tick(&mut self, now: SystemTime) {
+        self.now = now;
+        // 只在日志页在前台时重读文件。一秒一次的磁盘读在别的页签上纯属
+        // 白烧——而这一页一旦切回来，第一跳（最多一秒）就会补上。
+        if self.tab == Tab::Logs {
+            self.reload_logs();
+        }
+    }
+
+    /// 各个落点。没接上内核时是 `None`——那时候这个进程压根不知道
+    /// 落点在哪儿，**不许去猜一个**，见 `Action::OpenLogDir` 那一支。
+    fn paths(&self) -> Option<&wiring::AppPaths> {
+        self.core.as_ref().map(|c| &c.paths)
+    }
+
+    /// 往内核发一条命令。发不出去只记一行，不崩。
+    fn send(&self, command: Command) {
+        let Some(core) = self.core.as_ref() else {
+            tracing::warn!(?command, "还没接上内核，这条命令发不出去");
+            return;
+        };
+        // `try_send` 不是 `send`：这里跑在界面线程上，通道满了就阻塞的话
+        // 整个窗口会卡住。通道容量 32，而界面能按出来的命令是个位数级
+        // 的——真满了说明内核已经不转了，那时候更不能连窗口一起卡死。
+        if let Err(e) = core.commands.try_send(command) {
+            tracing::error!(error = %e, "命令没能送进内核");
+        }
+    }
+
+    /// 按下一个动作按钮。
+    fn dispatch(&mut self, action: Action) {
+        match action {
+            Action::Start => match self.form.validate() {
+                Ok(addrs) => self.send(Command::Start {
+                    username: self.form.username.trim().to_string(),
+                    password: self.form.password.clone(),
+                    gateway: addrs.gateway().clone(),
+                    appliance: addrs.appliance().clone(),
+                }),
+                // 按钮此时本来就该是灰的（`action_enabled`），走到这里
+                // 说明有人绕过了那道门。什么都不做，不发一条注定被
+                // Supervisor 拒掉的命令。
+                Err(errors) => tracing::warn!(?errors, "表单还没填对，不发起连接"),
+            },
+            Action::Cancel => self.send(Command::Cancel),
+            Action::Stop => self.send(Command::Stop),
+            Action::RetryNow => self.send(Command::RetryNow),
+            Action::ExportDiagnostics => self.export_diagnostics(),
+            // 剪贴板要 `update` 返回 `iced::Task`，本轮没做，见
+            // task-10-report.md 的「后续完善」。
+            Action::CopyDiagnostics => tracing::info!("复制检查结果：本轮未实现"),
+            Action::OpenLogDir => {
+                // 没有内核就不知道落点在哪儿——**不去猜一个**。猜一个的
+                // 代价实测过：`cargo test` 会在开发机真实的 `~/.rmc` 下
+                // 建目录、还会真的弹出一个文件管理器窗口。
+                let Some(dir) = self.paths().map(|p| p.log_dir()) else {
+                    tracing::warn!("还没接上内核，不知道日志目录在哪儿");
+                    return;
+                };
+                // 目录可能还不存在（今天还没写过日志），先建出来——
+                // 否则资源管理器会弹一个"找不到路径"。
+                let _ = std::fs::create_dir_all(&dir);
+                wiring::open_dir(&dir);
+            }
+        }
+    }
+
+    /// 导出诊断包。**脱敏登记在 [`diag::export`] 里就地做完**（W172），
+    /// 这里连一个能传错的参数都没有。
+    fn export_diagnostics(&mut self) {
+        // 同 `Action::OpenLogDir`：没有内核就不知道往哪儿写。猜一个的
+        // 代价是 `cargo test` 每跑一次就往开发机真实的 `~/.rmc` 里扔一个
+        // 诊断包（实测攒了 27 个才发现）。
+        let Some(paths) = self.paths().cloned() else {
+            tracing::warn!("还没接上内核，不知道诊断包该写到哪儿");
+            return;
+        };
+        match diag::export(
+            &self.form,
+            self.model.preflight.as_ref(),
+            &self.environment,
+            &paths.log_dir(),
+            &paths.export_dir(),
+        ) {
+            Ok(path) => {
+                tracing::info!(?path, "诊断包已导出");
+                self.last_export = Some(path);
+            }
+            Err(e) => tracing::error!(error = %e, "导出诊断包失败"),
+        }
     }
 
     pub fn model(&self) -> &Model {
@@ -247,9 +474,22 @@ impl App {
         &self.form
     }
 
-    /// 把一条隧道事件喂给视图模型。Task 10 的 `Subscription` 接这里。
+    /// 把一条隧道事件喂给视图模型。[`subscription`] 接这里。
+    ///
+    /// 除了推进 [`Model`]，还有两件只有这一层能做的事：
+    ///
+    /// 1. **口令该不该抹掉**（[`model::should_clear_password`]）——
+    ///    `Model` 看不见 `Form`；
+    /// 2. **把检测到的代理同步给表单**（W152）。`Form::detected_proxy`
+    ///    因此**不是第二个真相来源**：它每次都从 `self.model.proxy` 原样
+    ///    派生，两者结构上不可能分叉。
     pub fn apply(&mut self, event: rmc_core::TunnelEvent) {
+        let before = self.model.state.clone();
         self.model.apply(event);
+        if model::should_clear_password(&before, &self.model.state) {
+            self.form.clear_password();
+        }
+        self.form.detected_proxy = self.model.proxy.as_ref().map(|p| p.endpoint.clone());
     }
 
     pub fn update(&mut self, message: Message) {
@@ -262,30 +502,36 @@ impl App {
             Message::UsernameChanged(v) => self.form.username = v,
             Message::PasswordChanged(v) => self.form.password = v,
             Message::RememberToggled(v) => self.form.remember = v,
-            // Task 10 才接得上 Supervisor：这两条现在**确实什么都不做**。
-            // 界面上按钮点得动、消息发得出来（`tests/ui.rs` 逐条验），
-            // 但没有任何东西在另一头接。不写成 `todo!()` 是因为那会让
-            // 一次误点直接崩掉进程。见 task-8-report.md 的「后续完善」。
-            Message::ActionPressed(_) | Message::DisconnectSession(_) => {}
+            Message::ActionPressed(a) => self.dispatch(a),
+            Message::DisconnectSession(id) => self.send(Command::DisconnectRemoteSession { id }),
+            Message::Tick => self.tick(SystemTime::now()),
+            Message::CoreEvent(e) => self.apply(e),
+            Message::LogFilterSelected(f) => self.log_filter = f,
+            Message::LogQueryChanged(q) => self.log_query = q,
         }
     }
 
     pub fn view(&self) -> iced::Element<'_, Message> {
         use iced::widget::column;
         let page = match self.tab {
-            Tab::Maintain => view::maintain::view(
-                &self.model,
-                &self.form,
-                self.model.elapsed(std::time::SystemTime::now()),
-            ),
+            // 时长用 `self.now`（由 `Tick` 推进），**不是现取的
+            // `SystemTime::now()`**——现取的话这行字只在别的消息顺带
+            // 触发重画时才动一下。见 `App::now` 上的说明。
+            Tab::Maintain => {
+                view::maintain::view(&self.model, &self.form, self.model.elapsed(self.now))
+            }
             Tab::Diagnostics => view::diagnostics::view(
                 &self.model,
                 self.model.proxy.as_ref(),
                 &self.environment,
                 self.form.can_start(),
             ),
-            // Task 11。日志页现在只有页签框架。
-            Tab::Logs => iced::widget::space::vertical().into(),
+            Tab::Logs => view::logs::view(
+                &self.log_tail,
+                self.log_filter,
+                &self.log_query,
+                &self.log_file_name,
+            ),
         };
         column![
             view::chrome::title_bar(),
@@ -391,7 +637,9 @@ mod tests {
             assert!(!w.resizable, "窗口不可缩放");
         }
 
-        check(&program());
+        // 不接内核：这两条验的是装配（标题、主题、窗口、挂的是哪棵树），
+        // 跟内核无关，而 `program(Some(..))` 会要一个 tokio 运行时。
+        check(&program(None));
     }
 
     /// 同一层的另一半：`main()` 挂上去的 view 是不是 [`App::view`]。
@@ -441,7 +689,9 @@ mod tests {
             );
         }
 
-        check(&program());
+        // 不接内核：这两条验的是装配（标题、主题、窗口、挂的是哪棵树），
+        // 跟内核无关，而 `program(Some(..))` 会要一个 tokio 运行时。
+        check(&program(None));
     }
 
     /// W141 的第三道：`Message` 不许把口令印出来。
@@ -563,5 +813,521 @@ mod tests {
                 "界面上不许出现 {banned}：{WINDOW_TITLE}"
             );
         }
+    }
+
+    // =================================================================
+    // Task 10 的接线。**每一条都回答「断掉哪一行会让它红」。**
+    //
+    // 这一轮最危险的形状是接线本身：九个任务的零件在这里第一次真的连
+    // 起来，而接错了**大多不会编译失败**——会安静地跑，只是某条线没接
+    // 上。下面每一条对着一根线。
+    // =================================================================
+
+    use rmc_core::state::State;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, mpsc};
+
+    /// 一根接到测试手里的假线。
+    ///
+    /// 返回 `(App, 命令接收端, 事件发送端)`：命令那一头让「按钮真的发出
+    /// 了命令」可观测，事件那一头让「事件真的到了界面」可观测。
+    fn app_with_fake_core(
+        root: &std::path::Path,
+    ) -> (App, mpsc::Receiver<Command>, broadcast::Sender<TunnelEvent>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (ev_tx, ev_rx) = broadcast::channel(32);
+        let core = wiring::Core::new(
+            cmd_tx,
+            ev_rx,
+            wiring::AppPaths::at(root.to_path_buf()),
+            None,
+        );
+        (App::with_core(Some(core)), cmd_rx, ev_tx)
+    }
+
+    fn filled_form() -> Form {
+        Form {
+            appliance_host: "192.168.100.10".into(),
+            appliance_port: "61001".into(),
+            gateway_host: "ops.example.com".into(),
+            gateway_port: "443".into(),
+            username: "tunnel-zhang".into(),
+            password: Zeroizing::new("pw".into()),
+            remember: false,
+            detected_proxy: None,
+        }
+    }
+
+    // ---------- 线 1：按钮 → 命令 ----------
+
+    /// **点「开启远程维护」真的会有一条 `Command::Start` 送进内核，而且
+    /// 带的是表单上那四样东西。**
+    ///
+    /// 断的是哪一根线：`Model::buttons` 有表驱动测试、`tests/ui.rs` 验过
+    /// 按钮点得动、`Form::validate` 有单测，**中间 `App::dispatch` 那一段
+    /// 两头都没人守**。在这一轮之前 `Message::ActionPressed(_)` 的分支
+    /// 体**就是一对空花括号**，六道闸门全绿。
+    ///
+    /// 改红：把 `Action::Start` 那一支改成 `{}`；或者把 `gateway` 与
+    /// `appliance` 写反（那会让隧道去连一体机、把一体机当运维服务器，
+    /// 而界面上一个字都看不出来）。
+    #[test]
+    fn pressing_start_sends_the_addresses_the_user_typed() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, mut cmd_rx, _ev) = app_with_fake_core(dir.path());
+        app.form = filled_form();
+
+        app.update(Message::ActionPressed(Action::Start));
+
+        match cmd_rx.try_recv().expect("没有任何命令送进内核") {
+            Command::Start {
+                username,
+                password,
+                gateway,
+                appliance,
+            } => {
+                assert_eq!(username, "tunnel-zhang");
+                assert_eq!(password.as_str(), "pw");
+                assert_eq!(gateway.to_string(), "ops.example.com:443");
+                assert_eq!(appliance.to_string(), "192.168.100.10:61001");
+            }
+            other => panic!("发出去的不是 Start：{other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "一次点击发了不止一条命令");
+    }
+
+    /// 表单没填对时**一条命令都不发**。
+    ///
+    /// 按钮此刻本来就是灰的（`action_enabled`），这条守的是第二道：
+    /// 真有一条 `Start` 送上去，Supervisor 会拒掉它，而界面上只会闪一下。
+    #[test]
+    fn an_invalid_form_sends_nothing() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, mut cmd_rx, _ev) = app_with_fake_core(dir.path());
+        // 反向自证：确实是"没填对"，不是"没点到"。
+        assert!(app.form().validate().is_err());
+        app.update(Message::ActionPressed(Action::Start));
+        assert!(cmd_rx.try_recv().is_err(), "表单没填对也把命令发出去了");
+    }
+
+    /// 三个止损动作与断开会话各发各的命令，**一条都不许串**。
+    ///
+    /// 改红：把 `Action::Stop` 那一支改成 `self.send(Command::Cancel)`
+    /// ——「停止」会变成「取消」，在 `Connected` 状态下 Supervisor 的
+    /// `Cancel` 准入判断直接把它丢掉，**隧道停不下来**，而界面上什么都
+    /// 看不出来。这条当场红。
+    #[test]
+    fn every_action_sends_its_own_command() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let cases: [(Action, &str); 3] = [
+            (Action::Cancel, "Cancel"),
+            (Action::Stop, "Stop"),
+            (Action::RetryNow, "RetryNow"),
+        ];
+        for (action, want) in cases {
+            let (mut app, mut cmd_rx, _ev) = app_with_fake_core(dir.path());
+            app.update(Message::ActionPressed(action));
+            let got = format!("{:?}", cmd_rx.try_recv().expect("没有命令"));
+            assert_eq!(got, want, "{action:?} 发出的命令不对");
+        }
+
+        let (mut app, mut cmd_rx, _ev) = app_with_fake_core(dir.path());
+        app.update(Message::DisconnectSession(7));
+        let got = cmd_rx.try_recv().expect("没有命令");
+        assert!(
+            matches!(got, Command::DisconnectRemoteSession { id: 7 }),
+            "断开会话带的不是那个会话的 id：{got:?}"
+        );
+    }
+
+    /// 没接上内核时点按钮**不崩，而且一个字节都不往磁盘上写**。
+    ///
+    /// `App::default()` 就是这个状态（`tests/ui.rs` 里全是它）。两件事
+    /// 都要守：
+    ///
+    /// 1. **不崩**——写成 `todo!()`/`unwrap()` 的话一次误点直接崩掉进程；
+    /// 2. **不猜落点**。这一条是实测出来的教训：第一版在没有内核时退回
+    ///    `AppPaths::resolve()`，于是「导出诊断包」那一格每跑一次
+    ///    `cargo test` 就往开发机真实的 `~/.rmc/` 里扔一个诊断包
+    ///    （攒到 27 个才被发现），「打开日志目录」那一格还会真的弹出一个
+    ///    文件管理器窗口。
+    ///
+    /// 改红：把 `export_diagnostics` / `Action::OpenLogDir` 里那两句
+    /// `let Some(..) = self.paths() else { return }` 换回
+    /// `AppPaths::resolve()`——第二组断言当场红。
+    #[test]
+    fn pressing_buttons_without_a_core_is_harmless_and_touches_no_disk() {
+        // 把 HOME 指到一个空的临时目录：真有人去猜落点，痕迹会落在这里，
+        // 而不是开发机的家目录里。
+        let home = tempfile::tempdir().expect("建临时目录");
+        let before = std::fs::read_dir(home.path()).unwrap().count();
+        assert_eq!(before, 0);
+
+        for action in Action::ALL {
+            let mut app = App {
+                form: filled_form(),
+                ..App::default()
+            };
+            app.update(Message::ActionPressed(action));
+            assert!(
+                app.last_export().is_none(),
+                "{action:?}：没有内核却导出了一个诊断包"
+            );
+        }
+        let mut app = App::default();
+        app.update(Message::DisconnectSession(1));
+        app.update(Message::Tick);
+
+        // 没有内核时日志页说的是"还没有日志"，而不是去读别处的文件。
+        assert_eq!(app.log_tail(), &LogTail::NotWrittenYet);
+        // 底部那行字照样完整——文件名只跟日期有关。
+        assert!(
+            app.log_file_name.starts_with("rmc-") && app.log_file_name.ends_with(".log"),
+            "{}",
+            app.log_file_name
+        );
+    }
+
+    // ---------- 线 2：事件 → 界面 ----------
+
+    /// **内核推上来的代理信息真的落到了诊断页要画的两个地方**（W152）。
+    ///
+    /// 断的是哪一根线：`Model::apply` 处理 `TunnelEvent::Proxy` 那一行，
+    /// 以及 `App::apply` 里把它同步给表单那一行。在这一轮之前
+    /// `Model.proxy` 与 `Form::detected_proxy` **一个写入方都没有**，
+    /// 诊断页那三行在真实运行里一行都不会出现。
+    ///
+    /// 改红：把 `Model::apply` 里 `TunnelEvent::Proxy` 那一支改成 `{}`；
+    /// 或者把 `App::apply` 里同步 `detected_proxy` 那一行删掉（第二组
+    /// 断言红，维护页的「出网」会永远写着「直连」）。
+    #[test]
+    fn a_proxy_event_reaches_both_the_diagnostics_rows_and_the_form() {
+        use rmc_core::diagnostic::{ConnectOutcome, ProxyAuthSummary, ProxyObservation};
+
+        let mut app = App::default();
+        assert!(app.model().proxy.is_none());
+        assert_eq!(app.form().egress_label(), "直连");
+
+        app.apply(TunnelEvent::Proxy(ProxyObservation::Via {
+            endpoint: "proxy.company.com:8080".parse().unwrap(),
+            connect: ConnectOutcome::Established,
+            auth: ProxyAuthSummary::FinalTokenIssued {
+                package: "NTLM".into(),
+                rounds: 2,
+            },
+        }));
+
+        let p = app.model().proxy.as_ref().expect("诊断页那三行没有数据");
+        assert_eq!(p.endpoint, "proxy.company.com:8080");
+        assert_eq!(p.connect, ConnectOutcome::Established);
+        assert_eq!(
+            app.form().egress_label(),
+            "经系统代理 proxy.company.com:8080"
+        );
+
+        // 判定直连之后两边都要跟着回到「直连」——留着上一次的代理是
+        // 另一个方向的假话。
+        app.apply(TunnelEvent::Proxy(ProxyObservation::Direct));
+        assert!(app.model().proxy.is_none(), "直连了还画着一台代理");
+        assert_eq!(app.form().egress_label(), "直连");
+    }
+
+    /// 表单里那份代理**不是第二个真相来源**：它恒等于 `Model` 里那份。
+    #[test]
+    fn the_form_never_disagrees_with_the_model_about_the_proxy() {
+        use rmc_core::diagnostic::{ConnectOutcome, ProxyAuthSummary, ProxyObservation};
+        let mut app = App::default();
+        for o in [
+            ProxyObservation::Direct,
+            ProxyObservation::Via {
+                endpoint: "a.example.com:1".parse().unwrap(),
+                connect: ConnectOutcome::Failed,
+                auth: ProxyAuthSummary::NotAttempted,
+            },
+            ProxyObservation::Via {
+                endpoint: "b.example.com:2".parse().unwrap(),
+                connect: ConnectOutcome::Established,
+                auth: ProxyAuthSummary::NotAttempted,
+            },
+            ProxyObservation::Direct,
+        ] {
+            app.apply(TunnelEvent::Proxy(o));
+            assert_eq!(
+                app.form().detected_proxy,
+                app.model().proxy.as_ref().map(|p| p.endpoint.clone()),
+                "表单与视图模型对代理的说法分叉了"
+            );
+        }
+        // 别的事件不许顺手改掉它。
+        app.apply(TunnelEvent::Proxy(ProxyObservation::Via {
+            endpoint: "c.example.com:3".parse().unwrap(),
+            connect: ConnectOutcome::Established,
+            auth: ProxyAuthSummary::NotAttempted,
+        }));
+        app.apply(TunnelEvent::State(State::Connecting));
+        assert_eq!(
+            app.form().detected_proxy.as_deref(),
+            Some("c.example.com:3")
+        );
+    }
+
+    /// **回到 `Idle` 时口令被抹掉。**
+    ///
+    /// 改红：把 `App::apply` 里那次 `should_clear_password` 判断删掉。
+    #[test]
+    fn coming_back_to_idle_wipes_the_password() {
+        const CANARY: &str = "canary-7f3a9e-must-never-be-printed";
+        let mut app = App::default();
+        app.update(Message::PasswordChanged(Zeroizing::new(CANARY.into())));
+        app.update(Message::UsernameChanged("tunnel-zhang".into()));
+
+        app.apply(TunnelEvent::State(State::Connecting));
+        assert_eq!(
+            app.form().password.as_str(),
+            CANARY,
+            "还在连接就把口令抹了，断线重连时会连不上"
+        );
+
+        app.apply(TunnelEvent::State(State::Idle));
+        assert!(app.form().password.is_empty(), "回到未开启之后口令还留着");
+        // 其余已填内容保留——抹的只有口令。
+        assert_eq!(app.form().username, "tunnel-zhang");
+    }
+
+    // ---------- 线 3：Tick（W150） ----------
+
+    /// **「已连接 HH:MM:SS」真的靠 `Tick` 走字。**
+    ///
+    /// 断的是哪一根线：`Model::elapsed` 有单测，`App::view` 把它画出来
+    /// 也有测试（`tests/ui.rs` 的 `the_elapsed_timer_is_drawn_when_it_
+    /// has_a_value`），**中间「现在几点」从哪儿来那一步没人守**。
+    /// 在这一轮之前 `view` 里写的是现取的 `SystemTime::now()`，而
+    /// **全 crate grep 不到任何 `Tick`**——这行字只在别的消息顺带触发
+    /// 重画时才动一下。
+    ///
+    /// 改红：把 `App::view` 里的 `self.model.elapsed(self.now)` 换回
+    /// `self.model.elapsed(std::time::SystemTime::now())`——第二帧的
+    /// 断言当场红（真实时间跟这条测试注入的假时间差着十年）。
+    #[test]
+    fn the_elapsed_timer_walks_with_every_tick() {
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::default();
+        app.apply(TunnelEvent::ConnectedSince(since));
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+
+        let drawn = |app: &App| {
+            let mut ui = iced_test::simulator(app.view());
+            for want in ["00:00:05", "00:01:05", "01:00:05"] {
+                if ui.find(want).is_ok() {
+                    return Some(want.to_string());
+                }
+            }
+            None
+        };
+
+        app.tick(since + Duration::from_secs(5));
+        assert_eq!(
+            drawn(&app).as_deref(),
+            Some("00:00:05"),
+            "第一跳之后界面上没画出已连接时长"
+        );
+
+        app.tick(since + Duration::from_secs(65));
+        assert_eq!(
+            drawn(&app).as_deref(),
+            Some("00:01:05"),
+            "时间往前走了一分钟，界面上那行字没跟着走"
+        );
+    }
+
+    /// **那两条订阅真的挂上去了**，而且计时器真的是一秒一跳。
+    ///
+    /// 这是 W150 的另一半：上面那条只证明「`tick()` 被调用之后界面会
+    /// 动」，证明不了「真的有人每秒调它一次」。
+    ///
+    /// # 为什么要比哈希，不只是数个数
+    ///
+    /// `Subscription` 的公开面只有 `units()`（recipe 个数）。光数个数的
+    /// 话，把 `TICK` 从 1 秒改成 60 秒、甚至改成一条完全不相干的订阅，
+    /// 个数照样是 2。recipe 的哈希是 iced 用来认「这是不是同一个订阅」
+    /// 的东西，它把 `Duration` 的值与映射函数的 `TypeId` 都拌了进去。
+    ///
+    /// 改红（都实测过）：把 `TICK` 改成 60 秒；把 `.map(tick_message)`
+    /// 整条 tick 订阅删掉（个数与哈希一起红）；把
+    /// `Subscription::run(core_events)` 删掉（事件那一半红，界面从此
+    /// 收不到任何内核消息）。
+    #[test]
+    fn the_ui_subscribes_to_a_one_second_tick_and_to_the_core_events() {
+        use iced_futures::subscription::{into_recipes, Hasher};
+        use std::hash::Hasher as _;
+
+        fn hashes(s: iced::Subscription<Message>) -> Vec<u64> {
+            into_recipes(s)
+                .into_iter()
+                .map(|r| {
+                    let mut h = Hasher::default();
+                    r.hash(&mut h);
+                    h.finish()
+                })
+                .collect()
+        }
+
+        let app = App::default();
+        let got = hashes(subscription(&app));
+        assert_eq!(got.len(), 2, "订阅的条数不对：{got:?}");
+
+        let want_tick = hashes(iced::time::every(Duration::from_secs(1)).map(tick_message));
+        assert_eq!(want_tick.len(), 1);
+        assert!(
+            got.contains(&want_tick[0]),
+            "没有订阅「每秒一跳」——已连接时长不会自己走字（W150）"
+        );
+
+        let want_events = hashes(iced::Subscription::run(core_events));
+        assert_eq!(want_events.len(), 1);
+        assert!(
+            got.contains(&want_events[0]),
+            "没有订阅内核事件流——界面永远停在未开启"
+        );
+
+        // 反向自证：这个判据真的分得出不同的间隔。少了它，上面那条
+        // `contains` 在「哈希恒等」时是永远为真的空转。
+        let sixty = hashes(iced::time::every(Duration::from_secs(60)).map(tick_message));
+        assert_ne!(want_tick, sixty, "间隔变了哈希却没变，这个判据没用");
+        assert!(!got.contains(&sixty[0]), "订阅的是 60 秒一跳，不是 1 秒");
+    }
+
+    /// `Tick` 只在日志页在前台时才重读文件。
+    ///
+    /// 一秒一次的磁盘读在别的页签上纯属白烧，而切回来最多一秒就补上。
+    #[test]
+    fn a_tick_only_rereads_the_log_file_on_the_log_page() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, _cmd, _ev) = app_with_fake_core(dir.path());
+        let log = app.log_file_name.clone();
+        assert!(!log.is_empty(), "日志文件名没算出来");
+
+        // 现在写一份日志出来。
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join(&log),
+            "2026-09-13T11:00:00+08:00 INFO 新写的一行\n",
+        )
+        .unwrap();
+
+        // 停在维护页：跳一下不重读。
+        app.tick(SystemTime::now());
+        assert!(app.log_tail().lines().is_empty(), "维护页上也在读日志文件");
+
+        // 切到日志页再跳一下：读到了。
+        app.update(Message::TabSelected(Tab::Logs));
+        app.tick(SystemTime::now());
+        assert_eq!(app.log_tail().lines().len(), 1, "日志页上没有重读文件");
+        assert_eq!(app.log_tail().lines()[0].message, "新写的一行");
+    }
+
+    // ---------- 线 4：事件流 → `Message::CoreEvent` ----------
+
+    /// **内核发一条事件，界面的状态真的跟着变。**
+    ///
+    /// 这条走的是 `Message::CoreEvent`（订阅那条流最终吐出来的东西），
+    /// 不是直接调 `apply`。改红：把 `Message::CoreEvent(e)` 那一支改成
+    /// `{}`——界面会永远停在「未开启」，而按钮照样点得动。
+    #[tokio::test]
+    async fn an_event_from_the_core_moves_the_status_card() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, _cmd, ev_tx) = app_with_fake_core(dir.path());
+        assert_eq!(app.model().state, State::Idle);
+
+        // 走的就是 `subscription` 用的那条流。
+        use iced::futures::StreamExt;
+        let mut stream = Box::pin(wiring::events_into(
+            app.core.as_ref().expect("有内核").subscribe(),
+            Message::CoreEvent,
+        ));
+        ev_tx.send(TunnelEvent::State(State::Preflight)).unwrap();
+        let msg = stream.next().await.expect("流里没有东西");
+
+        app.update(msg);
+        assert_eq!(app.model().state, State::Preflight);
+        assert_eq!(app.model().status_card().title, "预检中");
+    }
+
+    // ---------- 线 5：导出诊断包（W172） ----------
+
+    /// **点「导出诊断包」真的写出一个 zip，而且里面没有口令。**
+    ///
+    /// `diag.rs` 那条 `nothing_the_user_typed_into_the_form_reaches_the_
+    /// diagnostics_zip` 守的是 `diag::export` 这一层；这一条守的是
+    /// **界面到底有没有走那一层**。
+    ///
+    /// 改红：把 `Action::ExportDiagnostics` 那一支改成 `{}`（第一条
+    /// 断言红）；或者让 `App::export_diagnostics` 绕开 `diag::export`
+    /// 直接调 `diag::bundle` 并传一个空 `Redaction`（金丝雀那条红）。
+    #[test]
+    fn exporting_from_the_ui_writes_a_zip_without_the_password() {
+        const CANARY: &str = "canary-pw-4f81c2-must-never-leave-this-machine";
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, _cmd, _ev) = app_with_fake_core(dir.path());
+        app.form = filled_form();
+        app.form.password = Zeroizing::new(CANARY.into());
+
+        // 让日志目录里有一份带金丝雀的日志——诊断包会把它收进去。
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("rmc-2026-09-13.log"),
+            format!("2026-09-13T11:00:00+08:00 INFO 调试行 password={CANARY}\n"),
+        )
+        .unwrap();
+
+        assert!(app.last_export().is_none());
+        app.update(Message::ActionPressed(Action::ExportDiagnostics));
+
+        let zip = app.last_export().expect("点了导出却没有包").to_path_buf();
+        assert!(zip.exists(), "{zip:?}");
+        let raw = std::fs::read(&zip).unwrap();
+        assert!(raw.len() > 100, "导出的包是空的：{} 字节", raw.len());
+
+        // 解开来逐条扫。
+        let f = std::fs::File::open(&zip).unwrap();
+        let mut archive = zip::ZipArchive::new(f).unwrap();
+        let mut names = Vec::new();
+        for i in 0..archive.len() {
+            use std::io::Read;
+            let mut e = archive.by_index(i).unwrap();
+            names.push(e.name().to_string());
+            let mut buf = String::new();
+            let _ = e.read_to_string(&mut buf);
+            assert!(
+                !buf.contains(CANARY),
+                "界面导出的诊断包里带着明文口令：{}",
+                e.name()
+            );
+        }
+        // 反向自证：日志真的进包了，上面那条扫描不是在一个空包上空转。
+        assert!(
+            names.iter().any(|n| n == "logs/rmc-2026-09-13.log"),
+            "日志没进包：{names:?}"
+        );
+    }
+
+    /// 日志页上那个「打开日志目录」按钮**发的是自己那条动作**。
+    ///
+    /// 真去起一个资源管理器不在测试范围内（那是 `wiring::open_dir`，
+    /// 它的判断部分有 `file_manager_for` 的表驱动测试）。
+    #[test]
+    fn the_log_page_button_carries_the_open_log_dir_action() {
+        let mut app = App::default();
+        app.update(Message::TabSelected(Tab::Logs));
+        let mut ui = iced_test::simulator(app.view());
+        ui.click("打开日志目录").expect("点不到「打开日志目录」");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            matches!(messages[0], Message::ActionPressed(Action::OpenLogDir)),
+            "{messages:?}"
+        );
     }
 }

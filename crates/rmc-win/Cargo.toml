@@ -31,8 +31,11 @@ windows = { workspace = true, features = [
   # 四个 SSPI 符号缺了它会一起「不存在」——feature 表在骨架阶段先备好。
   "Win32_Security_Credentials",
   "Win32_System_Threading",
-  # W6：Task 4/5 会用到（DEVICE_NOTIFY_CALLBACK 等不在 System::Power 里）。
-  "Win32_System_SystemServices",
+  # W93：这里原来还有一条 `Win32_System_SystemServices`，连同它上面那条
+  # 「DEVICE_NOTIFY_CALLBACK 等不在 System::Power 里」的注释一起**都是
+  # 错的**——那个符号在 `Win32_UI_WindowsAndMessaging`（下一行，本来就
+  # 开着），`events.rs` 的 `use` 写的就是那个路径。全仓库 grep
+  # `SystemServices` 唯一的命中就是那一行 feature 本身。已删。
   "Win32_UI_WindowsAndMessaging",
   "Win32_Networking_WinHttp",
   "Win32_Security_Cryptography",

@@ -48,6 +48,23 @@ pub trait Sealer: Send + Sync {
     fn unseal(&self, sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>>;
 }
 
+/// 装箱之后还是同一个密封器。
+///
+/// 接线那一层（`rmc_app::wiring`）要把"用哪个密封器"这件事做成一个
+/// `Option<Box<dyn Sealer>>`——Windows 上是 DPAPI，别的平台上是 `None`
+/// （不记住密码）。没有这个 impl，`FileSecretStore<Box<dyn Sealer>>` 就
+/// 拼不出来，那段装配只能退回 `#[cfg(windows)]` 里去，而那一层在本项目
+/// 的闸门下按构造检测不到任何还能编译的语义改动（W171）。
+impl<T: Sealer + ?Sized> Sealer for Box<T> {
+    fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        (**self).seal(plain)
+    }
+
+    fn unseal(&self, sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        (**self).unseal(sealed)
+    }
+}
+
 /// 声明 [`LoadOutcome`]，顺带生成变体名表与变体总数。
 ///
 /// # 为什么要经一个宏

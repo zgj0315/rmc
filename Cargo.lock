@@ -2672,11 +2672,14 @@ dependencies = [
 name = "rmc-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "iced",
+ "iced_futures",
  "iced_test",
  "rmc-core",
  "rmc-win",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "zeroize",

@@ -74,11 +74,37 @@ iced = { version = "0.14", default-features = false, features = [
 # 后端全是 C 代码，会把 windows-gnu 的交叉编译（闸门 5/6）拖下水。
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-# Win32 调用只在 windows target 上编译。
-[target.'cfg(windows)'.dependencies]
-# 单实例互斥。不在 `[workspace.dependencies]` 里（rmc-core 不依赖它），
-# 用路径引。
+# 平台实现。**W171：这条依赖从 `[target.'cfg(windows)'.dependencies]` 搬
+# 到了这里，成了无条件依赖。**
+#
+# 理由不是省事，是可观测性。`wiring::spawn_core` 是一对
+# `#[cfg(windows)]` / `#[cfg(not(windows))]` 孪生块，而 Task 5 已经用八枪
+# 实测过：`#[cfg(windows)]` 那一层里**任何还能编译的语义改动按构造检测
+# 不到**（闸门 5 只编译、闸门 6 只静态检查，两道都不跑测试；连把
+# `Box::leak` 换成悬垂栈指针都六道全绿）。而这一轮接线里最要紧的两件事
+# ——`ProxyEndpointRecorder` 要同时坐在 `Transport` 的 resolver 位和
+# 协商器的 endpoint 位（W170）、以及 SPN 必须用代理主机名而不是认证
+# 方案——恰恰全在那一支里。
+#
+# rmc-win 本来就为此做过准备：它的纯逻辑层（`ProxyEndpointRecorder`、
+# `SspiProxyAuthenticator`、`EventHub`、`FileSecretStore`）**不带
+# `#[cfg(windows)]`**，在 macOS 上照常编译、照常测（`cargo test -p
+# rmc-win` 有 137 条）。把依赖提到无条件之后，`wiring` 里那段装配可以整
+# 块搬到平台中立的函数里，在这台机器上被真的跑到；`cfg` 块里只剩「构造
+# 哪四个实现」这一层纯搬运。
+#
+# **不新增依赖包**：rmc-win 本来就在 workspace 里，它在非 Windows 上的
+# 依赖（rmc-core/tokio/tracing/async-trait/base64/zeroize/sha2）全都已经
+# 在锁里；`windows` crate 仍然只在 `cfg(windows)` 下引入。
 rmc-win = { path = "../rmc-win" }
+
+# 接线要用 `mpsc::Sender<Command>` / `broadcast::Receiver<TunnelEvent>`，
+# 以及 `#[tokio::test]`。**不新增依赖包**：tokio 早就是
+# `[workspace.dependencies]` 的一员（rmc-core、rmc-win 都在用），iced 的
+# `tokio` feature 也已经把它拉进 rmc-app 的依赖图，这里只是多一条直接
+# 依赖边。
+tokio.workspace = true
+
 
 [dev-dependencies]
 # headless 控件树断言。只在测试期编译，不进发布二进制。
@@ -86,10 +112,23 @@ rmc-win = { path = "../rmc-win" }
 # 跟运行时走系统字体不是一回事——见 task-6-fix-1-report.md 关于快照测试的
 # 那一节。
 iced_test = "0.14"
+# 测试里要给 `ProxyResolver` 写假实现，那个 trait 是 `#[async_trait]` 的。
+# **不新增依赖包**：`async-trait = "0.1"` 已经是 rmc-win 的直接依赖，
+# Cargo.lock 里就有；只在测试期编译。
+async-trait = "0.1"
 # 差分快照测试要一个临时目录放基线哈希（跑完即扔，不进仓库）。
 # **不新增依赖包**：`tempfile = "3"` 已经是 rmc-core 的 dev-dependency，
 # Cargo.lock 里就有。
 tempfile = "3"
+# W150 那条「Tick 真的被订阅了」的唯一观察口。`iced::Subscription` 就是
+# `iced_futures::Subscription`，但 `into_recipes` / `Hasher` 这两样
+# `iced` 没有 re-export——没有它们，`subscription()` 里除了 recipe 的
+# **个数**（`Subscription::units()`）之外什么都验不了，「把 1 秒改成
+# 60 秒」一条测试都不会红。
+#
+# **不新增依赖包**：`iced_futures 0.14` 早就在锁里（iced 自己依赖它），
+# 这里只是多一条 dev 依赖边，不进发布二进制。
+iced_futures = "0.14"
 
 [lib]
 name = "rmc_app"

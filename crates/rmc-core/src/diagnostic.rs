@@ -31,6 +31,8 @@
 //! rmc-win 那边留下一份说着相近意思的副本，两份迟早漂移——W164 要收拾的
 //! 正是这种漂移。
 
+use crate::addr::HostPort;
+
 /// 诊断页一行的结论。
 ///
 /// **不是 `Option<bool>`。** `Option<bool>` 在这个项目里已经是第五次
@@ -71,6 +73,39 @@ pub enum ConnectOutcome {
     Established,
     /// CONNECT 没有建立。
     Failed,
+}
+
+/// 这次连接**实际经过了什么**：直连，还是某一台代理。
+///
+/// # W173：界面不许自己去查代理，这条信息由内核送上来
+///
+/// `Transport::effective_proxy` 被文档标成「供预检与界面显示使用」，但
+/// rmc-win 的 `ProxyEndpointRecorder` 上写明了它的代价：界面每重画一帧
+/// 就查一次，会在一次协商进行到一半时改写协商器用来拼 SPN 的那一格，
+/// 而**没有任何测试会因此变红**。rmc-app 那边有一道源码扫描
+/// （`this_crate_never_polls_the_transport_for_the_current_proxy`）把
+/// 「界面自己去查」整条路封死了，那么界面要显示的代理就必须有另一条
+/// 来路——就是这个类型，经 [`crate::state::TunnelEvent::Proxy`] 送上去。
+///
+/// # 为什么不是 `Option<HostPort>` + 一个 `ConnectOutcome`
+///
+/// 直连时**根本没有 CONNECT 这回事**。压成一对字段，构造的地方就必须给
+/// 「直连时的 CONNECT 结果」编一个值出来，而界面拿到那个编出来的值会
+/// 照样画进「代理 CONNECT」那一行。这是本项目同一个缺陷类的第七次，
+/// 解法跟前六次一样：**带类型的出口**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyObservation {
+    /// 这次判定直连，没有经过任何代理。
+    Direct,
+    /// 这次经过了这台代理。
+    Via {
+        endpoint: HostPort,
+        /// 经这台代理的那次 HTTP CONNECT 成没成。
+        connect: ConnectOutcome,
+        /// 代理认证协商的结局。平台中立，来自
+        /// [`crate::platform::ProxyAuthenticator::auth_summary`]。
+        auth: ProxyAuthSummary,
+    },
 }
 
 /// 诊断页上「代理认证」那一行的**行首文字**。

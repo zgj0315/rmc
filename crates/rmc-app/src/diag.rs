@@ -96,6 +96,30 @@ pub struct ProxyStatus {
     pub auth: ProxyAuthSummary,
 }
 
+impl ProxyStatus {
+    /// 从 rmc-core 送上来的那份观察结果转过来。
+    ///
+    /// `None` 表示**这次是直连**，诊断页于是一行代理信息都不画——这正是
+    /// [`ProxyObservation`](rmc_core::diagnostic::ProxyObservation) 分成
+    /// 两个变体的理由：直连时根本没有「CONNECT 成没成」这回事，压成一对
+    /// 字段就得给它编一个值，而界面会照样把编出来的值画上屏。
+    pub fn observed(o: &rmc_core::diagnostic::ProxyObservation) -> Option<Self> {
+        use rmc_core::diagnostic::ProxyObservation;
+        match o {
+            ProxyObservation::Direct => None,
+            ProxyObservation::Via {
+                endpoint,
+                connect,
+                auth,
+            } => Some(Self {
+                endpoint: endpoint.to_string(),
+                connect: *connect,
+                auth: auth.clone(),
+            }),
+        }
+    }
+}
+
 /// 运维服务器 host key 的比对结果。
 ///
 /// W159：这是 brief 那个 `(String, bool)` 的带类型版本。`bool` 是
@@ -537,6 +561,51 @@ pub fn bundle(out_dir: &Path, input: &BundleInput<'_>) -> std::io::Result<PathBu
 
     zip.finish()?;
     Ok(out_path)
+}
+
+/// 这一次导出要抹掉哪些东西，**从表单上取**。
+///
+/// # W172：这是 [`Redaction`] 唯一的生产调用方
+///
+/// 在这一轮之前，`Redaction` 一个生产调用点都没有——诊断包照常导得
+/// 出来，只是里面带着明文口令，而**没有任何闸门会因为忘了登记而变红**。
+///
+/// 把"登记什么"关进这个函数（而不是散在 `App::update` 里），是为了让
+/// 「忘了登记」这件事结构上发生不了：[`export`] 是界面唯一的导出入口，
+/// 它自己调这一个函数，调用方连一个能传错的参数都没有。
+///
+/// **两样都登记**：口令是显然的；账号也登记，因为诊断包会离开这台
+/// 机器（见本模块顶部），而账号名加上日志里的时间线足以拼出"谁在什么
+/// 时候连了哪台客户设备"。代价写在这里：账号名要是短到一两个字符，
+/// 日志里凡是出现那个字符的地方都会被打成 [`REDACTED`]。宁可日志花掉，
+/// 不可把凭据送出去。
+pub fn redaction_for(form: &crate::form::Form) -> Redaction {
+    let mut r = Redaction::new();
+    r.hide(&form.password).hide(form.username.trim());
+    r
+}
+
+/// 导出一个诊断包，返回它的路径。**界面唯一的导出入口。**
+///
+/// 脱敏在这里就地做完（[`redaction_for`]），调用方没有机会绕过它。
+pub fn export(
+    form: &crate::form::Form,
+    report: Option<&PreflightReport>,
+    environment: &str,
+    log_dir: &Path,
+    out_dir: &Path,
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(out_dir)?;
+    let redaction = redaction_for(form);
+    bundle(
+        out_dir,
+        &BundleInput {
+            environment,
+            report,
+            log_dir,
+            redaction: &redaction,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1197,6 +1266,146 @@ mod tests {
                 "zip 的原始字节里出现了金丝雀（未压缩的条目？注释？扩展字段？）"
             );
         }
+    }
+
+    // ================= W172：从 `Form` 到 zip 字节 =================
+
+    /// **端到端：表单里敲进去的口令与账号，一个字节都到不了 zip 里。**
+    ///
+    /// 上面那条 `no_entry_in_the_bundle_carries_the_canary_password_or_account`
+    /// 守的是 [`bundle`] 这一层——它收一份**已经填好的** [`Redaction`]，
+    /// 于是"谁来填、填没填"整件事在它眼皮底下不存在。W172 点名的正是
+    /// 这个缺口：在这一轮之前 `Redaction` **一个生产调用方都没有**，
+    /// 诊断包照常导得出来，只是里面带着明文口令，而**没有任何闸门会
+    /// 因为忘了登记而变红**。
+    ///
+    /// 这条从 [`crate::form::Form`] 出发，走界面真正会走的那条路
+    /// （[`export`]），一路到 zip 的字节。
+    ///
+    /// # 改实现的哪一行会让它红
+    ///
+    /// - 把 [`redaction_for`] 的函数体换成 `Redaction::new()`（"忘了
+    ///   登记"）→ 主断言当场红；
+    /// - 只登记口令、漏掉账号（`.hide(form.username.trim())` 删掉）→
+    ///   账号那一半红；
+    /// - 让 [`export`] 绕开 `redaction_for` 自己 `Redaction::new()` →
+    ///   同上。
+    ///
+    /// 三种都实测过，见 task-10-report.md 的变异表。
+    #[test]
+    fn nothing_the_user_typed_into_the_form_reaches_the_diagnostics_zip() {
+        const PASSWORD: &str = "canary-pw-4f81c2-must-never-leave-this-machine";
+        const ACCOUNT: &str = "canary-acct-9d3b07-must-never-leave-this-machine";
+        const MARK: &str = "mark-e2e-b7c9";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let logs = dir.path().join("logs");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        // 三个来源各灌一份金丝雀，形状照现场：审计日志里会记账号
+        // （「口令认证通过 tunnel-zhang」是 rmc-core 真的会写的一行）。
+        std::fs::write(
+            logs.join("rmc-2026-09-13.log"),
+            format!(
+                "2026-09-13T11:12:46+08:00 INFO {MARK} 口令认证通过 {ACCOUNT}\n\
+                 2026-09-13T11:12:47+08:00 INFO 调试留下的一行 password={PASSWORD}\n"
+            ),
+        )
+        .unwrap();
+        let report = PreflightReport {
+            steps: vec![step(
+                STEP_GATEWAY_TLS,
+                failed(&format!("账号 {ACCOUNT} 口令 {PASSWORD} 被拒")),
+            )],
+        };
+        let environment = format!("{MARK} · 登录用户 {ACCOUNT}");
+
+        // **这就是用户敲进去的那份表单。**
+        let form = crate::form::Form {
+            appliance_host: "192.168.100.10".into(),
+            appliance_port: "61001".into(),
+            gateway_host: "ops.example.com".into(),
+            gateway_port: "443".into(),
+            username: ACCOUNT.into(),
+            password: Zeroizing::new(PASSWORD.into()),
+            remember: false,
+            detected_proxy: None,
+        };
+
+        let zip = export(&form, Some(&report), &environment, &logs, &out).expect("导出诊断包");
+
+        let entries = entries_of(&zip);
+        // 反向自证 1：三个来源都进包了，扫描不是在一个空包上空转。
+        assert_eq!(
+            names_of(&entries),
+            vec![
+                "environment.txt",
+                "preflight.txt",
+                "logs/rmc-2026-09-13.log"
+            ],
+            "三个来源没有都进包"
+        );
+        // 反向自证 2：非密的记号还在，脱敏没有把整段清空。
+        for entry in ["environment.txt", "logs/rmc-2026-09-13.log"] {
+            assert!(
+                contains_bytes(text_of(&entries, entry), MARK.as_bytes()),
+                "{entry} 连非密的记号都没了，下面的扫描会空转"
+            );
+        }
+
+        // 主断言。
+        for (name, bytes) in &entries {
+            for (what, canary) in [("口令", PASSWORD), ("账号", ACCOUNT)] {
+                assert!(
+                    !contains_bytes(bytes, canary.as_bytes()),
+                    "条目 {name} 里出现了用户在表单上敲进去的{what}：\n{}",
+                    String::from_utf8_lossy(bytes)
+                );
+            }
+        }
+        let raw = std::fs::read(&zip).unwrap();
+        for canary in [PASSWORD, ACCOUNT] {
+            assert!(
+                !contains_bytes(&raw, canary.as_bytes()),
+                "zip 原始字节里有金丝雀"
+            );
+        }
+    }
+
+    /// 没填口令时**不许**把整份日志打花。
+    ///
+    /// `"".replace(..)` 会在每两个字符之间插一个记号。`Redaction::hide`
+    /// 自己挡着空串，这条守的是"[`redaction_for`] 真的走了那条挡板"
+    /// ——而"现场还没填口令就先导一包"恰恰是最常见的用法。
+    #[test]
+    fn an_empty_password_does_not_shred_the_bundle() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("rmc-2026-09-13.log"),
+            "2026-09-13T11:00:00+08:00 INFO 一行普通的日志\n",
+        )
+        .unwrap();
+
+        let form = crate::form::Form::default();
+        assert!(form.password.is_empty() && form.username.is_empty());
+
+        let zip = export(&form, None, "环境信息一行", &logs, dir.path()).expect("导出诊断包");
+        let entries = entries_of(&zip);
+        assert_eq!(
+            String::from_utf8_lossy(text_of(&entries, "environment.txt")),
+            "环境信息一行"
+        );
+        assert!(contains_bytes(
+            text_of(&entries, "logs/rmc-2026-09-13.log"),
+            "一行普通的日志".as_bytes()
+        ));
+        assert!(
+            !contains_bytes(text_of(&entries, "environment.txt"), REDACTED.as_bytes()),
+            "空口令把整份文本打花了"
+        );
     }
 
     // ================= 环境信息 =================

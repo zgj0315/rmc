@@ -1007,6 +1007,16 @@ where
         }
     }
 
+    /// W173：诊断页要的那句话经这条出去。**只取 `outcome` 那把短锁**
+    /// （跟 [`SspiProxyAuthenticator::last_outcome`] 一样），不碰
+    /// `negotiation`——那把锁可能正被一次去找域控的 SSPI 调用攥着，而
+    /// 这个方法是 Supervisor 在广播事件时同步调的。
+    ///
+    /// 转抄只有一处（[`AuthOutcome::summary`]），这里不重写任何映射。
+    fn auth_summary(&self) -> ProxyAuthSummary {
+        self.last_outcome().summary()
+    }
+
     async fn next_token(&self, scheme: &str, challenge: Option<&str>) -> Option<Zeroizing<String>> {
         let Some(package) = SspiPackage::from_http_scheme(scheme) else {
             // 截断（W32）：这一段字节来自代理响应头，没有任何长度约束。
@@ -2784,6 +2794,49 @@ mod tests {
                 package: SspiPackage::Negotiate,
                 rounds: 2
             }
+        );
+    }
+
+    // =================================================================
+    // W173：诊断页要的那句话，经 `ProxyAuthenticator::auth_summary` 出去
+    // =================================================================
+
+    /// **经 `dyn ProxyAuthenticator` 拿到的结局，跟 `last_outcome()` 说的
+    /// 是同一件事。**
+    ///
+    /// 断的是哪一根线：`AuthOutcome::summary()` 那张转抄表有自己的穷尽
+    /// 测试，rmc-core 那边 `Transport::last_proxy()` 会去调
+    /// `auth_summary()`，**中间这一个 `impl` 两头都没人守**。把
+    /// `auth_summary` 的实现删掉，trait 上的默认实现会接手、恒定返回
+    /// `NotAttempted`——诊断页上「代理认证」那一行于是永远写着"代理没有
+    /// 要求认证"，哪怕这次连接就是卡在代理认证上。那种情况下
+    /// **`cargo test --workspace` 一条都不红**，所以有这条。
+    ///
+    /// 刻意经 `&dyn ProxyAuthenticator` 调用：直接写 `a.auth_summary()`
+    /// 在固有方法与 trait 方法之间解析得到同一份，证明不了"默认实现被
+    /// 盖掉了"。
+    #[tokio::test]
+    async fn the_summary_reaches_the_core_through_the_trait_object() {
+        let a = SspiProxyAuthenticator::new(endpoint(), |_: SspiPackage, _: &str| None);
+        let obj: &dyn ProxyAuthenticator = &a;
+
+        // 反向自证：还没被要求过认证时，两边都说"没协商过"。
+        assert_eq!(obj.auth_summary(), ProxyAuthSummary::NotAttempted);
+        assert_eq!(a.last_outcome().summary(), ProxyAuthSummary::NotAttempted);
+
+        // 走一次本机不做的认证方式，结局离开 `NotAttempted`。
+        obj.begin_connection().await;
+        assert!(obj.next_token("Basic", None).await.is_none());
+
+        assert_eq!(
+            obj.auth_summary(),
+            ProxyAuthSummary::UnsupportedScheme("Basic".into()),
+            "trait 上的默认实现没被盖掉，诊断页会永远说「代理没有要求认证」"
+        );
+        assert_eq!(
+            obj.auth_summary(),
+            a.last_outcome().summary(),
+            "两个出口对不上"
         );
     }
 }

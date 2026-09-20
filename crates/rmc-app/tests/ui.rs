@@ -1017,3 +1017,163 @@ fn the_app_actually_mounts_the_diagnostics_page() {
     assert!(ui.find("导出诊断包").is_err(), "切回维护页还画着诊断页");
     assert!(ui.find("维护目标").is_ok(), "维护页没画出来");
 }
+
+// ===================================================================
+// Task 10：日志页
+// ===================================================================
+
+/// `App` 在「日志」页签下画的真的是日志页。
+///
+/// 跟 `the_app_actually_mounts_the_diagnostics_page` 同一个理由：
+/// `view/logs.rs` 里那些针对 `log_row` / `chip` 的测试证明不了 `App`
+/// 挂的是它。Task 6 实测过，`main()` 可以挂一棵完全不相干的树而所有
+/// 针对 `view` 函数的测试全绿。
+///
+/// 改红：把 `App::view` 里 `Tab::Logs` 那一支改回
+/// `iced::widget::space::vertical().into()`（那正是这一轮之前的样子）
+/// ——全部断言一起红。
+#[test]
+fn the_app_actually_mounts_the_logs_page() {
+    let mut app = App::default();
+    app.update(Message::TabSelected(Tab::Logs));
+    let mut ui = simulator(app.view());
+
+    // 四个筛选标签，各带自己的计数。
+    for label in ["全部 0", "信息 0", "警告 0", "错误 0"] {
+        assert!(ui.find(label).is_ok(), "日志页上找不到筛选标签「{label}」");
+    }
+    // 底部那行字与按钮。
+    let mut ui = simulator(app.view());
+    assert!(ui.find("打开日志目录").is_ok(), "没有「打开日志目录」");
+    let mut ui = simulator(app.view());
+    let footer = ui.find(|c: Candidate<'_>| match c {
+        Candidate::Text { content, .. } if content.starts_with("最近 200 条") => Some(()),
+        _ => None,
+    });
+    assert!(footer.is_ok(), "日志页底部那行字没挂上去");
+
+    // 切回维护页就不该还画着日志页。
+    let mut app = App::default();
+    app.update(Message::TabSelected(Tab::Maintain));
+    let mut ui = simulator(app.view());
+    assert!(ui.find("打开日志目录").is_err(), "切回维护页还画着日志页");
+}
+
+/// 还没有日志时，页面上**说了一句话**，不是一片空白。
+///
+/// W174 在界面上的落地：「还没有日志」与「日志读不出来」必须长得不一样，
+/// 而且两种都不能是静悄悄的空白——日志页正是用户出问题时唯一会去看的
+/// 地方。
+///
+/// 改红：把 `view::logs::view` 里那段 `if let Some(n) = tail.notice()`
+/// 删掉。
+#[test]
+fn an_empty_log_page_says_why_it_is_empty() {
+    let mut app = App::default();
+    app.update(Message::TabSelected(Tab::Logs));
+    let mut ui = simulator(app.view());
+
+    let notice = ui.find(|c: Candidate<'_>| match c {
+        Candidate::Text { content, .. } if content.contains("还没有日志") => Some(()),
+        _ => None,
+    });
+    assert!(notice.is_ok(), "日志页是一片空白，什么都没说");
+}
+
+/// 点一个筛选标签，`App` 的状态真的跟着变，画出来的也跟着变。
+///
+/// 改红：把 `App::update` 里 `Message::LogFilterSelected(f)` 那一支改成
+/// `{}`——点了没反应，而按钮照样有按下去的动画。
+#[test]
+fn clicking_a_chip_actually_switches_the_filter() {
+    use rmc_app::logs::{LogFilter, LogLevel};
+
+    let mut app = App::default();
+    app.update(Message::TabSelected(Tab::Logs));
+    assert_eq!(app.log_filter(), LogFilter::All);
+
+    let mut ui = simulator(app.view());
+    ui.click("错误 0").expect("点不到「错误」标签");
+    for m in ui.into_messages().collect::<Vec<Message>>() {
+        app.update(m);
+    }
+    assert_eq!(app.log_filter(), LogFilter::Only(LogLevel::Error));
+}
+
+/// 搜索框敲进去的字真的写回了 `App`。
+#[test]
+fn typing_in_the_search_box_reaches_the_app() {
+    let mut app = App::default();
+    app.update(Message::TabSelected(Tab::Logs));
+    let mut ui = simulator(app.view());
+    // 搜索框是空的，可见文本就是占位符。
+    ui.click("搜索").expect("点不到搜索框");
+    ui.typewrite("22001");
+    let messages: Vec<Message> = ui.into_messages().collect();
+    assert!(!messages.is_empty(), "敲字没发出任何消息");
+    for m in messages {
+        app.update(m);
+    }
+    // 反向自证：确实是搜索框收的，不是别的输入框。
+    let mut ui = simulator(app.view());
+    assert!(has_input(&mut ui, "22001"), "敲进去的字没有回到搜索框里");
+}
+
+/// 日志页上的三种等级各画各的，而且**画的是等级那个词本身**。
+///
+/// 这条走 `App::view`（而不是 `view/logs.rs` 里的 `log_row`），因此同时
+/// 证明了筛选真的作用在列表上。
+#[test]
+fn the_log_page_draws_each_level_and_the_filter_really_filters() {
+    use rmc_app::logs::{LogFilter, LogLevel};
+
+    let dir = tempfile::tempdir().expect("建临时目录");
+    let paths = rmc_app::wiring::AppPaths::at(dir.path().to_path_buf());
+    std::fs::create_dir_all(paths.log_dir()).unwrap();
+    std::fs::write(
+        paths.current_log(),
+        concat!(
+            "2026-09-13T11:12:44+08:00 INFO 预检通过\n",
+            "2026-09-13T11:14:02+08:00 WARN 一体机首包延迟\n",
+            "2026-09-13T11:52:31+08:00 ERROR 连接被重置\n",
+        ),
+    )
+    .unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (_ev_tx, ev_rx) = tokio::sync::broadcast::channel(4);
+    let core = rmc_app::wiring::Core::new(tx, ev_rx, paths, None);
+    let mut app = App::with_core(Some(core));
+    app.update(Message::TabSelected(Tab::Logs));
+
+    let drawn = |app: &App, want: &str| simulator(app.view()).find(want).is_ok();
+
+    for text in [
+        "11:12:44",
+        "INFO",
+        "预检通过",
+        "WARN",
+        "ERROR",
+        "连接被重置",
+    ] {
+        assert!(drawn(&app, text), "日志页上找不到「{text}」");
+    }
+    // 计数也对得上。
+    for label in ["全部 3", "信息 1", "警告 1", "错误 1"] {
+        assert!(drawn(&app, label), "标签「{label}」的计数不对");
+    }
+
+    // 只看错误：另外两行必须从树里消失。
+    app.update(Message::LogFilterSelected(LogFilter::Only(LogLevel::Error)));
+    assert!(drawn(&app, "连接被重置"), "筛成错误之后错误那行也没了");
+    assert!(
+        !drawn(&app, "预检通过"),
+        "筛成「错误」之后信息那一行还画着——筛选没作用在列表上"
+    );
+
+    // 搜索同理。
+    app.update(Message::LogFilterSelected(LogFilter::All));
+    app.update(Message::LogQueryChanged("延迟".into()));
+    assert!(drawn(&app, "一体机首包延迟"));
+    assert!(!drawn(&app, "预检通过"), "搜索没作用在列表上");
+}
