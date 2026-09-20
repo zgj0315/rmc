@@ -34,3 +34,4 @@ pub mod proxy;
 pub mod secret;
 pub mod single_instance;
 pub mod sspi;
+pub mod tray;

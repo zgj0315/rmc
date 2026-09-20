@@ -66,6 +66,11 @@ fn the_scan_really_reaches_this_crates_source() {
         // Task 9 新增的两个文件也要真的被走到。
         ("diag.rs", "系统代理"),
         ("view/diagnostics.rs", "导出诊断包"),
+        // Task 11 新增的两个文件同样要被走到——托盘提示与通知正文是
+        // **会弹到用户屏幕上**的字，而它们一条都不在控件树里，
+        // `tests/ui.rs` 那道扫描一个字都看不见。
+        ("tray.rs", "远程维护"),
+        ("remember.rs", "账号记录的格式不对，当作没有记过"),
     ] {
         assert!(
             lits.iter().any(|l| l.file == file && l.text == text),

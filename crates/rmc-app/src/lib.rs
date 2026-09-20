@@ -31,17 +31,20 @@ pub mod diag;
 pub mod form;
 pub mod logs;
 pub mod model;
+pub mod remember;
 pub mod theme;
+pub mod tray;
 pub mod view;
 pub mod wiring;
 
 use form::Form;
 use logs::{LogFilter, LogTail};
 use model::{Action, Model};
-use rmc_core::state::{Command, TunnelEvent};
+use rmc_core::state::{Command, State, TunnelEvent};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use theme::{Tab, WINDOW_SIZE};
+use tray::{Notify, SessionDelta, TrayFactory, TraySink};
 use wiring::Core;
 use zeroize::Zeroizing;
 
@@ -139,17 +142,22 @@ pub fn window_settings() -> iced::window::Settings {
 /// 而那在 1.89 上是 `error[E0658]: impl Trait in type aliases is unstable`。
 pub fn program(
     core: Option<Core>,
+    tray: TrayFactory,
 ) -> iced::application::Application<
     impl iced::Program<State = App, Message = Message, Theme = iced::Theme>,
 > {
-    iced::application(move || App::with_core(core.clone()), App::update, App::view)
-        .title(WINDOW_TITLE)
-        .theme(APP_THEME)
-        .window(window_settings())
-        // W150：brief 的 `Message::Tick` 被 Task 8 静默丢掉了，后果是
-        // 「已连接 HH:MM:SS」不会自己走字。这一行是它回来的地方，另一半
-        // 在 [`subscription`]。
-        .subscription(subscription)
+    iced::application(
+        move || App::boot(core.clone(), tray),
+        App::update,
+        App::view,
+    )
+    .title(WINDOW_TITLE)
+    .theme(APP_THEME)
+    .window(window_settings())
+    // W150：brief 的 `Message::Tick` 被 Task 8 静默丢掉了，后果是
+    // 「已连接 HH:MM:SS」不会自己走字。这一行是它回来的地方，另一半
+    // 在 [`subscription`]。
+    .subscription(subscription)
 }
 
 /// 把内核接上去，交出一个可以 `run()` 的程序。
@@ -181,7 +189,11 @@ pub fn assemble(
     // `wiring::subscribe_installed` 上关于"为什么这里必须有一个全局"
     // 的说明；命令与路径走 `App` 自己持有的那一份。
     wiring::install_event_source(&core);
-    program(Some(core))
+    // W192：托盘也在这里装。写成一个**函数指针**而不是就地
+    // `wiring::open_tray()`，是为了让「boot 真的把托盘装进了 `App`」在
+    // macOS 上可观测——测试喂一个假工厂就能看见（见
+    // [`tests::booting_the_program_installs_the_tray_the_factory_gives_it`]）。
+    program(Some(core), wiring::open_tray)
 }
 
 /// 每秒一跳。计时器与日志刷新都跟着它。
@@ -334,6 +346,16 @@ pub struct App {
     core: Option<Core>,
     /// 上一次导出的诊断包落在哪儿。
     last_export: Option<PathBuf>,
+    /// 通知区图标。`None` 表示这台机器上没有托盘（非 Windows，或者
+    /// 建不出来）——界面照常工作。判断全在 [`tray`]，这里只是个出口。
+    tray: Option<Box<dyn TraySink>>,
+    /// 密码框旁边那句话：启动时取回记住的密码的结局（W200 第 3 条）。
+    ///
+    /// `None` 表示没什么好说的（这台机器没记过账号，或者用户已经动过
+    /// 密码框）。四种失败分类各自的话来自 Task 4 的
+    /// [`rmc_win::secret::LoadOutcome::diagnostic`]，rmc-app 一个字都不
+    /// 重写。
+    password_note: Option<String>,
     /// 诊断页底部那行环境信息。
     ///
     /// 算一次存着，不是每帧调一次 [`diag::environment_line`]：`view` 要
@@ -362,19 +384,107 @@ impl Default for App {
             log_file_name: wiring::current_log_name(),
             core: None,
             last_export: None,
+            // `Default` 保持纯：不去建托盘、不去读密码。真正的装配在
+            // [`App::boot`]。
+            tray: None,
+            password_note: None,
         }
     }
 }
 
 impl App {
-    /// 接上内核。`program()` 的 boot 走这条。
+    /// 接上内核，不装托盘。测试与 `App::boot` 都走它。
     pub fn with_core(core: Option<Core>) -> Self {
+        Self::boot(core, tray::no_tray)
+    }
+
+    /// 接上内核并装上托盘。`program()` 的 boot 走这条。
+    ///
+    /// 三件事：读一次日志、**取回记住的密码**（W200 第 2 条）、把托盘
+    /// 的初始颜色与提示画上。
+    pub fn boot(core: Option<Core>, tray: TrayFactory) -> Self {
         let mut app = Self {
             core,
+            tray: tray(),
             ..Self::default()
         };
         app.reload_logs();
+        app.recall_password();
+        app.refresh_tray();
         app
+    }
+
+    /// 装一个托盘出口。测试用——生产路径走 [`Self::boot`] 的工厂。
+    pub fn with_tray(mut self, tray: Option<Box<dyn TraySink>>) -> Self {
+        self.tray = tray;
+        self.refresh_tray();
+        self
+    }
+
+    /// 密码框旁边那句话。`None` 表示没什么好说的。
+    pub fn password_note(&self) -> Option<&str> {
+        self.password_note.as_deref()
+    }
+
+    /// 内核那一份「落点 + 密码存储」。两样都有才谈得上记住密码。
+    ///
+    /// 返回克隆而不是借用：调用方接着要 `&mut self.form`。
+    fn secrets(
+        &self,
+    ) -> Option<(
+        wiring::AppPaths,
+        std::sync::Arc<dyn rmc_win::secret::SecretStore>,
+    )> {
+        let core = self.core.as_ref()?;
+        let store = core.secrets.clone()?;
+        Some((core.paths.clone(), store))
+    }
+
+    /// W200 第 2、3 条：启动时取回记住的密码，填进表单；取回失败时把
+    /// Task 4 那四种分类的诊断话留在 [`Self::password_note`] 里。
+    fn recall_password(&mut self) {
+        let Some((paths, store)) = self.secrets() else {
+            return;
+        };
+        self.password_note = remember::recall(&paths, store.as_ref()).fill(&mut self.form);
+    }
+
+    /// W200 第 1 条：连接成功之后按「记住密码」的勾存或清。
+    fn remember_password(&mut self) {
+        let Some((paths, store)) = self.secrets() else {
+            return;
+        };
+        match remember::save(&paths, store.as_ref(), &self.form) {
+            remember::SaveOutcome::Saved { .. } => tracing::info!("已记住这个运维服务器的密码"),
+            remember::SaveOutcome::Cleared => tracing::info!("按用户的选择清掉了记住的密码"),
+            remember::SaveOutcome::Incomplete => {}
+            // **不静默吞掉**：记不住而用户以为记住了，下次启动会莫名
+            // 其妙地要他重新输入。
+            remember::SaveOutcome::Failed(e) => {
+                tracing::error!(error = %e, "记住密码失败");
+            }
+        }
+    }
+
+    /// 把当前状态画到托盘上。
+    fn refresh_tray(&self) {
+        let Some(t) = self.tray.as_ref() else {
+            return;
+        };
+        t.show_status(&tray::tooltip(&self.model), tray::icon_color(&self.model));
+    }
+
+    /// 这一拍要不要弹通知。**压住的那一档也记一行**——`Suppressed` 跟
+    /// `Nothing` 不是一回事（W193）。
+    fn notify_tray(&self, before: &State, after: &State, sessions: SessionDelta) {
+        let Some(t) = self.tray.as_ref() else {
+            return;
+        };
+        match tray::notification_for(before, after, sessions) {
+            Notify::Show(n) => t.show_notification(&n),
+            Notify::Suppressed { reason } => tracing::debug!(reason, "这一拍刻意不弹通知"),
+            Notify::Nothing => {}
+        }
     }
 
     /// 当前选中的页签。
@@ -517,11 +627,26 @@ impl App {
     ///    派生，两者结构上不可能分叉。
     pub fn apply(&mut self, event: rmc_core::TunnelEvent) {
         let before = self.model.state.clone();
+        let before_sessions = self.model.sessions.clone();
         self.model.apply(event);
-        if model::should_clear_password(&before, &self.model.state) {
+        let after = self.model.state.clone();
+
+        if model::should_clear_password(&before, &after) {
             self.form.clear_password();
         }
         self.form.detected_proxy = self.model.proxy.as_ref().map(|p| p.endpoint.clone());
+
+        // W200 第 1 条：**连上了**才谈得上记住密码——口令没被运维服务器
+        // 验过就存下来，等于把一个打错的口令记一年。
+        if !matches!(before, State::Connected { .. }) && matches!(after, State::Connected { .. }) {
+            self.remember_password();
+        }
+
+        // W192：托盘跟着走。通知在前、重画在后——两者互不影响，但先算
+        // 通知能让 `before` 那一份状态用完即弃。
+        let sessions = SessionDelta::between(&before_sessions, &self.model.sessions);
+        self.notify_tray(&before, &after, sessions);
+        self.refresh_tray();
     }
 
     pub fn update(&mut self, message: Message) {
@@ -532,8 +657,20 @@ impl App {
             Message::GatewayHostChanged(v) => self.form.gateway_host = v,
             Message::GatewayPortChanged(v) => self.form.gateway_port = v,
             Message::UsernameChanged(v) => self.form.username = v,
-            Message::PasswordChanged(v) => self.form.password = v,
-            Message::RememberToggled(v) => self.form.remember = v,
+            Message::PasswordChanged(v) => {
+                self.form.password = v;
+                // 用户自己动了密码框，上一轮取回的那句话就过期了。
+                self.password_note = None;
+            }
+            Message::RememberToggled(v) => {
+                self.form.remember = v;
+                self.password_note = None;
+                // 取消勾选 = 「不再记住密码」，当场清掉，不等下一次连接
+                // 成功（那可能永远不会发生）。
+                if !v {
+                    self.remember_password();
+                }
+            }
             Message::ActionPressed(a) => self.dispatch(a),
             Message::DisconnectSession(id) => self.send(Command::DisconnectRemoteSession { id }),
             Message::Tick => self.tick(SystemTime::now()),
@@ -549,9 +686,12 @@ impl App {
             // 时长用 `self.now`（由 `Tick` 推进），**不是现取的
             // `SystemTime::now()`**——现取的话这行字只在别的消息顺带
             // 触发重画时才动一下。见 `App::now` 上的说明。
-            Tab::Maintain => {
-                view::maintain::view(&self.model, &self.form, self.model.elapsed(self.now))
-            }
+            Tab::Maintain => view::maintain::view(
+                &self.model,
+                &self.form,
+                self.model.elapsed(self.now),
+                self.password_note(),
+            ),
             Tab::Diagnostics => view::diagnostics::view(
                 &self.model,
                 self.model.proxy.as_ref(),
@@ -671,7 +811,7 @@ mod tests {
 
         // 不接内核：这两条验的是装配（标题、主题、窗口、挂的是哪棵树），
         // 跟内核无关，而 `program(Some(..))` 会要一个 tokio 运行时。
-        check(&program(None));
+        check(&program(None, tray::no_tray));
     }
 
     /// 同一层的另一半：`main()` 挂上去的 view 是不是 [`App::view`]。
@@ -723,7 +863,7 @@ mod tests {
 
         // 不接内核：这两条验的是装配（标题、主题、窗口、挂的是哪棵树），
         // 跟内核无关，而 `program(Some(..))` 会要一个 tokio 运行时。
-        check(&program(None));
+        check(&program(None, tray::no_tray));
     }
 
     /// W141 的第三道：`Message` 不许把口令印出来。
@@ -1557,5 +1697,453 @@ mod tests {
             matches!(messages[0], Message::ActionPressed(Action::OpenLogDir)),
             "{messages:?}"
         );
+    }
+}
+
+/// Task 11 的接线：托盘（W192）与记住密码（W200）。
+///
+/// 这两块的共同处境：零件都做完了、都有自己的单测，而**从界面到零件的
+/// 那根线两头都没人守**——上一轮 `Core::secrets` 一个生产读方都没有，
+/// 勾选框什么都不做，六道闸门全绿。
+#[cfg(test)]
+mod task11_tests {
+    use super::*;
+    use crate::tray::{Notification, TraySink};
+    use model::Action;
+    use rmc_core::state::RemoteSessionInfo;
+    use rmc_win::secret::{FileSecretStore, Sealer, SecretStore};
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::SystemTime;
+    use tokio::sync::{broadcast, mpsc};
+
+    const CANARY: &str = "canary-3c81af-through-the-ui";
+    const KEY: &str = "tunnel-zhang@ops.example.com:443";
+
+    // ---------- 假托盘 ----------
+
+    /// 托盘上真的发生过什么。
+    #[derive(Debug, Default)]
+    struct TrayLog {
+        status: Mutex<Vec<(String, iced::Color)>>,
+        notifications: Mutex<Vec<Notification>>,
+    }
+
+    #[derive(Debug)]
+    struct FakeTray(Arc<TrayLog>);
+
+    impl TraySink for FakeTray {
+        fn show_status(&self, tip: &str, color: iced::Color) {
+            self.0.status.lock().expect("锁").push((tip.into(), color));
+        }
+        fn show_notification(&self, n: &Notification) {
+            self.0.notifications.lock().expect("锁").push(n.clone());
+        }
+    }
+
+    fn app_with_tray() -> (App, Arc<TrayLog>) {
+        let log = Arc::new(TrayLog::default());
+        let app = App::default().with_tray(Some(Box::new(FakeTray(Arc::clone(&log)))));
+        (app, log)
+    }
+
+    fn session(id: u64) -> RemoteSessionInfo {
+        RemoteSessionInfo {
+            id,
+            opened_at: SystemTime::UNIX_EPOCH,
+            to_appliance: 0,
+            from_appliance: 0,
+        }
+    }
+
+    /// `program()` 的 boot 用的那个假工厂往这里记。
+    ///
+    /// **只有 `booting_the_program_installs_the_tray_the_factory_gives_it`
+    /// 用它**——那条测试的第一句反向自证（「还没被调过」）只有在这个
+    /// 前提下才站得住。
+    static BOOT_TRAY: LazyLock<Arc<TrayLog>> = LazyLock::new(Arc::default);
+
+    fn boot_tray_factory() -> Option<Box<dyn TraySink>> {
+        Some(Box::new(FakeTray(Arc::clone(&BOOT_TRAY))))
+    }
+
+    // ---------- 假密封器 ----------
+
+    /// 可逆的假密封器（字节取反）。**证明不了「明文没落盘」**——取反之后
+    /// 本来就不会出现明文子串，那条断言靠自己的反向自证站住。
+    struct FlipSealer;
+
+    impl Sealer for FlipSealer {
+        fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
+            Some(plain.iter().map(|b| !b).collect())
+        }
+        fn unseal(&self, sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+            Some(Zeroizing::new(sealed.iter().map(|b| !b).collect()))
+        }
+    }
+
+    /// 解不开——「换了 Windows 账号」那一格。
+    struct BrokenSealer;
+
+    impl Sealer for BrokenSealer {
+        fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
+            Some(plain.to_vec())
+        }
+        fn unseal(&self, _sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+            None
+        }
+    }
+
+    /// 一根带密码存储的假线。
+    fn app_that_remembers<S: Sealer + 'static>(
+        root: &std::path::Path,
+        sealer: S,
+    ) -> (App, Arc<dyn SecretStore>) {
+        let paths = wiring::AppPaths::at(root.to_path_buf());
+        let store: Arc<dyn SecretStore> =
+            Arc::new(FileSecretStore::new(paths.secrets_dir(), Box::new(sealer)));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (_ev_tx, ev_rx) = broadcast::channel(4);
+        let core = wiring::Core::new(cmd_tx, ev_rx, paths, Some(Arc::clone(&store)));
+        (App::with_core(Some(core)), store)
+    }
+
+    fn form_ready_to_remember() -> Form {
+        Form {
+            appliance_host: "192.168.100.10".into(),
+            appliance_port: "61001".into(),
+            gateway_host: "ops.example.com".into(),
+            gateway_port: "443".into(),
+            username: "tunnel-zhang".into(),
+            password: Zeroizing::new(CANARY.into()),
+            remember: true,
+            detected_proxy: None,
+        }
+    }
+
+    // ================= W192：托盘接线 =================
+
+    /// **`program()` 的 boot 真的把工厂给的托盘装进了 `App`，而且当场
+    /// 画了一次初始状态。**
+    ///
+    /// 断的是哪一根线：没有这条，`App::boot` 里 `tray: tray()` 写成
+    /// `tray: None` 也不会有任何东西红——跟 W177 那两枪一模一样。
+    ///
+    /// 改红：把 `App::boot` 里的 `tray: tray()` 换成 `tray: None`，
+    /// 或者把 `boot` 末尾那句 `app.refresh_tray()` 删掉。
+    #[test]
+    fn booting_the_program_installs_the_tray_the_factory_gives_it() {
+        fn boot_state<P>(p: &P) -> App
+        where
+            P: iced::Program<State = App, Message = Message, Theme = iced::Theme>,
+        {
+            let (state, _task) = p.boot();
+            state
+        }
+
+        // 反向自证：工厂还一次都没被调过，下面那条断言因此带载。
+        assert!(
+            BOOT_TRAY.status.lock().expect("锁").is_empty(),
+            "有别的测试用了这个工厂，这条测试的前提不成立"
+        );
+
+        let state = boot_state(&program(None, boot_tray_factory));
+        // `App` 确实拿着一个托盘。
+        assert!(state.tray.is_some(), "boot 出来的 App 身上没有托盘");
+
+        let status = BOOT_TRAY.status.lock().expect("锁");
+        assert_eq!(status.len(), 1, "boot 之后托盘应当被画过恰好一次");
+        assert_eq!(
+            status[0].1,
+            theme::color::IDLE,
+            "初始颜色不是「未开启」的灰"
+        );
+        assert!(
+            status[0].0.contains("未开启"),
+            "初始提示不是「未开启」：{}",
+            status[0].0
+        );
+    }
+
+    /// **内核推上来的状态变化真的重画了托盘。**
+    ///
+    /// 改红：把 `App::apply` 末尾那句 `self.refresh_tray()` 删掉——
+    /// 托盘会永远停在「未开启」的灰点上，而窗口里一切正常。
+    #[test]
+    fn a_state_change_repaints_the_tray() {
+        let (mut app, log) = app_with_tray();
+        // 反向自证：装上托盘时画过一次「未开启」。
+        assert_eq!(log.status.lock().expect("锁").len(), 1);
+
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+
+        let status = log.status.lock().expect("锁");
+        assert_eq!(status.len(), 2, "状态变了却没有重画托盘");
+        assert_eq!(status[1].1, theme::color::CONNECTED);
+        assert!(status[1].0.contains("已连接"), "{}", status[1].0);
+        // 而且画的就是 `tray::tooltip` 算出来的那一份，不是另写一遍。
+        assert_eq!(status[1].0, tray::tooltip(app.model()));
+        assert_eq!(status[1].1, tray::icon_color(app.model()));
+    }
+
+    /// **远程会话接进来会弹一条通知；退避重连一条都不弹。**
+    ///
+    /// 断的是哪一根线：`App::apply` 里算 [`SessionDelta`] 并调
+    /// `notify_tray` 那两行。在这一轮之前 `notification_for` 根本没有
+    /// 调用方。
+    ///
+    /// 改红：把 `App::apply` 里的 `self.notify_tray(..)` 删掉（第一组
+    /// 断言红）；或者把 `SessionDelta::between(&before_sessions, ..)`
+    /// 的第一个参数换成 `&[]`（每一拍都会当成「新接进来 N 个」，
+    /// 最后那条「同一份会话列表重发一次不弹」当场红）。
+    #[test]
+    fn a_session_pops_a_notification_but_a_reconnect_does_not() {
+        let (mut app, log) = app_with_tray();
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        // 反向自证：到这里为止一条通知都没有。
+        assert!(log.notifications.lock().expect("锁").is_empty());
+
+        app.apply(TunnelEvent::RemoteSessions(vec![session(7)]));
+        {
+            let ns = log.notifications.lock().expect("锁");
+            assert_eq!(ns.len(), 1, "远程会话接进来却没弹通知");
+            assert_eq!(ns[0].title, "远程维护");
+            assert_eq!(ns[0].body, "1 个远程会话已接入一体机");
+        }
+
+        // 同一份会话列表再推一次：什么都没变，不该再弹。
+        app.apply(TunnelEvent::RemoteSessions(vec![session(7)]));
+        assert_eq!(
+            log.notifications.lock().expect("锁").len(),
+            1,
+            "会话列表原样重发了一次却又弹了一条"
+        );
+
+        // 断开：再弹一条，说的是「结束」。
+        app.apply(TunnelEvent::RemoteSessions(vec![]));
+        {
+            let ns = log.notifications.lock().expect("锁");
+            assert_eq!(ns.len(), 2);
+            assert_eq!(ns[1].body, "1 个远程会话已结束");
+        }
+
+        // 退避重连：**刻意不弹**（现场网络抖一下很常见）。
+        app.apply(TunnelEvent::State(State::Backoff {
+            attempt: 1,
+            delay: Duration::from_secs(1),
+        }));
+        assert_eq!(
+            log.notifications.lock().expect("锁").len(),
+            2,
+            "重连弹了通知，会骚扰现场人员"
+        );
+        // 但托盘照样变色——不弹通知不等于不更新。
+        let status = log.status.lock().expect("锁");
+        assert_eq!(
+            status.last().expect("画过").1,
+            theme::color::BACKOFF,
+            "重连时托盘没有变成琥珀色"
+        );
+    }
+
+    /// 没有托盘时一切照常，不崩。
+    #[test]
+    fn an_app_without_a_tray_still_works() {
+        let mut app = App::default();
+        assert!(app.tray.is_none());
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        app.apply(TunnelEvent::RemoteSessions(vec![session(1)]));
+        assert_eq!(app.model().state, State::Connected { degraded: false });
+    }
+
+    // ================= W200：记住密码接线 =================
+
+    /// **连接成功 + 勾了「记住密码」→ 口令真的进了 `SecretStore`。**
+    ///
+    /// 断的是哪一根线：`App::apply` 里「刚连上就 `remember_password()`」
+    /// 那一段。Task 4 做完了密封与存储（105 条测试），Task 10 造出了
+    /// `Core::secrets`，而在这一轮之前**一个生产读方都没有**——勾选框
+    /// 勾了也白勾，六道闸门全绿。
+    ///
+    /// 改红：把 `App::apply` 里那句 `self.remember_password();` 删掉。
+    #[test]
+    fn connecting_with_remember_checked_really_stores_the_password() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, store) = app_that_remembers(dir.path(), FlipSealer);
+        app.form = form_ready_to_remember();
+
+        // 反向自证：连上之前确实什么都没存。
+        assert!(store.load(KEY).is_none(), "夹具脏了，下面那条是空转的");
+
+        // 走一遍真实路径：内核推上来「已连接」。
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+
+        let got = store.load(KEY).expect("连上了却没有记住密码");
+        assert_eq!(*got, CANARY);
+
+        // 反向自证之二：**没勾的时候不存**。
+        let dir2 = tempfile::tempdir().expect("建临时目录");
+        let (mut app2, store2) = app_that_remembers(dir2.path(), FlipSealer);
+        app2.form = Form {
+            remember: false,
+            ..form_ready_to_remember()
+        };
+        app2.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        assert!(store2.load(KEY).is_none(), "没勾也把口令存了下来");
+    }
+
+    /// 只是「正在连接」还不算成功，不许提前记住。
+    ///
+    /// 口令没被运维服务器验过就存下来，等于把一个打错的口令记一年。
+    #[test]
+    fn a_connection_that_has_not_succeeded_yet_stores_nothing() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, store) = app_that_remembers(dir.path(), FlipSealer);
+        app.form = form_ready_to_remember();
+
+        for s in [
+            State::Preflight,
+            State::Connecting,
+            State::Backoff {
+                attempt: 1,
+                delay: Duration::from_secs(1),
+            },
+            State::Failed {
+                class: rmc_core::error::ErrorClass::Auth,
+                message: "口令不对".into(),
+            },
+        ] {
+            app.apply(TunnelEvent::State(s.clone()));
+            assert!(store.load(KEY).is_none(), "{s:?} 就把口令记下来了");
+        }
+        // 反向自证：真连上了才记。
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        assert!(store.load(KEY).is_some());
+    }
+
+    /// **下一次启动：口令在密码框里，勾是勾上的，旁边还有一句说明。**
+    ///
+    /// 改红：把 `App::boot` 里那句 `app.recall_password();` 删掉。
+    #[test]
+    fn the_next_start_finds_the_password_already_in_the_box() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        {
+            let (mut app, _store) = app_that_remembers(dir.path(), FlipSealer);
+            app.form = form_ready_to_remember();
+            app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        }
+
+        // 新起一个 App，同一个落点——这就是「下一次启动」。
+        let (app, _store) = app_that_remembers(dir.path(), FlipSealer);
+        assert_eq!(*app.form().password, CANARY, "密码框是空的");
+        assert_eq!(app.form().username, "tunnel-zhang");
+        assert_eq!(app.form().gateway_host, "ops.example.com");
+        assert_eq!(app.form().gateway_port, "443");
+        assert!(app.form().remember, "勾没有跟着回来");
+        let note = app.password_note().expect("取回成功也该有一句说明");
+        assert!(!note.contains(CANARY), "说明里带上了口令：{note}");
+
+        // 口令也不许从别的顺手路径漏出去。
+        let dumped = format!("{app:?}");
+        assert!(!dumped.contains(CANARY), "口令经 App 的 Debug 漏了出来");
+    }
+
+    /// **换了 Windows 账号：密码框空着，但旁边说得出为什么。**
+    ///
+    /// 这一格就是 W21 当初要带类型出口的全部理由，也是四格里在现实中
+    /// 最常见的一格（换笔记本、换域账号）。
+    ///
+    /// 改红：把 `Recall::fill` 里 `outcome.diagnostic()` 那一行换成
+    /// `None`——密码框照样空着，而**一句解释都没有**，正是 W21 描述的
+    /// 那个场景。
+    #[test]
+    fn a_password_sealed_by_another_windows_account_explains_itself() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        {
+            let (mut app, _store) = app_that_remembers(dir.path(), FlipSealer);
+            app.form = form_ready_to_remember();
+            app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        }
+
+        // 换一个解不开的密封器 = 换了 Windows 账号。
+        let (app, _store) = app_that_remembers(dir.path(), BrokenSealer);
+        assert!(app.form().password.is_empty(), "解不开却填了口令");
+        let note = app.password_note().expect("解不开却一句话都不说");
+        assert!(
+            note.contains("换了账号或换了机器就解不开"),
+            "说的不是那句话：{note}"
+        );
+        assert_eq!(rmc_core::banned_word_in(note), None, "{note}");
+        // 账号还在，用户重新输入就能接着用。
+        assert_eq!(app.form().username, "tunnel-zhang");
+    }
+
+    /// 用户一动密码框，上一轮那句话就该消失——它说的是被覆盖掉的那一份。
+    #[test]
+    fn typing_a_new_password_clears_the_recall_note() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        {
+            let (mut app, _store) = app_that_remembers(dir.path(), FlipSealer);
+            app.form = form_ready_to_remember();
+            app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        }
+        let (mut app, _store) = app_that_remembers(dir.path(), BrokenSealer);
+        assert!(app.password_note().is_some(), "夹具本该留下一句话");
+
+        app.update(Message::PasswordChanged(Zeroizing::new("newpw".into())));
+        assert!(app.password_note().is_none(), "用户改了密码，旧说明还挂着");
+    }
+
+    /// **取消勾选当场就清掉，不等下一次连接成功**（那可能永远不会发生）。
+    ///
+    /// 改红：把 `Message::RememberToggled` 那一支里的
+    /// `if !v { self.remember_password(); }` 删掉——用户点了「不再记住
+    /// 密码」，而密文还躺在盘上。
+    #[test]
+    fn unchecking_remember_forgets_it_right_away() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, store) = app_that_remembers(dir.path(), FlipSealer);
+        app.form = form_ready_to_remember();
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        // 反向自证：确实记住过。
+        assert!(store.load(KEY).is_some());
+
+        app.update(Message::RememberToggled(false));
+
+        assert!(store.load(KEY).is_none(), "取消勾选之后密文还在盘上");
+        assert!(!app.form().remember);
+    }
+
+    /// 没有密码存储（非 Windows，或者装配失败）时，这一整块**什么都不做**
+    /// ——尤其不许退回明文存盘。
+    #[test]
+    fn without_a_secret_store_nothing_is_remembered_and_nothing_is_written() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = wiring::AppPaths::at(dir.path().to_path_buf());
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (_ev_tx, ev_rx) = broadcast::channel(4);
+        // `secrets: None` 就是非 Windows 那一档。
+        let core = wiring::Core::new(cmd_tx, ev_rx, paths.clone(), None);
+        let mut app = App::with_core(Some(core));
+        app.form = form_ready_to_remember();
+
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        app.update(Message::ActionPressed(Action::Start));
+
+        assert!(app.password_note().is_none());
+        assert!(!paths.last_account().exists(), "没有密封器却写了账号记录");
+        assert!(!paths.secrets_dir().exists(), "没有密封器却建了密文目录");
+        // 整个应用目录里不许出现明文口令。
+        for entry in std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let bytes = std::fs::read(entry.path()).unwrap_or_default();
+            assert!(
+                !bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes()),
+                "{:?} 里躺着明文口令",
+                entry.path()
+            );
+        }
     }
 }

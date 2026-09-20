@@ -388,6 +388,94 @@ pub const REDACTED: &str = "[已脱敏]";
 /// 一条日志都没写过，而真相是它读不出来。
 pub const LOGS_UNAVAILABLE: &str = "logs-unavailable.txt";
 
+/// 有日志被截断、被略过、或者根本读不出来时，包里那条说明的条目名
+/// （W196/W197）。
+///
+/// 跟 [`LOGS_UNAVAILABLE`] 分开：那一条说的是「整个目录列不出来」，
+/// 这一条说的是「目录列出来了，但里面某几个文件没有完整进包」。合成
+/// 一条的话，收到包的人分不出「一条日志都没有」与「少了最老的那两天」。
+pub const LOGS_INCOMPLETE: &str = "logs-incomplete.txt";
+
+/// 单个日志文件最多收进包里多少字节。超出的部分**从头部丢**，保留尾部
+/// ——出事的记录在最后。
+///
+/// # W197（W167 到期）：为什么必须有这个上限
+///
+/// 在这一轮之前 `bundle` 对日志大小**没有任何限制**：`std::fs::read`
+/// 整个读进内存 → [`Redaction::apply`] 产出第二份 → `write_all` 之前还
+/// 有一份压缩缓冲，**三份同时在堆上**。一份 500MB 的日志（审计日志按天
+/// 滚动，一台连续跑的机器上完全做得到）会让这个 520×720 的小工具在
+/// 导出诊断包时吃掉 1.5GB 并且很可能当场 OOM ——而用户点的是「出问题了，
+/// 导个包给工程师」。
+///
+/// 当初记下的理由是「轮转策略要 Task 11 才定」。这一轮就是 Task 11。
+pub const LOG_ENTRY_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// 一次导出里**全部**日志加起来的上限。
+///
+/// 只限单个文件不够：`log_dir` 下有多少天的日志是不封顶的。预算按
+/// **从新到旧**分配（[`plan_logs`]），所以吃紧时先保住今天那一份。
+pub const LOG_TOTAL_BUDGET: u64 = 16 * 1024 * 1024;
+
+/// 一个日志文件这次收多少。
+///
+/// 带类型，不是一个裸 `u64`（0 到底是「空文件」还是「一个字节都不收」
+/// 说不清）——同 W193 那一串。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogTake {
+    /// 整个文件都收。
+    Whole,
+    /// 只收**尾部** `bytes` 个字节，头部 `dropped` 个字节被丢掉。
+    Tail { bytes: u64, dropped: u64 },
+    /// 一个字节都不收：预算已经被更新的日志用完了。
+    Skipped,
+}
+
+/// 一个日志文件的收取计划。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedLog {
+    pub name: String,
+    pub size: u64,
+    pub take: LogTake,
+}
+
+/// 给一批日志文件分配预算。**纯函数**：收的是「文件名 + 大小」，不碰
+/// 文件系统，于是「500MB 的日志会怎么办」这件事在这台机器上是可测的
+/// （真造一个 500MB 的夹具既慢又会把开发机的盘填满）。
+///
+/// `files` 按文件名升序传入（日志名是 `rmc-YYYY-MM-DD.log`，升序即从旧
+/// 到新）。预算**从新到旧**分配：盘上日志太多时，保住的是最近那几天。
+/// 输出顺序跟输入一致，让同一份输入产出同一份包。
+pub fn plan_logs(files: &[(String, u64)]) -> Vec<PlannedLog> {
+    let mut takes = vec![LogTake::Skipped; files.len()];
+    let mut left = LOG_TOTAL_BUDGET;
+    for (i, (_, size)) in files.iter().enumerate().rev() {
+        let want = (*size).min(LOG_ENTRY_LIMIT).min(left);
+        takes[i] = if want >= *size {
+            LogTake::Whole
+        } else if want == 0 {
+            // 预算用完了。**不写成 `Tail { bytes: 0 }`**：那会在包里放
+            // 一个空条目，收到包的人以为这一天真的一条日志都没有。
+            LogTake::Skipped
+        } else {
+            LogTake::Tail {
+                bytes: want,
+                dropped: size - want,
+            }
+        };
+        left -= want;
+    }
+    files
+        .iter()
+        .zip(takes)
+        .map(|((name, size), take)| PlannedLog {
+            name: name.clone(),
+            size: *size,
+            take,
+        })
+        .collect()
+}
+
 /// 进诊断包之前要抹掉的东西。
 ///
 /// # 为什么脱敏要**登记**，而不是靠猜
@@ -524,10 +612,37 @@ pub fn bundle(out_dir: &Path, input: &BundleInput<'_>) -> std::io::Result<PathBu
     // 打得开、条目只有 `environment.txt`）。危害不是「远程那头解不开」，
     // 而是**界面报了失败、盘上却躺着一个看上去完整的包**：发的人和收的人
     // 都不会知道少了日志。
-    match write_bundle(&out_path, input) {
-        Ok(()) => Ok(out_path),
+    write_or_clean(&out_path, |p| write_bundle(p, input))
+}
+
+/// 写一个文件，**写失败就把半成品删掉**，成功时交出它的路径。
+///
+/// # W196：为什么这一层被单独抽出来
+///
+/// 这一轮把「单个日志文件读不出来」改成了优雅降级（见
+/// [`write_bundle`]），于是 `write_bundle` 再也**没有任何一条现实输入
+/// 能让它失败**——它现在只会因为输出文件本身出事（盘满、写到一半掉电、
+/// 杀软掐掉句柄）而失败，而那些在 macOS 上没有确定性的夹具。
+///
+/// 原来守这件事的
+/// [`tests::a_failed_export_leaves_no_half_filled_bundle_behind`] 的夹具
+/// 正是「用一个目录冒充日志文件」，也正是这一轮要改成降级的那一档——
+/// 改完那条守卫会因为**自己的反向自证**（`assert!(err.is_err())`）而变
+/// 红。两条出路：换一个能让 `File::create` 之后失败的夹具，或者如实
+/// 承认这条守卫此后无法覆盖。
+///
+/// 选的是第一条，做法是把清理这一层抽成这个函数：测试喂一个「先建出
+/// 文件、再返回 `Err`」的闭包，正是「盘满」那一路在磁盘上留下的形状。
+/// 代价写清楚：**它不再证明 `write_bundle` 真的会失败**（现在它几乎
+/// 不会），只证明「一旦失败，盘上不留半成品」。
+fn write_or_clean(
+    out_path: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    match write(out_path) {
+        Ok(()) => Ok(out_path.to_path_buf()),
         Err(e) => {
-            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(out_path);
             Err(e)
         }
     }
@@ -573,16 +688,40 @@ fn write_bundle(out_path: &Path, input: &BundleInput<'_>) -> std::io::Result<()>
     // - 别的（权限、路径被占）：**照样出包**，但包里留一条
     //   [`LOGS_UNAVAILABLE`] 说明为什么没有日志——静默少一个目录才是
     //   最糟的，收到包的人会以为这台机器真的一条日志都没写过。
-    let mut logs: Vec<PathBuf> = Vec::new();
+    let mut logs: Vec<(String, u64)> = Vec::new();
+    // 这一路上出的岔子都记在这儿，最后写成一条 `LOGS_INCOMPLETE` 说明。
+    let mut notes: Vec<String> = Vec::new();
     match std::fs::read_dir(input.log_dir) {
         Ok(entries) => {
             for entry in entries {
-                let path = entry?.path();
+                // W196：**列目录时某一项读不出来也不能让整包失败**。
+                // 原来这里是一个 `?`。
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        notes.push(format!("日志目录里有一项列不出来：{e}"));
+                        continue;
+                    }
+                };
+                let path = entry.path();
                 let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if name.starts_with("rmc-") && name.ends_with(".log") {
-                    logs.push(path);
+                if !(name.starts_with("rmc-") && name.ends_with(".log")) {
+                    continue;
+                }
+                // 大小取自 metadata。取不到就当它读不出来——**不去猜一个
+                // 大小**，猜错的后果是预算失效。
+                //
+                // **刻意不在这里筛 `is_file()`**：那会让「名字像日志的
+                // 目录」在这一步就被挡掉，下面 `read_log_range` 的降级
+                // 分支于是一条夹具都够不着（变异 M11 实测：把那一支换回
+                // `?`，全套测试照样全绿）。让它走完整条路，读不出来时
+                // 由同一条降级分支记一句，用户看到的结果一模一样，而
+                // 那条分支有了真实覆盖。
+                match std::fs::metadata(&path) {
+                    Ok(m) => logs.push((name.to_string(), m.len())),
+                    Err(e) => notes.push(format!("{name}：读不出来（{e}），没有收进包里")),
                 }
             }
         }
@@ -597,24 +736,82 @@ fn write_bundle(out_path: &Path, input: &BundleInput<'_>) -> std::io::Result<()>
             )?;
         }
     }
-    // 目录项的顺序由文件系统决定，排一遍序好让同一份输入产出同一份包。
+    // 目录项的顺序由文件系统决定，排一遍序好让同一份输入产出同一份包
+    // ——也让 `plan_logs` 的「从新到旧分配预算」有意义。
     logs.sort();
-    for path in logs {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("上面已经按 to_str() 筛过");
-        let raw = std::fs::read(&path)?;
+
+    for planned in plan_logs(&logs) {
+        let path = input.log_dir.join(&planned.name);
+        let (offset, note) = match planned.take {
+            LogTake::Whole => (0, None),
+            LogTake::Tail { bytes, dropped } => (
+                dropped,
+                Some(format!(
+                    "{}：共 {} 字节，只收了最后 {bytes} 字节（诊断包有大小上限）",
+                    planned.name, planned.size
+                )),
+            ),
+            LogTake::Skipped => {
+                notes.push(format!(
+                    "{}：共 {} 字节，整个没有收进包里（诊断包的日志预算已经被更新的日志用完）",
+                    planned.name, planned.size
+                ));
+                continue;
+            }
+        };
+        // W196：**单个日志文件读不出来不能让整包失败、更不能让整包被
+        // 删掉**。Windows 上「被别的进程占住」「正在轮转」「杀软挡住」
+        // 都是现场常见形态，而这一轮之前这里是一个 `?`——一个读不出来
+        // 的文件会让 `bundle` 返回 `Err`，`write_or_clean` 随即把已经
+        // 写好的环境信息与预检结果连同整个包一起删掉。
+        //
+        // 那跟紧挨着的「整个目录列不出来反而宽容」自相矛盾，也跟那段
+        // 注释自己立的原则（「静默少一个 `logs/` 才是最糟的」）相反。
+        let raw = match read_log_range(&path, offset) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                notes.push(format!("{}：读不出来（{e}），没有收进包里", planned.name));
+                continue;
+            }
+        };
+        if let Some(n) = note {
+            notes.push(n);
+        }
         // 日志是我们自己用 tracing 写的，永远是 UTF-8；`lossy` 是为了
-        // 「写到一半断电」这种半条字符的情形，宁可画一个替换符也不要
-        // 整个导出失败——现场要诊断包的时候多半正是出了乱子的时候。
+        // 「写到一半断电」这种半条字符的情形（截尾读也会从一个字符中间
+        // 开始），宁可画一个替换符也不要整个导出失败——现场要诊断包的
+        // 时候多半正是出了乱子的时候。
         let text = String::from_utf8_lossy(&raw);
-        zip.start_file(format!("logs/{}", input.redaction.apply(name)), opts)?;
+        zip.start_file(
+            format!("logs/{}", input.redaction.apply(&planned.name)),
+            opts,
+        )?;
         zip.write_all(input.redaction.apply(&text).as_bytes())?;
+    }
+
+    if !notes.is_empty() {
+        notes.sort();
+        zip.start_file(LOGS_INCOMPLETE, opts)?;
+        zip.write_all(input.redaction.apply(&notes.join("\n")).as_bytes())?;
     }
 
     zip.finish()?;
     Ok(())
+}
+
+/// 从 `offset` 开始把一个文件读到底。
+///
+/// `seek` 而不是「整个读进来再切」：W197 的全部意义就是**不要**把
+/// 500MB 读进堆里。
+fn read_log_range(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    let mut f = std::fs::File::open(path)?;
+    if offset > 0 {
+        f.seek(std::io::SeekFrom::Start(offset))?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// 这一次导出要抹掉哪些东西，**从表单上取**。
@@ -1525,37 +1722,43 @@ mod tests {
 
     /// 失败时**不留半成品**。
     ///
-    /// # 夹具必须让失败发生在 zip **已经建出来之后**
+    /// # W196：这条守卫换过一次夹具，代价写在这里
     ///
-    /// 第一版让输出目录本身是一个文件，于是 `File::create` 就失败了，
-    /// 盘上压根没出现过 zip——那种夹具下把 `remove_file` 删掉**一条都
-    /// 不红**（实测过）。要观察到"半成品"，失败必须发生在
-    /// `File::create` 成功之后：这里让日志目录里躺着一个**名字像日志
-    /// 文件的目录**，`read_dir` 会把它列出来，随后 `std::fs::read`
-    /// 在它上面失败（`EISDIR`），而那时 zip 已经建出来了。
+    /// 上一版的夹具是「日志目录里躺着一个名字像日志文件的**目录**」：
+    /// `read_dir` 把它列出来，随后 `std::fs::read` 在它上面失败
+    /// （`EISDIR`），而那时 zip 已经建出来了。
     ///
-    /// 改红：把 `bundle` 里那句 `let _ = std::fs::remove_file(&out_path);`
-    /// 删掉。
+    /// 这一轮把「单个日志文件读不出来」改成了优雅降级（W196），那个
+    /// 夹具于是**再也失败不了**——这条守卫因为自己那句反向自证
+    /// （`assert!(err.is_err())`）当场变红，是它自己把这次行为变更报出来
+    /// 的。改完之后 `write_bundle` 没有任何一条现实输入能让它失败：
+    /// 它只会因为输出文件本身出事（盘满、写到一半掉电、杀软掐掉句柄）
+    /// 而失败，而那些在 macOS 上没有确定性的夹具。
+    ///
+    /// 出路是把清理那一层抽成 [`write_or_clean`]，这里喂一个「**先把
+    /// 文件建出来**、再返回 `Err`」的闭包——那正是"盘满"在磁盘上留下的
+    /// 形状。
+    ///
+    /// **它此后不再证明的事**：`write_bundle` 真的会失败。那一条现在
+    /// 没有任何自动化覆盖，记在 task-11-report.md 的「改什么都不会红」。
+    ///
+    /// 改红：把 `write_or_clean` 里那句
+    /// `let _ = std::fs::remove_file(out_path);` 删掉。
     #[test]
     fn a_failed_export_leaves_no_half_filled_bundle_behind() {
         let dir = tempfile::tempdir().expect("建临时目录");
         let out = dir.path().join("out");
-        let logs = dir.path().join("logs");
         std::fs::create_dir_all(&out).unwrap();
-        std::fs::create_dir_all(&logs).unwrap();
-        // 一个**目录**，名字却长得像日志文件。
-        std::fs::create_dir(logs.join("rmc-2026-09-13.log")).unwrap();
+        let target = out.join("rmc-diagnostics-1.zip");
 
-        let form = crate::form::Form::default();
-        let err = bundle(
-            &out,
-            &BundleInput {
-                environment: "x",
-                report: None,
-                log_dir: &logs,
-                redaction: &redaction_for(&form),
-            },
-        );
+        let err = write_or_clean(&target, |p| {
+            // 先建出文件——半成品必须真的在盘上出现过，否则下面那条
+            // 断言在"压根没建过"时是永远为真的空转。
+            std::fs::write(p, b"PK\x03\x04 half-written")?;
+            assert!(p.exists(), "夹具没能让半成品出现在盘上");
+            Err(std::io::Error::other("模拟：写到一半盘满了"))
+        });
+
         assert!(err.is_err(), "夹具没能让导出失败，下面那条断言是空转的");
         // 主断言：输出目录里一个文件都没留下。
         let left: Vec<String> = std::fs::read_dir(&out)
@@ -1563,6 +1766,189 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert!(left.is_empty(), "失败之后留下了缺料的半成品：{left:?}");
+
+        // 反向自证之二：成功那一路不许把文件删掉，也要交出正确的路径。
+        let ok = write_or_clean(&target, |p| std::fs::write(p, b"done")).expect("写成功了却报了错");
+        assert_eq!(ok, target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"done");
+    }
+
+    /// **W196：单个日志文件读不出来，照样出包。**
+    ///
+    /// 这是上一轮（Task 10 修复轮）引入的行为回退：`std::fs::read` 上
+    /// 那个 `?` 让「一个读不出来的日志文件」把**整包**判成失败，而
+    /// `bundle` 随即连同已经写好的环境信息与预检结果一起删掉。
+    ///
+    /// Windows 上「被别的进程占住」「正在轮转」「杀软挡住」都是现场常见
+    /// 形态——也就是说**最需要诊断包的那一次，恰恰是导不出来的那一次**。
+    /// 而紧挨着的「整个目录列不出来」反而是宽容的，两者自相矛盾。
+    ///
+    /// 改红：把 `read_log_range` 那一处的 `match` 换回 `?`。
+    #[test]
+    fn one_unreadable_log_file_does_not_kill_the_whole_bundle() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("rmc-2026-09-12.log"), b"good line\n").unwrap();
+        // 一个**目录**，名字却长得像日志文件：`read_dir` 会列出它，
+        // 而它读不出来。这正是上一版夹具用的那一档。
+        std::fs::create_dir(logs.join("rmc-2026-09-13.log")).unwrap();
+
+        let form = crate::form::Form::default();
+        let zip = export(&form, None, "客户端 0.1.0", &logs, dir.path())
+            .expect("一个读不出来的日志文件不该让整包失败");
+
+        let entries = entries_of(&zip);
+        let names = names_of(&entries);
+        // 读得出来的那一份照样进包了。
+        assert!(
+            names.contains(&"logs/rmc-2026-09-12.log"),
+            "好的那份日志也没进包：{names:?}"
+        );
+        assert!(names.contains(&"environment.txt"));
+        // 读不出来的那一份**不许静默消失**，包里要说一句。
+        assert!(
+            names.contains(&LOGS_INCOMPLETE),
+            "少了一份日志却一声不响：{names:?}"
+        );
+        let note = String::from_utf8_lossy(text_of(&entries, LOGS_INCOMPLETE)).into_owned();
+        assert!(
+            note.contains("rmc-2026-09-13.log"),
+            "说明里没点名是哪一份日志：{note}"
+        );
+        // 反向自证：好的那一份**不**在说明里，说明不是一条恒定的话。
+        assert!(!note.contains("rmc-2026-09-12.log"), "{note}");
+    }
+
+    /// 全都读得出来的时候**不该**多出那条说明。
+    ///
+    /// 少了这条，上面那条在「`LOGS_INCOMPLETE` 每次都写」时也是绿的。
+    #[test]
+    fn a_healthy_log_directory_gets_no_incomplete_note() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("rmc-2026-09-12.log"), b"good line\n").unwrap();
+
+        let form = crate::form::Form::default();
+        let zip = export(&form, None, "客户端 0.1.0", &logs, dir.path()).expect("导出");
+        let entries = entries_of(&zip);
+        let names = names_of(&entries);
+        assert!(
+            !names.contains(&LOGS_INCOMPLETE),
+            "什么都没少却写了一条「日志不全」：{names:?}"
+        );
+        assert!(names.contains(&"logs/rmc-2026-09-12.log"));
+    }
+
+    // ================= W197：诊断包的大小上限 =================
+
+    /// 预算按**从新到旧**分配，超出的从头部丢、保留尾部。
+    ///
+    /// 纯函数上测，不用真造一个 500MB 的夹具（那会把开发机的盘填满，
+    /// 而且慢得没法跑）。
+    ///
+    /// 改红：把 `plan_logs` 里 `.enumerate().rev()` 的 `.rev()` 去掉
+    /// ——预算会从最老的日志开始花，盘上日志一多，**今天那一份反而进
+    /// 不了包**。最后那组断言当场红。
+    #[test]
+    fn the_log_budget_is_spent_on_the_newest_files_first() {
+        // 一个文件就超过单文件上限：只收尾部。
+        let plan = plan_logs(&[("rmc-1.log".into(), LOG_ENTRY_LIMIT + 100)]);
+        assert_eq!(
+            plan[0].take,
+            LogTake::Tail {
+                bytes: LOG_ENTRY_LIMIT,
+                dropped: 100
+            }
+        );
+
+        // 装得下的原样收。
+        let plan = plan_logs(&[("rmc-1.log".into(), 10), ("rmc-2.log".into(), 20)]);
+        assert_eq!(
+            plan.iter().map(|p| p.take).collect::<Vec<_>>(),
+            vec![LogTake::Whole, LogTake::Whole]
+        );
+        // 输出顺序跟输入一致，同一份输入产出同一份包。
+        assert_eq!(plan[0].name, "rmc-1.log");
+
+        // 总预算吃紧：五个文件各占满单文件上限，总预算只够四个。
+        let n = (LOG_TOTAL_BUDGET / LOG_ENTRY_LIMIT) as usize;
+        assert!(n >= 2, "总预算至少要放得下两个满额文件");
+        let files: Vec<(String, u64)> = (0..=n)
+            .map(|i| (format!("rmc-{i}.log"), LOG_ENTRY_LIMIT))
+            .collect();
+        let plan = plan_logs(&files);
+        // 最老的那一个被挤掉，最新的那几个都在。
+        assert_eq!(plan[0].take, LogTake::Skipped, "被挤掉的不是最老的那一份");
+        for p in &plan[1..] {
+            assert_eq!(p.take, LogTake::Whole, "{}：新日志反而没收全", p.name);
+        }
+        // 收进来的总量不超过预算。
+        let taken: u64 = plan
+            .iter()
+            .map(|p| match p.take {
+                LogTake::Whole => p.size,
+                LogTake::Tail { bytes, .. } => bytes,
+                LogTake::Skipped => 0,
+            })
+            .sum();
+        assert!(taken <= LOG_TOTAL_BUDGET, "{taken} 超过了总预算");
+    }
+
+    /// **一份超大的日志只有尾部进包，而且包里说清楚了。**
+    ///
+    /// 夹具用一个临时调小的观察口做不到（常量是编译期的），所以这里
+    /// 真写一个比 [`LOG_ENTRY_LIMIT`] 大一点的文件——4MB 出头，写盘
+    /// 不到一秒，跑完就扔。
+    ///
+    /// 改红：把 `read_log_range` 里的 `seek` 那一段删掉（永远从 0 读）
+    /// ——第二条断言当场红（包里会出现开头那个金丝雀）。
+    #[test]
+    fn an_oversized_log_keeps_only_its_tail_and_says_so() {
+        const HEAD: &str = "head-marker-8b1d2f";
+        const TAIL: &str = "tail-marker-4e9c07";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut body = String::with_capacity(LOG_ENTRY_LIMIT as usize + 4096);
+        body.push_str(HEAD);
+        while body.len() < LOG_ENTRY_LIMIT as usize + 1024 {
+            body.push_str("filler line\n");
+        }
+        body.push_str(TAIL);
+        let size = body.len() as u64;
+        assert!(size > LOG_ENTRY_LIMIT, "夹具没有超过单文件上限");
+        std::fs::write(logs.join("rmc-2026-09-13.log"), &body).unwrap();
+
+        let form = crate::form::Form::default();
+        let zip = export(&form, None, "客户端 0.1.0", &logs, dir.path()).expect("导出");
+        let entries = entries_of(&zip);
+        let kept = text_of(&entries, "logs/rmc-2026-09-13.log");
+
+        // 收进来的不超过上限。
+        assert!(
+            kept.len() as u64 <= LOG_ENTRY_LIMIT,
+            "收了 {} 字节，超过单文件上限 {LOG_ENTRY_LIMIT}",
+            kept.len()
+        );
+        // 丢的是头，留的是尾——出事的记录在最后。
+        assert!(
+            !contains_bytes(kept, HEAD.as_bytes()),
+            "整个文件都被读进来了，上限没有生效"
+        );
+        assert!(
+            contains_bytes(kept, TAIL.as_bytes()),
+            "留下的不是尾部，最近的记录被丢掉了"
+        );
+        // 包里说清楚少了什么。
+        let note = String::from_utf8_lossy(text_of(&entries, LOGS_INCOMPLETE)).into_owned();
+        assert!(note.contains("rmc-2026-09-13.log"), "{note}");
+        assert!(
+            note.contains(&size.to_string()),
+            "说明里没写原始大小：{note}"
+        );
     }
 
     // ================= 环境信息 =================

@@ -275,7 +275,7 @@ fn session(id: u64) -> RemoteSessionInfo {
 #[test]
 fn the_idle_maintain_page_draws_both_groups() {
     let (model, form) = (model_in(State::Idle), filled());
-    let mut ui = simulator(maintain::view(&model, &form, None));
+    let mut ui = simulator(maintain::view(&model, &form, None, None));
 
     for label in [
         "未开启",
@@ -326,7 +326,7 @@ fn connecting_hides_the_credential_rows_and_keeps_the_addresses() {
 
     // 反向自证：未开启时这些东西确实在，下面的"不在"才有意义。
     let idle = model_in(State::Idle);
-    let mut ui = simulator(maintain::view(&idle, &form, None));
+    let mut ui = simulator(maintain::view(&idle, &form, None, None));
     assert!(ui.find("账号").is_ok());
     assert!(ui.find("记住密码").is_ok());
     assert!(has_input(&mut ui, "tunnel-zhang"));
@@ -339,7 +339,7 @@ fn connecting_hides_the_credential_rows_and_keeps_the_addresses() {
         State::Stopping,
     ] {
         let model = model_in(state.clone());
-        let mut ui = simulator(maintain::view(&model, &form, None));
+        let mut ui = simulator(maintain::view(&model, &form, None, None));
         assert!(ui.find("记住密码").is_err(), "{state:?} 还画着「记住密码」");
         assert!(
             !has_input(&mut ui, "tunnel-zhang"),
@@ -358,7 +358,7 @@ fn connecting_hides_the_credential_rows_and_keeps_the_addresses() {
         class: rmc_core::ErrorClass::Fatal,
         message: "x".into(),
     });
-    let mut ui = simulator(maintain::view(&failed, &form, None));
+    let mut ui = simulator(maintain::view(&failed, &form, None, None));
     assert!(ui.find("记住密码").is_ok(), "失败后必须能重填凭据");
 }
 
@@ -375,7 +375,7 @@ fn locked_addresses_swallow_typing() {
 
     // 未开启：敲得进去，而且发出的是一体机地址那条消息。
     let idle = model_in(State::Idle);
-    let mut ui = simulator(maintain::view(&idle, &form, None));
+    let mut ui = simulator(maintain::view(&idle, &form, None, None));
     ui.click("192.168.100.10").expect("点不到一体机地址框");
     ui.typewrite("7");
     let messages: Vec<Message> = ui.into_messages().collect();
@@ -387,7 +387,7 @@ fn locked_addresses_swallow_typing() {
 
     // 已连接：框还在、点得到，但敲进去什么都没有。
     let connected = model_in(State::Connected { degraded: false });
-    let mut ui = simulator(maintain::view(&connected, &form, None));
+    let mut ui = simulator(maintain::view(&connected, &form, None, None));
     ui.click("192.168.100.10")
         .expect("已连接时一体机地址框应当还画着");
     ui.typewrite("7");
@@ -404,14 +404,14 @@ fn the_start_button_waits_for_a_valid_form() {
     let idle = model_in(State::Idle);
 
     let blank = Form::default();
-    let mut ui = simulator(maintain::view(&idle, &blank, None));
+    let mut ui = simulator(maintain::view(&idle, &blank, None, None));
     ui.click("开启远程维护")
         .expect("按钮本身必须画出来，只是按不动");
     let messages: Vec<Message> = ui.into_messages().collect();
     assert!(messages.is_empty(), "表单还没填全就能开始：{messages:?}");
 
     let ready = filled();
-    let mut ui = simulator(maintain::view(&idle, &ready, None));
+    let mut ui = simulator(maintain::view(&idle, &ready, None, None));
     ui.click("开启远程维护").expect("点不到主按钮");
     let messages: Vec<Message> = ui.into_messages().collect();
     assert_eq!(
@@ -437,7 +437,7 @@ fn the_remember_checkbox_toggles_both_ways() {
     for (before, want) in [(false, true), (true, false)] {
         let mut form = filled();
         form.remember = before;
-        let mut ui = simulator(maintain::view(&idle, &form, None));
+        let mut ui = simulator(maintain::view(&idle, &form, None, None));
         ui.click("记住密码").expect("点不到「记住密码」");
         let messages: Vec<Message> = ui.into_messages().collect();
         assert_eq!(messages.len(), 1, "{messages:?}");
@@ -456,7 +456,7 @@ fn the_remember_checkbox_toggles_both_ways() {
 fn stopping_never_depends_on_the_form() {
     let connected = model_in(State::Connected { degraded: false });
     let blank = Form::default();
-    let mut ui = simulator(maintain::view(&connected, &blank, None));
+    let mut ui = simulator(maintain::view(&connected, &blank, None, None));
     ui.click("停止远程维护").expect("点不到停止");
     let messages: Vec<Message> = ui.into_messages().collect();
     assert_eq!(messages.len(), 1, "{messages:?}");
@@ -476,7 +476,7 @@ fn each_disconnect_button_carries_its_own_session_id() {
             sessions: vec![session(id)],
             ..Model::default()
         };
-        let mut ui = simulator(maintain::view(&model, &form, None));
+        let mut ui = simulator(maintain::view(&model, &form, None, None));
         assert!(ui.find("远程会话").is_ok());
         assert!(
             ui.find("发往一体机 1.0 MB · 来自一体机 340 KB").is_ok(),
@@ -493,7 +493,7 @@ fn each_disconnect_button_carries_its_own_session_id() {
 
     // 一条会话都没有时画的是空态，不是一个空卡片。
     let model = model_in(State::Connected { degraded: false });
-    let mut ui = simulator(maintain::view(&model, &form, None));
+    let mut ui = simulator(maintain::view(&model, &form, None, None));
     assert!(ui.find("暂无远程会话").is_ok());
     assert!(ui.find("0 个进行中").is_ok());
 }
@@ -505,7 +505,7 @@ fn error_hints_name_the_field_that_is_wrong() {
 
     let mut bad = filled();
     bad.appliance_port = "abc".into();
-    let mut ui = simulator(maintain::view(&idle, &bad, None));
+    let mut ui = simulator(maintain::view(&idle, &bad, None, None));
     assert!(
         ui.find("一体机端口必须是 1-65535 的整数").is_ok(),
         "填错的端口没有在界面上说出来"
@@ -513,7 +513,7 @@ fn error_hints_name_the_field_that_is_wrong() {
 
     // 反向自证 + 「空字段不吭声」：全空的表单一行红字都没有。
     let blank = Form::default();
-    let mut ui = simulator(maintain::view(&idle, &blank, None));
+    let mut ui = simulator(maintain::view(&idle, &blank, None, None));
     assert!(
         ui.find("一体机端口必须是 1-65535 的整数").is_err(),
         "全空的表单不该画错误"
@@ -547,7 +547,7 @@ fn nothing_the_maintain_page_draws_is_banned() {
     for state in states {
         let mut model = model_in(state.clone());
         model.sessions = vec![session(1)];
-        let mut ui = simulator(maintain::view(&model, &form, Some("01:34:14".into())));
+        let mut ui = simulator(maintain::view(&model, &form, Some("01:34:14".into()), None));
 
         // 反向自证之一：扫描器真的遍历到了文本控件。
         assert!(
@@ -575,7 +575,7 @@ fn nothing_the_maintain_page_draws_is_banned() {
     // `gateway.company.com`）。填满的表单永远盖着占位符，扫不到它。
     let blank = Form::default();
     let idle = model_in(State::Idle);
-    let mut ui = simulator(maintain::view(&idle, &blank, None));
+    let mut ui = simulator(maintain::view(&idle, &blank, None, None));
     assert!(
         has_input(&mut ui, "主机名或 IP"),
         "空表单的占位符没有被遍历到，下面那条断言会空转"
@@ -591,7 +591,7 @@ fn nothing_the_maintain_page_draws_is_banned() {
     let mut bad = filled();
     bad.gateway_host = "gateway.company.com".into();
     let model = model_in(State::Idle);
-    let mut ui = simulator(maintain::view(&model, &bad, None));
+    let mut ui = simulator(maintain::view(&model, &bad, None, None));
     assert!(
         banned_in_tree(&mut ui).is_some(),
         "往地址框里塞一个含禁用词的值，扫描器居然没响"
@@ -621,7 +621,7 @@ fn the_password_box_masks_what_it_draws() {
     let with = |pw: &str| {
         let mut f = filled();
         f.password = Zeroizing::new(pw.into());
-        let mut ui = simulator(maintain::view(&idle, &f, None));
+        let mut ui = simulator(maintain::view(&idle, &f, None, None));
         ui.snapshot(&APP_THEME)
             .expect("渲染")
             .matches_hash(&baseline)
@@ -649,12 +649,17 @@ fn the_elapsed_timer_is_drawn_when_it_has_a_value() {
     let connected = model_in(State::Connected { degraded: false });
     let form = filled();
 
-    let mut ui = simulator(maintain::view(&connected, &form, Some("01:34:14".into())));
+    let mut ui = simulator(maintain::view(
+        &connected,
+        &form,
+        Some("01:34:14".into()),
+        None,
+    ));
     assert!(ui.find("01:34:14").is_ok(), "计时器没画出来");
     assert!(ui.find("已连接").is_ok());
 
     // 没有值时不该凭空画一个。
-    let mut ui = simulator(maintain::view(&connected, &form, None));
+    let mut ui = simulator(maintain::view(&connected, &form, None, None));
     assert!(ui.find("01:34:14").is_err());
     // 反向自证：树本身是画出来了的。
     assert!(ui.find("运维服务器").is_ok());
@@ -710,7 +715,7 @@ fn the_secondary_button_is_the_way_out_of_a_backoff_loop() {
         delay: std::time::Duration::from_secs(5),
     });
     let blank = Form::default();
-    let mut ui = simulator(maintain::view(&model, &blank, None));
+    let mut ui = simulator(maintain::view(&model, &blank, None, None));
 
     // 反向自证：主按钮确实画出来了，而且它**不是**「停止远程维护」。
     // 少了这一步，次按钮整块消失、而主按钮恰好也叫这个名字时，
@@ -744,7 +749,7 @@ fn the_password_box_reports_bullets_not_the_password() {
     let idle = model_in(State::Idle);
     let mut f = filled();
     f.password = Zeroizing::new("abcdefgh".into());
-    let mut ui = simulator(maintain::view(&idle, &f, None));
+    let mut ui = simulator(maintain::view(&idle, &f, None, None));
     assert!(
         has_input(&mut ui, "••••••••"),
         "口令框报出来的不是 8 个圆点"
@@ -1176,4 +1181,65 @@ fn the_log_page_draws_each_level_and_the_filter_really_filters() {
     app.update(Message::LogQueryChanged("延迟".into()));
     assert!(drawn(&app, "一体机首包延迟"));
     assert!(!drawn(&app, "预检通过"), "搜索没作用在列表上");
+}
+
+// =====================================================================
+// W200：取回记住的密码的结局，真的画在密码框旁边
+// =====================================================================
+
+/// **「换了 Windows 账号解不开」这句话真的上屏了。**
+///
+/// 断的是哪一根线：`view/maintain.rs` 里 `if let Some(note) =
+/// password_note` 那三行。没有它，`Recall::fill` 算出来的那句话只会被
+/// `App` 存着，一个字都不显示——而那正是 W21 当初要带类型出口的**全部
+/// 意义**：口令解不开时密码框空着、一句解释都没有。
+///
+/// 改红：把 `view/maintain.rs` 里那个 `if let Some(note) = ..` 整块
+/// 删掉，第二组断言当场红。
+#[test]
+fn the_password_recall_note_is_drawn_next_to_the_password_box() {
+    use rmc_app::view::maintain;
+
+    let outcome = rmc_win::secret::LoadOutcome::UnsealFailed;
+    let note = outcome.diagnostic().1;
+    let idle = model_in(rmc_core::state::State::Idle);
+    let form = filled();
+
+    // 反向自证：没有那句话的时候树里确实找不到它。
+    let mut ui = simulator(maintain::view(&idle, &form, None, None));
+    assert!(
+        ui.find(note.as_str()).is_err(),
+        "没有给说明却画出来了，下面那条断言证明不了什么"
+    );
+    // 而且这一帧本身不是空的（凭据区在）。
+    assert!(ui.find("记住密码").is_ok());
+
+    // 主断言：给了就画出来。
+    let mut ui = simulator(maintain::view(&idle, &form, None, Some(note.as_str())));
+    assert!(
+        ui.find(note.as_str()).is_ok(),
+        "取回失败的说明没有上屏：{note}"
+    );
+
+    // 它也不许含禁用词——这是一条会上屏的、来自 rmc-win 的文案。
+    for banned in BANNED {
+        assert!(!note.contains(banned), "说明里含禁用词 {banned}：{note}");
+    }
+}
+
+/// 凭据区整块藏起来的时候，那句话也跟着不见——密码框都没了，旁边挂一
+/// 句「记住的密码解不开」只会让人摸不着头脑。
+#[test]
+fn the_recall_note_goes_away_with_the_credential_rows() {
+    use rmc_app::view::maintain;
+
+    let outcome = rmc_win::secret::LoadOutcome::UnsealFailed;
+    let note = outcome.diagnostic().1;
+    let connected = model_in(rmc_core::state::State::Connected { degraded: false });
+    let form = filled();
+    let mut ui = simulator(maintain::view(&connected, &form, None, Some(note.as_str())));
+    assert!(
+        ui.find(note.as_str()).is_err(),
+        "连上之后密码框没了，那句话还挂在页面上"
+    );
 }

@@ -146,6 +146,19 @@ impl AppPaths {
         self.root.join("secrets")
     }
 
+    /// 上一次记住密码的那个账号（W200）。
+    ///
+    /// **不含任何秘密**：账号名 + 运维服务器地址，三行纯文本。为什么需要
+    /// 它见 [`crate::remember`] 的模块文档——key 是「账号@运维服务器」，
+    /// 而启动那一刻表单是空的，不记下来就拼不出 key。
+    ///
+    /// 放根目录下，不放 `secrets/`：那个目录里只该有密文，混进一个明文
+    /// 文件迟早让人看错。也不放 `logs/`：`diag::bundle` 会把 `log_dir`
+    /// 下的东西整个收进诊断包。
+    pub fn last_account(&self) -> PathBuf {
+        self.root.join("last-account.txt")
+    }
+
     /// 诊断包写到哪儿。放根目录下，不跟日志混在一起——包本身不是日志，
     /// 而且 `bundle` 每次都写一个带时间戳的新文件。
     pub fn export_dir(&self) -> PathBuf {
@@ -190,6 +203,15 @@ pub struct Platform {
     pub events: Arc<dyn SystemEvents>,
     /// 用什么把口令密封到盘上。`None` 表示这台机器不支持记住密码。
     pub sealer: Option<Box<dyn Sealer>>,
+    /// 网络连通性轮询线程的凭据（W198）。
+    ///
+    /// **拿着它就等于那个线程还在跑**：它一 `Drop`，轮询就在下一轮退出。
+    /// [`spawn_core`] 把它接进 [`Core`]，于是轮询跟整个客户端一起活、
+    /// 一起停——不再是上一轮那个「进程活多久就每 2 秒醒一次多久、谁也
+    /// 叫不停」的线程。
+    ///
+    /// `None` 表示这台机器上根本没有那个线程（非 Windows）。
+    pub network_polling: Option<rmc_win::events::NetworkPolling>,
 }
 
 impl Platform {
@@ -203,9 +225,14 @@ impl Platform {
         let hub = Arc::new(EventHub::new());
         // 注册电源与网络通知。失败只记日志（那两个函数自己记），客户端
         // 照常能用，只是恢复慢一些——见 `spawn_win32_listeners`。
-        spawn_win32_listeners(Arc::clone(&hub));
+        //
+        // W198：返回的句柄**必须拿住**（那个函数是 `#[must_use]` 的）。
+        // 丢掉它，网络轮询线程会在启动后的下一轮当场退出，而界面上
+        // 一个字都看不出来。
+        let network_polling = spawn_win32_listeners(Arc::clone(&hub));
 
         Self {
+            network_polling: Some(network_polling),
             proxy: Arc::new(SystemProxyResolver::new(WinHttpSource::new())),
             // 工厂收的是 `(安全包, SPN)`，**SPN 由 rmc-win 自己用代理
             // 主机名拼好**（`spn_for_proxy`），这里拿不到 scheme，也就
@@ -230,6 +257,8 @@ impl Platform {
             events: Arc::new(NoSystemEvents::default()),
             // 没有 DPAPI：不支持记住密码。**不退回明文存盘**。
             sealer: None,
+            // 没有 NLM：根本没有那个轮询线程（W198）。
+            network_polling: None,
         }
     }
 }
@@ -300,6 +329,10 @@ pub struct Core {
     pub paths: AppPaths,
     /// 记住的密码存在哪儿。`None` 表示这台机器不支持记住密码。
     pub secrets: Option<Arc<dyn SecretStore>>,
+    /// 网络轮询线程的凭据（W198）。`Core` 拿着它，于是轮询跟客户端同生
+    /// 共死；`Arc` 是因为 `Core` 是 `Clone` 的——界面一份、订阅一份，
+    /// **最后一份丢掉时**轮询才停。
+    polling: Option<Arc<rmc_win::events::NetworkPolling>>,
 }
 
 impl std::fmt::Debug for Core {
@@ -308,6 +341,7 @@ impl std::fmt::Debug for Core {
         f.debug_struct("Core")
             .field("paths", &self.paths)
             .field("remembers_passwords", &self.secrets.is_some())
+            .field("polls_network", &self.is_polling_network())
             .finish_non_exhaustive()
     }
 }
@@ -327,7 +361,19 @@ impl Core {
             events: Arc::new(events),
             paths,
             secrets,
+            polling: None,
         }
+    }
+
+    /// 接上网络轮询的凭据（W198）。生产路径上由 [`spawn_core`] 调用。
+    pub fn with_polling(mut self, polling: Option<rmc_win::events::NetworkPolling>) -> Self {
+        self.polling = polling.map(Arc::new);
+        self
+    }
+
+    /// 网络轮询线程还在不在。`None` 表示这台机器上根本没有那个线程。
+    pub fn is_polling_network(&self) -> Option<bool> {
+        self.polling.as_ref().map(|p| p.is_polling())
     }
 
     /// 一个新的事件接收端。
@@ -346,6 +392,7 @@ pub fn spawn_core(paths: AppPaths, platform: Platform) -> Core {
         sspi,
         events,
         sealer,
+        network_polling,
     } = platform;
 
     let egress = wire_egress(proxy, sspi);
@@ -386,7 +433,74 @@ pub fn spawn_core(paths: AppPaths, platform: Platform) -> Core {
         "平台给了密封器，装配却没有造出密码存储"
     );
 
-    Core::new(commands, events_rx, paths, secrets)
+    // W198：把轮询句柄接进 `Core`，跟整个客户端一起活。
+    //
+    // **顺手丢掉它是这一路唯一会发生的事故**，而且没有任何界面表现：
+    // 轮询线程在启动后的下一轮就退出，切网之后不再立刻重连，只是靠
+    // 退避序列慢慢恢复。`rmc_win::events::NetworkPolling` 的 `Drop` 让
+    // 这件事有后果，[`tests::the_network_polling_handle_lives_as_long_as_the_core`]
+    // 让它可观测。
+    Core::new(commands, events_rx, paths, secrets).with_polling(network_polling)
+}
+
+// =====================================================================
+// W192：托盘
+// =====================================================================
+
+/// 造一个通知区图标。
+///
+/// **这是本模块的第二个 `cfg` 块**（第一个是 [`Platform::detect`]），
+/// 而且跟第一个一样只做搬运：托盘要画什么颜色、写什么字、要不要弹通知，
+/// 全在 [`crate::tray`] 那一层（macOS 上被真的跑到）。这里只回答
+/// 「这台机器上用哪个实现」。
+///
+/// 返回 `None` 表示没有托盘——**不是错误**，界面照常工作。
+pub fn open_tray() -> Option<Box<dyn crate::tray::TraySink>> {
+    #[cfg(windows)]
+    {
+        win_tray::open()
+    }
+    #[cfg(not(windows))]
+    {
+        crate::tray::no_tray()
+    }
+}
+
+#[cfg(windows)]
+mod win_tray {
+    //! `rmc_win::tray::Tray` 到 [`TraySink`] 的一层转接。**一条判断都
+    //! 没有**：颜色怎么算、提示怎么截、通知弹不弹，全在
+    //! [`crate::tray`]；字节怎么排、缓冲怎么填，全在 `rmc_win::tray`。
+    //! 这里只把两边接上。
+
+    use crate::tray::{icon_color, icon_rgba, tooltip, Notification, TraySink};
+
+    pub struct WinTray(rmc_win::tray::Tray);
+
+    impl std::fmt::Debug for WinTray {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // 里面只有一个 HWND 和一个 HICON，印出来对谁都没用。
+            f.write_str("WinTray")
+        }
+    }
+
+    impl TraySink for WinTray {
+        fn show_status(&self, tip: &str, color: iced::Color) {
+            self.0.set_status(tip, &icon_rgba(color));
+        }
+
+        fn show_notification(&self, n: &Notification) {
+            self.0.notify(&n.title, &n.body);
+        }
+    }
+
+    pub fn open() -> Option<Box<dyn TraySink>> {
+        // 初始样子就是「未开启」——跟界面刚起来时状态卡上画的一样，
+        // 同一个 `Model::default()` 算出来，不另写一份。
+        let initial = crate::model::Model::default();
+        rmc_win::tray::Tray::open(&tooltip(&initial), &icon_rgba(icon_color(&initial)))
+            .map(|t| Box::new(WinTray(t)) as Box<dyn TraySink>)
+    }
 }
 
 // =====================================================================
@@ -535,18 +649,29 @@ mod tests {
             Path::new("C:\\Users\\zhang\\AppData\\Local").join("rmc")
         );
 
-        // 三处（W28）：审计日志、known_hosts、记住的密码。
-        for spot in [p.log_dir(), p.known_hosts(), p.secrets_dir()] {
+        // 三处（W28）：审计日志、known_hosts、记住的密码；W200 又加了
+        // 第四处：上一次记住密码的那个账号。
+        let spots = [
+            p.log_dir(),
+            p.known_hosts(),
+            p.secrets_dir(),
+            p.last_account(),
+        ];
+        for spot in &spots {
             assert!(
                 spot.starts_with(p.root()),
                 "{spot:?} 没落在应用目录里，它会跟着进程的工作目录跑"
             );
         }
-        // 三处互不重叠——诊断包会把 log_dir 下的东西整个收走。
+        // 四处互不重叠——诊断包会把 log_dir 下的东西整个收走。
         let mut distinct = std::collections::BTreeSet::new();
-        for spot in [p.log_dir(), p.known_hosts(), p.secrets_dir()] {
+        for spot in &spots {
             assert!(distinct.insert(spot.clone()), "两处落点撞在一起：{spot:?}");
         }
+        // 账号记录尤其不许落进日志目录（会被诊断包收走）或密文目录
+        // （那里只该有密文）。
+        assert!(!p.last_account().starts_with(p.log_dir()));
+        assert!(!p.last_account().starts_with(p.secrets_dir()));
         // 配置真的用上了这两处，不是算出来放着不用。
         let cfg = p.config();
         assert_eq!(cfg.log_dir, p.log_dir());
@@ -989,6 +1114,73 @@ mod tests {
         drop(tx);
         // 缓冲里可能还剩东西，取到 None 为止。
         while stream.next().await.is_some() {}
+    }
+
+    // ================= W198：网络轮询的停止路径 =================
+
+    /// **`spawn_core` 必须把轮询句柄接进 `Core`，而不是顺手丢掉。**
+    ///
+    /// 丢掉它没有任何界面表现：网络轮询线程在启动后的下一轮就退出，
+    /// 切网之后不再立刻重连，只是靠退避序列慢慢恢复——跟「本来就没有
+    /// 这个功能」长得一模一样。这正是本项目最怕的那种静默降级。
+    ///
+    /// 改红：把 `spawn_core` 末尾的 `.with_polling(network_polling)`
+    /// 去掉——句柄会在 `spawn_core` 返回时就地 `Drop`，第二条断言当场红。
+    #[tokio::test]
+    async fn the_network_polling_handle_lives_as_long_as_the_core() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (handle, stop) = rmc_win::events::NetworkPolling::new();
+        let platform = Platform {
+            network_polling: Some(handle),
+            ..Platform::detect()
+        };
+
+        // 反向自证：装配之前轮询是该转的。
+        assert!(stop.keep_polling());
+
+        let core = spawn_core(AppPaths::at(dir.path().to_path_buf()), platform);
+
+        assert!(
+            stop.keep_polling(),
+            "装配把轮询句柄丢掉了——网络轮询在启动后的下一轮就停了，\
+             而界面上一个字都看不出来"
+        );
+        assert_eq!(core.is_polling_network(), Some(true));
+
+        // `Core` 是 `Clone` 的（界面一份、订阅一份）：克隆还在的时候
+        // 不许停。
+        let twin = core.clone();
+        drop(core);
+        assert!(stop.keep_polling(), "还有一份 Core 活着，轮询就停了");
+
+        // 最后一份丢掉，轮询才停——客户端退出时那个线程跟着走。
+        drop(twin);
+        assert!(
+            !stop.keep_polling(),
+            "客户端都没了，轮询线程还在每 2 秒醒一次"
+        );
+    }
+
+    /// 这台机器上（非 Windows）本来就没有那个线程。
+    ///
+    /// 这条钉住「`None` 不等于 `Some(false)`」——前者是「没有这个功能」，
+    /// 后者是「有，但停了」。
+    #[test]
+    fn a_platform_without_the_poller_says_so_instead_of_saying_it_stopped() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let core = Core::new(
+            mpsc::channel(1).0,
+            broadcast::channel(1).1,
+            AppPaths::at(dir.path().to_path_buf()),
+            None,
+        );
+        assert_eq!(core.is_polling_network(), None);
+        // 反向自证：接上一个就有话说了。
+        let (handle, _stop) = rmc_win::events::NetworkPolling::new();
+        assert_eq!(
+            core.with_polling(Some(handle)).is_polling_network(),
+            Some(true)
+        );
     }
 
     // ================= 真的起得来 =================

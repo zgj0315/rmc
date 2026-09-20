@@ -46,15 +46,21 @@
 //! 进去」。真正的 `Instant::now()` 只出现在 `win` 子模块的两个调用点，
 //! 各一行。
 //!
-//! # 关于轮询线程没有停止方式（W83，本任务不处理）
+//! # 轮询线程的停止方式（W83 → W198，已结）
 //!
 //! `win::poll_network` 用「每 2 秒读一次 NLM 连通性」代替 COM 事件接收
 //! （`INetworkListManagerEvents` 要一个 STA 消息循环和一个
 //! `#[implement]` 的 COM 对象，unsafe 面积大出一个量级）。这个取舍本身
-//! 是合算的，但代价要写明白：**那个线程没有任何停止方式**，进程活多久
-//! 它就每 2 秒醒一次多久，笔记本上这是一个永不停歇的定时唤醒。Task 10
-//! 接线时再评估要不要给它一个关闭通道（以及要不要在已连接状态下降低
-//! 频率）——现在不为此加复杂度，只把账记在这里。
+//! 是合算的，但上一轮的代价是**那个线程没有任何停止方式**，进程活多久
+//! 它就每 2 秒醒一次多久。
+//!
+//! Task 11 把这笔账结掉：[`spawn_win32_listeners`] 返回一个
+//! [`NetworkPolling`] 句柄（`#[must_use]`），句柄一 `Drop`，
+//! [`poll_loop`] 在下一轮判停时退出；循环骨架本身（含「停了就不再睡」
+//! 这个顺序）在纯逻辑层，macOS 上真的被跑到。
+//!
+//! **仍然没做的**：已连接时降低轮询频率。那是一个纯功耗优化，成本不随
+//! 时间涨，记在 task-11-report.md 的「后续完善」。
 
 use rmc_core::platform::{SystemEvent, SystemEvents};
 use std::sync::Mutex;
@@ -329,6 +335,118 @@ pub fn is_resume_event(event_type: u32) -> bool {
     event_type == PBT_RESUME_AUTOMATIC
 }
 
+// =====================================================================
+// W198（W83 到期）：轮询线程的停止路径
+// =====================================================================
+
+/// 轮询线程的停止开关。
+///
+/// # W198：这一轮把 W83 那笔账结掉
+///
+/// 上一轮的 `win::poll_network` 是一个 `loop { read; sleep(2s) }`，
+/// **没有任何出口**——进程活多久它就每 2 秒醒一次多久。笔记本上这是一个
+/// 永不停歇的定时唤醒，而且客户端退出时那个线程还在睡，谁也叫不醒它。
+///
+/// 开关本身放在纯逻辑层（不带 `#[cfg(windows)]`），跟 [`Debouncer`]、
+/// [`ConnectivityWatcher`] 同一条理由：Task 5 实测过 `#[cfg(windows)]`
+/// 里任何还能编译的语义改动本项目的闸门按构造检测不到，而「停了之后
+/// 还转不转」恰恰是一条判断。
+#[derive(Debug, Default)]
+pub struct PollStop {
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl PollStop {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 请轮询线程停下。可以调任意多次。
+    pub fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 还要不要再轮询一轮。
+    pub fn keep_polling(&self) -> bool {
+        !self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// 「网络轮询还在跑」这件事的凭据。**丢掉它，轮询线程就会在下一轮退出。**
+///
+/// 写成一个 `Drop` 类型而不是一个裸 `Arc<PollStop>`，是为了让「接线时
+/// 把句柄顺手丢掉」这件事有真实后果、而且看得见：句柄一落地就 `Drop`，
+/// 轮询在启动后的下一轮当场停掉，`rmc_app::wiring` 那边有一条测试专门
+/// 盯这个（接线把它接进 `Core`，跟着整个客户端一起活）。
+#[derive(Debug)]
+pub struct NetworkPolling {
+    stop: std::sync::Arc<PollStop>,
+}
+
+impl NetworkPolling {
+    /// 造一对：留给调用方的句柄，以及交给轮询线程的那一份。
+    pub fn new() -> (Self, std::sync::Arc<PollStop>) {
+        let stop = std::sync::Arc::new(PollStop::new());
+        (
+            Self {
+                stop: std::sync::Arc::clone(&stop),
+            },
+            stop,
+        )
+    }
+
+    /// 现在就停，不等 `Drop`。
+    pub fn stop_now(&self) {
+        self.stop.stop();
+    }
+
+    /// 轮询线程还该不该转。测试与诊断用。
+    pub fn is_polling(&self) -> bool {
+        self.stop.keep_polling()
+    }
+}
+
+impl Drop for NetworkPolling {
+    fn drop(&mut self) {
+        self.stop.stop();
+    }
+}
+
+/// 轮询循环的**整个骨架**，包括「停了就不再睡」这个顺序。
+///
+/// `read` 读一次连通性（`None` 表示这一轮没读出来），`now` 给时刻，
+/// `sleep` 睡一轮——三样都收成参数，于是这个循环在 macOS 上真的被跑到
+/// （见 `tests`），`win::poll_network` 那边只剩「怎么读」「怎么睡」两行
+/// 搬运。同 [`register_once`] 对注册顺序的那一招（W86）。
+///
+/// **先判停、后睡**：反过来的话，停止请求最坏要等满一个
+/// [`POLL_INTERVAL`] 才生效，而且客户端退出时必然要多睡一觉。
+pub fn poll_loop(
+    stop: &PollStop,
+    hub: &EventHub,
+    watcher: &mut ConnectivityWatcher,
+    mut read: impl FnMut() -> Option<i32>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(),
+) {
+    while stop.keep_polling() {
+        // 读失败（网络栈正在重启之类）这一轮就跳过，`watcher` 的
+        // `previous` 保持不动——下一轮读到的值仍然跟**变化之前**那个值
+        // 比较，不会因为中间漏了一拍就把一次真实变化吞掉。
+        if let Some(current) = read() {
+            if watcher.observe(current, now()) {
+                tracing::info!("检测到网络连通性变化，立即重连");
+                hub.emit(SystemEvent::NetworkChanged);
+            }
+        }
+        if !stop.keep_polling() {
+            return;
+        }
+        sleep();
+    }
+}
+
 /// 把「这个码算不算唤醒 + 防抖放不放行」两件事合在一起，让电源回调
 /// 退化成「问一句 → 要么发要么不发」。
 ///
@@ -508,8 +626,7 @@ mod win {
     //! [`super`] 的纯逻辑层，在这台机器上被测到。
     #![allow(unsafe_code)]
 
-    use super::{ConnectivityWatcher, EventHub, PowerCallbackState};
-    use rmc_core::platform::SystemEvent;
+    use super::{ConnectivityWatcher, EventHub, NetworkPolling, PowerCallbackState};
     use std::sync::{Arc, OnceLock};
     use std::time::Instant;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -529,18 +646,24 @@ mod win {
 
     /// 注册两类通知。失败只记日志，不影响其余功能：没有事件时客户端仍
     /// 会按退避序列重连，只是恢复慢一些。
-    pub fn spawn_win32_listeners(hub: Arc<EventHub>) {
+    ///
+    /// **返回的 [`NetworkPolling`] 必须被接线那一层拿住**（W198）：它一
+    /// `Drop`，网络轮询线程就在下一轮退出。丢掉返回值 = 轮询刚起来就停。
+    #[must_use = "丢掉它，网络轮询线程会在下一轮当场退出（W198）"]
+    pub fn spawn_win32_listeners(hub: Arc<EventHub>) -> NetworkPolling {
         let power_hub = Arc::clone(&hub);
         std::thread::spawn(move || {
             if let Err(e) = register_power(power_hub) {
                 tracing::warn!(error = %e, "注册休眠恢复通知失败，恢复后将依赖退避重连");
             }
         });
+        let (handle, stop) = NetworkPolling::new();
         std::thread::spawn(move || {
-            if let Err(e) = poll_network(hub) {
+            if let Err(e) = poll_network(hub, &stop) {
                 tracing::warn!(error = %e, "网络连通性轮询启动失败，切网后将依赖退避重连");
             }
         });
+        handle
     }
 
     /// 系统在任意一个线程池线程上调用它。
@@ -696,9 +819,10 @@ mod win {
 
     /// 每 [`super::POLL_INTERVAL`] 读一次 NLM 连通性，变化时发事件。
     ///
-    /// 这个循环没有出口，线程活到进程结束——见模块文档的 W83 一节，
-    /// Task 10 接线时再评估要不要给它关闭通道。
-    fn poll_network(hub: Arc<EventHub>) -> windows::core::Result<()> {
+    /// **循环本身在纯逻辑层**（[`super::poll_loop`]，W198）：这里只剩
+    /// 「怎么读」与「怎么睡」两行搬运，一条判断都没有。停止路径见
+    /// [`super::NetworkPolling`]。
+    fn poll_network(hub: Arc<EventHub>, stop: &super::PollStop) -> windows::core::Result<()> {
         // NLM 的 COM 事件接收（`INetworkListManagerEvents`）需要一个 STA
         // 消息循环和一个 `#[implement]` 的 COM 对象。为了把 unsafe 面积
         // 压到最小，这里用轮询代替。
@@ -717,19 +841,16 @@ mod win {
             unsafe { CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL) }?;
 
         let mut watcher = ConnectivityWatcher::new();
-        loop {
+        super::poll_loop(
+            stop,
+            &hub,
+            &mut watcher,
             // SAFETY: `nlm` 是上面成功创建、本线程独占的接口指针。
-            // 读失败（网络栈正在重启之类）这一轮就跳过，`watcher` 的
-            // `previous` 保持不动——下一轮读到的值仍然跟**变化之前**那个
-            // 值比较，不会因为中间漏了一拍就把一次真实变化吞掉。
-            if let Ok(current) = unsafe { nlm.GetConnectivity() } {
-                if watcher.observe(current.0, Instant::now()) {
-                    tracing::info!("检测到网络连通性变化，立即重连");
-                    hub.emit(SystemEvent::NetworkChanged);
-                }
-            }
-            std::thread::sleep(super::POLL_INTERVAL);
-        }
+            || unsafe { nlm.GetConnectivity() }.ok().map(|c| c.0),
+            Instant::now,
+            || std::thread::sleep(super::POLL_INTERVAL),
+        );
+        Ok(())
     }
 }
 
@@ -1307,6 +1428,165 @@ mod tests {
             .expect("注册成功之后格子必须装上了")
             .on_power_event(PBT_RESUME_AUTOMATIC, t0()));
         assert_eq!(recv_soon(&mut rx).await, SystemEvent::ResumedFromSleep);
+    }
+
+    // ================= W198：轮询线程的停止路径 =================
+
+    /// 一个能被驱动的假轮询：记下读了几次、睡了几次。
+    struct FakePoll {
+        reads: std::cell::Cell<usize>,
+        sleeps: std::cell::Cell<usize>,
+    }
+
+    impl FakePoll {
+        fn new() -> Self {
+            Self {
+                reads: std::cell::Cell::new(0),
+                sleeps: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    /// **停下之后轮询循环真的会退出**，而且退出前不会再白睡一觉。
+    ///
+    /// 改红：把 `poll_loop` 的 `while stop.keep_polling()` 改回 `loop`
+    /// ——这条会永不结束（这正是本项目抓到的第 20 个形状：不是红，是
+    /// 挂住），所以循环里另配了一个「转太多圈就停」的保险，让它以
+    /// 失败而不是挂起收场。
+    #[test]
+    fn a_stopped_poll_loop_really_leaves_the_loop() {
+        let hub = EventHub::new();
+        let mut watcher = ConnectivityWatcher::new();
+        let (handle, stop) = NetworkPolling::new();
+        let f = FakePoll::new();
+
+        // 反向自证：还没停的时候它是要继续转的。
+        assert!(handle.is_polling());
+        assert!(stop.keep_polling());
+
+        poll_loop(
+            &stop,
+            &hub,
+            &mut watcher,
+            || {
+                let n = f.reads.get() + 1;
+                f.reads.set(n);
+                // 第三轮请它停下。保险：转到第 50 圈还没停就自己停，
+                // 免得这条测试在回归时变成"永不结束"。
+                if n >= 3 {
+                    stop.stop();
+                }
+                assert!(n < 50, "poll_loop 在收到停止请求之后还在转");
+                Some(7)
+            },
+            t0,
+            || f.sleeps.set(f.sleeps.get() + 1),
+        );
+
+        assert_eq!(f.reads.get(), 3, "停止请求没有在下一次判停时生效");
+        // 先判停、后睡：第三轮请停之后**不该**再睡一觉。
+        assert_eq!(f.sleeps.get(), 2, "停下之前又白睡了一觉");
+        assert!(!handle.is_polling());
+    }
+
+    /// **已经停了就一轮都不读。**
+    ///
+    /// 这条钉的是 `poll_loop` 开头那个 `while stop.keep_polling()`
+    /// ——循环体中段还有一次判停，所以少了这条测试，把 `while` 换成
+    /// `loop` 一条都不会红（变异 M9 实测）。差别在第一轮：客户端退出
+    /// 时轮询线程本来该一次 NLM 都不再读。
+    ///
+    /// 改红：把 `poll_loop` 的 `while stop.keep_polling()` 换成 `loop`。
+    #[test]
+    fn a_loop_that_is_already_stopped_never_reads_even_once() {
+        let hub = EventHub::new();
+        let mut watcher = ConnectivityWatcher::new();
+        let (handle, stop) = NetworkPolling::new();
+        drop(handle); // 客户端已经退出了
+
+        poll_loop(
+            &stop,
+            &hub,
+            &mut watcher,
+            || panic!("已经停了还去读了一次 NLM"),
+            t0,
+            || panic!("已经停了还睡了一觉"),
+        );
+    }
+
+    /// 句柄一 `Drop`，轮询就该停——这是接线层"顺手丢掉返回值"的唯一
+    /// 防线。
+    ///
+    /// 改红：把 `impl Drop for NetworkPolling` 删掉。
+    #[test]
+    fn dropping_the_handle_stops_the_polling() {
+        let (handle, stop) = NetworkPolling::new();
+        assert!(stop.keep_polling(), "还没丢就停了，下面那条断言是空转的");
+        drop(handle);
+        assert!(!stop.keep_polling(), "句柄丢掉之后轮询线程仍然会转下去");
+    }
+
+    /// `stop_now` 与 `Drop` 说的是同一件事。
+    #[test]
+    fn stop_now_stops_without_waiting_for_the_drop() {
+        let (handle, stop) = NetworkPolling::new();
+        handle.stop_now();
+        assert!(!stop.keep_polling());
+        // 停过再停不出事。
+        handle.stop_now();
+        drop(handle);
+        assert!(!stop.keep_polling());
+    }
+
+    /// 轮询循环该发的事件照样发，该跳的一轮照样跳。
+    ///
+    /// 这条挡的是"把 `poll_loop` 写成一个只会判停的空壳"——没有它，
+    /// 上面两条在 `poll_loop` 函数体为空时全绿。
+    ///
+    /// 改红：把 `poll_loop` 里 `hub.emit(..)` 那一行删掉。
+    #[tokio::test]
+    async fn the_poll_loop_still_reports_a_real_change_and_skips_a_failed_read() {
+        let hub = EventHub::new();
+        let mut rx = hub.subscribe();
+        let mut watcher = ConnectivityWatcher::new();
+        let (_handle, stop) = NetworkPolling::new();
+
+        // 四轮读数：64 → 读不出来 → 64 → 0。只有最后一轮是变化。
+        let readings = std::cell::RefCell::new(vec![Some(64), None, Some(64), Some(0)].into_iter());
+        poll_loop(
+            &stop,
+            &hub,
+            &mut watcher,
+            || match readings.borrow_mut().next() {
+                Some(v) => v,
+                None => {
+                    stop.stop();
+                    None
+                }
+            },
+            // 防抖窗口是 800ms，两次变化之间要拉开；这里每一轮都往前
+            // 走一整秒。
+            {
+                let n = std::cell::Cell::new(0u64);
+                let base = t0();
+                move || {
+                    n.set(n.get() + 1);
+                    base + Duration::from_secs(n.get())
+                }
+            },
+            || {},
+        );
+
+        assert_eq!(
+            recv_soon(&mut rx).await,
+            SystemEvent::NetworkChanged,
+            "连通性真的变了却没发事件"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "读不出来的那一轮不该被当成一次变化"
+        );
     }
 
     #[test]

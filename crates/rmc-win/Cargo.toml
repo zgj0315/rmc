@@ -43,4 +43,18 @@ windows = { workspace = true, features = [
   "Win32_System_Power",
   "Win32_Networking_NetworkListManager",
   "Win32_System_Com",
+  # W192：通知区图标与气泡通知（`tray.rs`）。`NOTIFYICONDATAW` /
+  # `Shell_NotifyIconW` / `NIF_INFO` 都在这个 feature 里；托盘宿主窗口要
+  # 的 `CreateWindowExW` / `CreateIcon` / `DestroyIcon` 在上面那条
+  # `Win32_UI_WindowsAndMessaging`（本来就开着）。
+  #
+  # **只加这一条，而且不新增任何包**——它是 `windows` crate 自己的
+  # feature，`Cargo.lock` 一个字节不变。这正是不用 `tray-icon` 的理由
+  # （那个 crate 对本工作区真新增 48 个包、`cargo deny` 两项变红），
+  # 见 `tray.rs` 顶部的 W192。
+  #
+  # 宿主窗口刻意用系统预定义的 `STATIC` 类而不是自己 `RegisterClassW`：
+  # `WNDCLASSW` 挂在 `Win32_Graphics_Gdi` 后面，为一个不上屏的消息窗口
+  # 开整个 GDI 不值当（闸门 5 实测报过这条）。
+  "Win32_UI_Shell",
 ] }

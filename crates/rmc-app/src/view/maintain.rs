@@ -144,7 +144,12 @@ fn status_card<'a>(model: &Model, elapsed: Option<String>) -> Element<'a, Messag
 
 /// 运维服务器那张卡：地址、出网，以及（仅未开启/失败时）账号、口令、
 /// 记住密码。
-fn server_card(form: &Form, editable: bool, credentials: bool) -> Element<'_, Message> {
+fn server_card<'a>(
+    form: &'a Form,
+    editable: bool,
+    credentials: bool,
+    password_note: Option<&'a str>,
+) -> Element<'a, Message> {
     let egress = line(row![
         row_label("出网"),
         text(form.egress_label()).size(13),
@@ -190,6 +195,17 @@ fn server_card(form: &Form, editable: bool, credentials: bool) -> Element<'_, Me
             .secure(true)
             .width(Length::Fill),
         ]));
+        // W200 第 3 条：取回记住的密码的结局，画在密码框下面那一行。
+        // 「换了 Windows 账号解不开」这句话终于有地方显示了。
+        if let Some(note) = password_note {
+            content = content.push(line(row![
+                Space::new().width(66),
+                text(note)
+                    .size(12)
+                    .color(color::TEXT_SUB)
+                    .width(Length::Fill),
+            ]));
+        }
         content = content.push(line(row![
             Space::new().width(66),
             checkbox(form.remember)
@@ -253,7 +269,18 @@ fn sessions<'a>(model: &Model) -> Element<'a, Message> {
     column![header, card(body.into())].spacing(12).into()
 }
 
-pub fn view<'a>(model: &'a Model, form: &'a Form, elapsed: Option<String>) -> Element<'a, Message> {
+/// 维护页。
+///
+/// `password_note` 是密码框旁边那句话（W200 第 3 条）：启动时取回记住
+/// 的密码的结局。`None` 表示没什么好说的。**它是收进来的，不是这里
+/// 算的**——四种失败分类的文案来自 Task 4 的
+/// `rmc_win::secret::LoadOutcome::diagnostic`，这一层一个字都不重写。
+pub fn view<'a>(
+    model: &'a Model,
+    form: &'a Form,
+    elapsed: Option<String>,
+    password_note: Option<&'a str>,
+) -> Element<'a, Message> {
     let editable = model.addresses_editable();
     let credentials = model.credentials_visible();
 
@@ -269,7 +296,7 @@ pub fn view<'a>(model: &'a Model, form: &'a Form, elapsed: Option<String>) -> El
             editable,
         )),
         section("运维服务器"),
-        server_card(form, editable, credentials),
+        server_card(form, editable, credentials, password_note),
     ]
     .spacing(12)
     .padding(14);
@@ -455,7 +482,7 @@ mod tests {
             ..Model::default()
         };
         let page = |form: &Form| {
-            let mut ui = iced_test::simulator(view(&model, form, None));
+            let mut ui = iced_test::simulator(view(&model, form, None, None));
             ui.snapshot(&APP_THEME)
                 .expect("渲染整页")
                 .matches_hash(&baseline)
