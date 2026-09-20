@@ -518,9 +518,12 @@ pub fn bundle(out_dir: &Path, input: &BundleInput<'_>) -> std::io::Result<PathBu
 
     // 失败就把半成品删掉（W180）。
     //
-    // 不这么做的话，任何一步出错都会在盘上留下一个**打不开的 zip**
+    // 不这么做的话，任何一步出错都会在盘上留下一个**打得开、却悄悄缺料**的包
     // ——`File::create` 已经建出文件，而 `ZipWriter::finish()` 还没跑。
-    // 现场工程师会把那个文件当成诊断包发出去，远程那头打不开。
+    // ——`ZipWriter` 的 `Drop` 会把中央目录补完（复审实测：131 字节、
+    // 打得开、条目只有 `environment.txt`）。危害不是「远程那头解不开」，
+    // 而是**界面报了失败、盘上却躺着一个看上去完整的包**：发的人和收的人
+    // 都不会知道少了日志。
     match write_bundle(&out_path, input) {
         Ok(()) => Ok(out_path),
         Err(e) => {
@@ -561,7 +564,8 @@ fn write_bundle(out_path: &Path, input: &BundleInput<'_>) -> std::io::Result<()>
     // 实测过的那条路：干净机器上**第一次**导出时 `log_dir` 还不存在
     // （今天还没写过任何一条审计日志），`read_dir` 返回 `NotFound`，
     // 原来那个 `?` 把整次导出判成失败——而 zip 文件已经建出来了。
-    // 也就是说「第一次导出」必然失败，而且留下一个打不开的文件。
+    // 也就是说「第一次导出」必然失败，而且留下一个打得开、却只有
+    // `environment.txt` 的包。
     //
     // 现在分两种：
     //
@@ -1469,7 +1473,7 @@ mod tests {
     ///
     /// 现场第一次点「导出诊断包」恰恰就是这种情形（而且那多半正是
     /// 连不上、急着要包的时候），后果是：界面报失败，盘上留下一个
-    /// 打不开的文件，工程师把它发出去，远程那头解不开。
+    /// 打得开、却悄悄缺了日志的包——工程师把它发出去，两头都不知道缺料。
     ///
     /// 改红：把 `write_bundle` 里那个 `match read_dir` 换回
     /// `for entry in read_dir(input.log_dir)?`。
@@ -1533,7 +1537,7 @@ mod tests {
     /// 改红：把 `bundle` 里那句 `let _ = std::fs::remove_file(&out_path);`
     /// 删掉。
     #[test]
-    fn a_failed_export_leaves_no_broken_zip_behind() {
+    fn a_failed_export_leaves_no_half_filled_bundle_behind() {
         let dir = tempfile::tempdir().expect("建临时目录");
         let out = dir.path().join("out");
         let logs = dir.path().join("logs");
@@ -1558,7 +1562,7 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(left.is_empty(), "失败之后留下了打不开的半成品：{left:?}");
+        assert!(left.is_empty(), "失败之后留下了缺料的半成品：{left:?}");
     }
 
     // ================= 环境信息 =================
