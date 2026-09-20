@@ -371,8 +371,20 @@ pub fn spawn_core(paths: AppPaths, platform: Platform) -> Core {
 
     // W28 的第三处：记住的密码。`None`（非 Windows）时整个功能不存在，
     // 不退回明文。
+    let remembers = sealer.is_some();
     let secrets = sealer
         .map(|s| Arc::new(FileSecretStore::new(paths.secrets_dir(), s)) as Arc<dyn SecretStore>);
+    // W181：这台机器有密封器，就必须真的有一个密码存储。
+    //
+    // **这拦不住"勾选框不工作"**——那是另一件事（整条「记住密码」链路
+    // 至今没有生产读方，见 task-10-report.md 的「后续完善」第 1 条）。
+    // 它拦的是更窄也更阴的一种：有人把这一行改成 `None` 或者把落点摘掉，
+    // 而 `Core::secrets` 今天没有任何读方，摘掉之后**一条测试都不会红**。
+    assert_eq!(
+        secrets.is_some(),
+        remembers,
+        "平台给了密封器，装配却没有造出密码存储"
+    );
 
     Core::new(commands, events_rx, paths, secrets)
 }
@@ -788,6 +800,137 @@ mod tests {
         let f: SspiContextFactory =
             Box::new(|_p, _spn| Some(Box::new(Empty) as Box<dyn SspiContext>));
         assert!(f(SspiPackage::Negotiate, "HTTP/proxy.example.com").is_some());
+    }
+
+    // ================= W181：有密封器就必须有存储 =================
+
+    /// 一个什么都不做的假密封器。非 Windows 上 `Platform::detect()` 给的
+    /// `sealer` 恒定是 `None`，没有它就没法在这台机器上走到那一支。
+    struct NoopSealer;
+
+    impl Sealer for NoopSealer {
+        fn seal(&self, plain: &[u8]) -> Option<Vec<u8>> {
+            Some(plain.to_vec())
+        }
+        fn unseal(&self, sealed: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+            Some(zeroize::Zeroizing::new(sealed.to_vec()))
+        }
+    }
+
+    /// **平台给了密封器，装配就必须真的造出一个密码存储。**
+    ///
+    /// # 这条**拦不住**什么
+    ///
+    /// 拦不住「记住密码那个勾选框不工作」——`Core::secrets` 至今没有
+    /// 任何生产读方，那是整条链路的功能缺口，见 task-10-report.md 的
+    /// 「后续完善」第 1 条。两件事别混为一谈。
+    ///
+    /// 它拦的是更窄也更阴的一种：有人把 `spawn_core` 里造存储那一行
+    /// 摘掉或者把落点改走。因为没有读方，摘掉之后**一条测试都不会红**
+    /// （上一轮实测确认过）。
+    ///
+    /// # 为什么光有 `spawn_core` 里那句 `assert_eq!` 不够
+    ///
+    /// 非 Windows 上 `Platform::detect()` 的 `sealer` 恒定是 `None`，
+    /// 于是那句断言的两边恒等——**它在这台机器上永远不会发火**。
+    /// 实测过：把造存储那一行换成 `None`，`cargo test -p rmc-app`
+    /// 全绿。要让它可达，就得自己塞一个密封器进去。
+    #[tokio::test]
+    async fn a_platform_with_a_sealer_really_gets_a_secret_store() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+
+        // 反向自证：没有密封器时确实没有存储（否则下面那条不带载）。
+        let bare = spawn_core(
+            paths.clone(),
+            Platform {
+                sealer: None,
+                ..Platform::detect()
+            },
+        );
+        assert!(bare.secrets.is_none());
+
+        let core = spawn_core(
+            paths.clone(),
+            Platform {
+                sealer: Some(Box::new(NoopSealer)),
+                ..Platform::detect()
+            },
+        );
+        let store = core.secrets.as_ref().expect("有密封器却没有密码存储");
+
+        // 而且它真的落在应用目录下那一处，不是随便哪儿。
+        store
+            .save("tunnel-zhang@ops.example.com:443", "pw")
+            .unwrap();
+        let landed: Vec<String> = std::fs::read_dir(paths.secrets_dir())
+            .expect("密码存储的落点不存在")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(landed.len(), 1, "{landed:?}");
+        assert!(landed[0].ends_with(".sealed"), "{landed:?}");
+    }
+
+    // ================= W178：事件源真的接上了 =================
+
+    /// 数 `subscribe()` 被调了几次。
+    struct SpyEvents {
+        inner: broadcast::Sender<rmc_core::platform::SystemEvent>,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SystemEvents for SpyEvents {
+        fn subscribe(&self) -> broadcast::Receiver<rmc_core::platform::SystemEvent> {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.subscribe()
+        }
+    }
+
+    /// **`Platform` 给的那个事件源真的被交给了 Supervisor。**
+    ///
+    /// # 断的是哪一根线
+    ///
+    /// `spawn_core` 里 `Deps { events }` 那一个字段。把它换成一个新造的
+    /// `NoSystemEvents`（也就是把 `Platform::detect` 辛辛苦苦注册好的
+    /// 那个 hub 直接丢掉），**600 条测试全绿**——上一轮的接线表第 6 行
+    /// 就是这么虚报的：我写的是"断掉它 `the_assembled_core_starts_and_
+    /// accepts_commands` 会红"，实测不会。
+    ///
+    /// Windows 上的后果是「合盖唤醒之后不再立刻重连」——**正是
+    /// W82/W94 花一整轮堵的那个形状，从另一头漏出来**。
+    ///
+    /// 判据用 `subscribe()` 的调用次数，不用"发一条事件看 Supervisor
+    /// 有没有反应"：后者要先把状态机推进 `Backoff` 才观察得到，那是
+    /// 一整套建连脚本；而 `run()` 一启动就会 `subscribe()` 恰好一次，
+    /// 这件事本身就足以证明这根线接上了。
+    #[tokio::test]
+    async fn the_platform_event_source_is_handed_to_the_supervisor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let platform = Platform {
+            events: Arc::new(SpyEvents {
+                inner: broadcast::channel(8).0,
+                hits: Arc::clone(&hits),
+            }),
+            ..Platform::detect()
+        };
+
+        // 反向自证：装配之前一次都没订阅过。
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let _core = spawn_core(AppPaths::at(dir.path().to_path_buf()), platform);
+        // `Supervisor::spawn` 里是 `tokio::spawn`，`run()` 的第一行才是
+        // `deps.events.subscribe()`——给它一点时间被调度到。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "Supervisor 没有订阅 Platform 给的那个事件源——\
+             合盖唤醒之后不会再立刻重连，而没有任何地方会说一句"
+        );
     }
 
     // ================= 打开目录 =================

@@ -78,23 +78,62 @@ fn toolbar<'a>(active: LogFilter, c: LevelCounts, query: &str) -> Element<'a, Me
     r.into()
 }
 
+/// 日志页左边两列用的等宽字体族，`None` 表示这个系统上不知道该用哪个。
+///
+/// # W179：**绝对不能用 `iced::Font::MONOSPACE`**
+///
+/// 根因：cosmic-text 把"等宽"这个泛族**硬编码**绑在 `Noto Sans Mono`
+/// 上（`cosmic-text-0.15.0/src/font/system.rs:158` 的
+/// `db.set_monospace_family("Noto Sans Mono")`），而那个字体
+/// **默认安装的 Windows 11 不带**（出厂的等宽是 Consolas /
+/// Cascadia Mono / Courier New / Lucida Console），这台 macOS 开发机也
+/// 没有。族名解析不到任何字面时，ASCII 还能经别的回退路画出来，
+/// **中文那条回退路会算出一个巨大的字形 x 坐标**，
+/// `cosmic-text-0.15.0/src/glyph_cache.rs:100` 的 `trunc + 1` 当场
+/// 溢出 panic（`attempt to add with overflow`）。
+///
+/// **这不是 `iced_test` 特有的。** 运行时用的
+/// `iced_graphics::text::font_system()` 是同一个
+/// `FontSystem::new_with_fonts`（`iced_graphics-0.14.0/src/text.rs:121`），
+/// 内嵌的 Fira Sans 只是多两个 face，补不上那个族名——所以这个崩溃
+/// **在 Windows 上同样会复现**。上一轮把它判成"测试环境特有"是错的，
+/// 订正见 task-10-fix-1-report.md 的 W179。
+///
+/// 换成一个**这个系统上真的装着**的族就同时解决两件事：拿回画板要的
+/// 对齐，而且中文有正常的回退路。
+///
+/// **写成收 `os` 的纯函数而不是一对 `cfg`**（同
+/// [`crate::wiring::file_manager_for`]）：Windows 那一档是唯一真正要用
+/// 的一档，写成 `cfg` 的话它在这台机器上没有任何东西看得见。
+pub fn monospace_family(os: &str) -> Option<&'static str> {
+    match os {
+        // Consolas 从 Vista 起每一版 Windows 都带（Cascadia Mono 要
+        // Win11 才有，不能指望）。
+        "windows" => Some("Consolas"),
+        // Menlo 从 10.6 起每一版 macOS 都带。
+        "macos" => Some("Menlo"),
+        // 装了什么全看发行版。猜一个不如不猜：回到默认比例字体，两列会
+        // 参差，但**不会崩**——崩是这里唯一不能接受的结局。
+        _ => None,
+    }
+}
+
+/// 本机该用的那个字体。
+fn mono() -> Font {
+    match monospace_family(std::env::consts::OS) {
+        Some(name) => Font::with_name(name),
+        None => Font::default(),
+    }
+}
+
 /// 日志列表里的一行：时间、等级、正文。
 ///
 /// # 等宽字体只给左边两列（画板给三列都上了 `mono`）
 ///
-/// 等宽在这里的作用是让 200 行的时间与等级**对齐成两列**，那两列全是
-/// ASCII。正文不需要对齐，而给它上等宽有一个实测过的硬代价：
-/// **`Font::MONOSPACE` 配中文会让渲染管线 panic**——
-/// `cosmic-text-0.15.0/src/glyph_cache.rs:100` 的 `attempt to add with
-/// overflow`。同一段中文用默认字体画没事，同一个 `MONOSPACE` 画 ASCII
-/// 也没事，只有两者凑在一起会炸（这一点是本轮写快照测试时实测出来的，
-/// 见 task-10-report.md）。
-///
-/// 而日志正文**全是中文**。真在 Windows 上也这样的话，就是"点开日志页
-/// 客户端当场崩"。这条纪律由
-/// [`tests::every_part_of_the_palette_really_reaches_the_pixels`] 守着：
-/// 那条测试渲染的就是一行带中文正文的日志，给正文加回 `MONOSPACE`
-/// 它会当场 panic。
+/// 等宽在这里的作用是让 200 行的时间与等级**对齐成两列**；正文不需要
+/// 对齐，所以不给它。W179 查清根因（见 [`monospace_family`]）之后，
+/// 给正文也上等宽已经是**安全**的了——但那是纯视觉，按用户方针记进
+/// 「后续完善」，不在这一轮做。
 fn log_row<'a>(l: &LogLine) -> Element<'a, Message> {
     log_row_with(l, log_row_palette(l.level))
 }
@@ -121,11 +160,11 @@ fn log_row_with<'a>(l: &LogLine, p: crate::theme::LogRowPalette) -> Element<'a, 
         row![
             text(l.time.clone())
                 .size(12)
-                .font(Font::MONOSPACE)
+                .font(mono())
                 .color(color::LOG_TIME),
             text(l.level.tag())
                 .size(12)
-                .font(Font::MONOSPACE)
+                .font(mono())
                 .color(p.tag)
                 .width(TAG_WIDTH),
             text(l.message.clone()).size(12).color(p.text),
@@ -371,6 +410,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ============== W179：字体 ==============
+
+    /// 三个系统各有各的等宽字体，不知道的老实说不知道。
+    ///
+    /// 写成纯函数而不是 `cfg` 的价值就在这一条：**Windows 那一档
+    /// （唯一真正要用的一档）在这台 macOS 机器上也验得到**。
+    ///
+    /// 改红：把 `"windows"` 那一支改回 `None`，或者改成一个 Windows
+    /// 不带的族——第一格红。
+    #[test]
+    fn each_operating_system_has_its_own_monospace_family() {
+        assert_eq!(monospace_family("windows"), Some("Consolas"));
+        assert_eq!(monospace_family("macos"), Some("Menlo"));
+        assert_eq!(monospace_family("freebsd"), None);
+        assert_eq!(monospace_family("linux"), None);
+        // 本机这一档必须有字体，否则下面那条渲染测试是在测"默认字体
+        // 能不能画中文"，跟等宽一个关系都没有。
+        assert!(
+            monospace_family(std::env::consts::OS).is_some(),
+            "这台机器这一档没有等宽字体，下面那条渲染测试会空转"
+        );
+    }
+
+    /// **本机选的那个等宽字体画得出中文，不会把渲染管线炸掉。**
+    ///
+    /// # 断的是哪一根线
+    ///
+    /// `iced::Font::MONOSPACE` 在这个项目里是**有毒的**：cosmic-text 把
+    /// 它绑在一个通常没装的族上（根因见 [`monospace_family`]），族名解析
+    /// 不到时中文会让 `glyph_cache.rs:100` 溢出 panic，而那个 panic 会
+    /// **连带毒掉全局字体锁**——上一轮实测过，一条测试炸掉，另外四条
+    /// 快照测试一起变成 `Write font system: PoisonError`。
+    ///
+    /// 所以这条测试**不能**用 `catch_unwind` 去证明 `MONOSPACE` 会炸
+    /// （那会把同一个测试二进制里别的快照测试全带下水）。它分两半：
+    ///
+    /// 1. **结构上**断言我们用的不是 `MONOSPACE`——有人换回去，这条
+    ///    立刻红，而且**不会炸**；
+    /// 2. **行为上**真的用本机这个族去渲染一段中文——族名要是写错
+    ///    （比如 Windows 那一档写成一个不存在的字体），这条当场 panic。
+    #[test]
+    fn the_monospace_font_really_draws_chinese() {
+        // 第一半：结构。
+        assert_ne!(
+            mono(),
+            Font::MONOSPACE,
+            "又用回 Font::MONOSPACE 了——它绑在一个通常没装的族上，\
+             中文会让渲染管线溢出 panic，见 monospace_family 的文档"
+        );
+        assert_eq!(
+            mono(),
+            Font::with_name(monospace_family(std::env::consts::OS).expect("本机该有等宽字体")),
+            "用的不是 monospace_family 给出的那个族"
+        );
+
+        // 第二半：行为。这一段中文就是日志里最常见的那种。
+        let element: Element<'_, Message> =
+            text("一体机首包延迟 480 ms").size(12).font(mono()).into();
+        let mut ui = iced_test::simulator(element);
+        let _ = ui.snapshot(&APP_THEME).expect("用本机的等宽字体渲染中文");
+    }
+
+    /// 时间那一列走的也是同一个字体，**而且它现在不再靠「只准 ASCII」
+    /// 那条校验保命**。
+    ///
+    /// 上一轮时间列用的是 `Font::MONOSPACE`，唯一挡着崩溃的是
+    /// `logs::parse_line` 里那条"时间必须全是数字与冒号"的校验——
+    /// 而那条校验的存在理由是**格式**，不是防崩。评审实测过：把时间
+    /// 夹具换成 `"11时52分"`，不 panic，但那一列被挤出可见区，
+    /// **行为损坏在 panic 之前就发生了**。
+    ///
+    /// 换成真实存在的族之后，这一列对非 ASCII 的时间也只是画得出来
+    /// 而已。这条测试把那件事钉住。
+    #[test]
+    fn a_time_column_with_non_ascii_still_renders() {
+        let l = LogLine {
+            time: "11时52分".into(),
+            level: LogLevel::Warn,
+            message: "一体机首包延迟".into(),
+        };
+        // 不崩就是这条测试的全部——上一轮这一行的安全完全依赖
+        // `parse_line` 那条校验，而那条校验随时可能被放宽。
+        let mut ui = iced_test::simulator(log_row(&l));
+        let _ = ui.snapshot(&APP_THEME).expect("渲染一行非 ASCII 的时间");
+        // 顺带：它确实还画得出来，不是被挤成了零宽。
+        let mut ui = iced_test::simulator(log_row(&l));
+        let bounds = ui.find("11时52分").expect("时间那一列").bounds();
+        assert!(bounds.width > 1.0, "时间那一列被挤没了：{bounds:?}");
     }
 
     /// **三列的横向顺序：时间在左，等级居中，正文在右。**

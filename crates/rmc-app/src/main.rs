@@ -12,7 +12,6 @@
 //! 这里只做三件 `main` 才能做的事：初始化日志、抢单实例锁、起 iced 事件
 //! 循环。往这个文件加任何判断之前，先看一眼 `lib.rs` 顶部的 crate 级约定。
 
-use rmc_app::program;
 use rmc_app::wiring::{self, AppPaths, Platform};
 #[cfg(windows)]
 use rmc_app::SINGLE_INSTANCE_NAME;
@@ -63,14 +62,15 @@ fn main() -> iced::Result {
         wiring::spawn_core(AppPaths::resolve(), Platform::detect())
     };
     tracing::info!(paths = ?core.paths, "内核已启动");
-    // 订阅那一条路只能走进程级的事件源，见 `wiring::subscribe_installed`
-    // 上的说明；命令与路径走 `App` 自己持有的那一份。
-    wiring::install_event_source(&core);
 
-    // 装配全部在 `rmc_app::program()` 里，那边有测试看得见；这里只负责把它
-    // 跑起来。**往这一行加任何东西之前先看 `program()` 的文档注释**——
-    // 写在 `main()` 里的装配在这台无头机器上一个字都验不了，评审实测过
-    // `.title("Gateway")`、绕开 `window_settings()`、删掉 `.theme(..)`、
-    // 乃至挂一棵字面画着 "Gateway" 的控件树，九道闸门全绿。
-    program(Some(core)).run()
+    // 装配全部在 `rmc_app::assemble()` 里，那边有测试看得见；这里只负责
+    // 把它跑起来。**往这一行加任何东西之前先看 `assemble()` 的文档
+    // 注释**——写在 `main()` 里的装配在这台无头机器上一个字都验不了，
+    // 实测过 `.title("Gateway")`、绕开 `window_settings()`、删掉
+    // `.theme(..)`、挂一棵字面画着 "Gateway" 的控件树、以及 W177 那两枪
+    // （忘了登记事件源、根本没把内核接上去），九道闸门全绿。
+    //
+    // W177 之后那两枪有人接了：`install_event_source` 与
+    // `program(Some(core))` 都搬进了 `assemble()`。
+    rmc_app::assemble(core).run()
 }

@@ -382,6 +382,12 @@ pub fn environment_line() -> String {
 /// 被抹掉的东西在包里留下的记号。
 pub const REDACTED: &str = "[已脱敏]";
 
+/// 日志目录读不出来时，包里那条说明的条目名（W180）。
+///
+/// **静默少一个 `logs/` 才是最糟的**：收到包的人会以为这台机器真的
+/// 一条日志都没写过，而真相是它读不出来。
+pub const LOGS_UNAVAILABLE: &str = "logs-unavailable.txt";
+
 /// 进诊断包之前要抹掉的东西。
 ///
 /// # 为什么脱敏要**登记**，而不是靠猜
@@ -509,7 +515,24 @@ pub fn bundle(out_dir: &Path, input: &BundleInput<'_>) -> std::io::Result<PathBu
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let out_path = out_dir.join(format!("rmc-diagnostics-{stamp}.zip"));
-    let file = std::fs::File::create(&out_path)?;
+
+    // 失败就把半成品删掉（W180）。
+    //
+    // 不这么做的话，任何一步出错都会在盘上留下一个**打不开的 zip**
+    // ——`File::create` 已经建出文件，而 `ZipWriter::finish()` 还没跑。
+    // 现场工程师会把那个文件当成诊断包发出去，远程那头打不开。
+    match write_bundle(&out_path, input) {
+        Ok(()) => Ok(out_path),
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            Err(e)
+        }
+    }
+}
+
+/// [`bundle`] 的正体。分出来只为让"失败就删掉半成品"那一层写得下。
+fn write_bundle(out_path: &Path, input: &BundleInput<'_>) -> std::io::Result<()> {
+    let file = std::fs::File::create(out_path)?;
     let mut zip = zip::ZipWriter::new(file);
     let opts: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -533,17 +556,44 @@ pub fn bundle(out_dir: &Path, input: &BundleInput<'_>) -> std::io::Result<PathBu
         zip.write_all(input.redaction.apply(&body).as_bytes())?;
     }
 
-    // 目录项的顺序由文件系统决定，排一遍序好让同一份输入产出同一份包。
+    // 日志目录读不了**不能让整次导出失败**（W180）。
+    //
+    // 实测过的那条路：干净机器上**第一次**导出时 `log_dir` 还不存在
+    // （今天还没写过任何一条审计日志），`read_dir` 返回 `NotFound`，
+    // 原来那个 `?` 把整次导出判成失败——而 zip 文件已经建出来了。
+    // 也就是说「第一次导出」必然失败，而且留下一个打不开的文件。
+    //
+    // 现在分两种：
+    //
+    // - `NotFound`：**正常**，今天还没有日志，包里就没有 `logs/`；
+    // - 别的（权限、路径被占）：**照样出包**，但包里留一条
+    //   [`LOGS_UNAVAILABLE`] 说明为什么没有日志——静默少一个目录才是
+    //   最糟的，收到包的人会以为这台机器真的一条日志都没写过。
     let mut logs: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(input.log_dir)? {
-        let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name.starts_with("rmc-") && name.ends_with(".log") {
-            logs.push(path);
+    match std::fs::read_dir(input.log_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with("rmc-") && name.ends_with(".log") {
+                    logs.push(path);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            zip.start_file(LOGS_UNAVAILABLE, opts)?;
+            zip.write_all(
+                input
+                    .redaction
+                    .apply(&format!("日志目录读不出来：{e}"))
+                    .as_bytes(),
+            )?;
         }
     }
+    // 目录项的顺序由文件系统决定，排一遍序好让同一份输入产出同一份包。
     logs.sort();
     for path in logs {
         let name = path
@@ -560,7 +610,7 @@ pub fn bundle(out_dir: &Path, input: &BundleInput<'_>) -> std::io::Result<PathBu
     }
 
     zip.finish()?;
-    Ok(out_path)
+    Ok(())
 }
 
 /// 这一次导出要抹掉哪些东西，**从表单上取**。
@@ -1406,6 +1456,109 @@ mod tests {
             !contains_bytes(text_of(&entries, "environment.txt"), REDACTED.as_bytes()),
             "空口令把整份文本打花了"
         );
+    }
+
+    // ================= W180：第一次导出 =================
+
+    /// **干净机器上的第一次导出必须成功。**
+    ///
+    /// 这是评审实测出来的一个真 bug，不只是测试问题：
+    /// 今天还没写过任何一条审计日志时 `log_dir` 根本不存在，原来
+    /// `bundle` 里那句 `for entry in read_dir(log_dir)?` 会把整次导出
+    /// 判成失败——**而 zip 文件已经被 `File::create` 建出来了**。
+    ///
+    /// 现场第一次点「导出诊断包」恰恰就是这种情形（而且那多半正是
+    /// 连不上、急着要包的时候），后果是：界面报失败，盘上留下一个
+    /// 打不开的文件，工程师把它发出去，远程那头解不开。
+    ///
+    /// 改红：把 `write_bundle` 里那个 `match read_dir` 换回
+    /// `for entry in read_dir(input.log_dir)?`。
+    #[test]
+    fn the_very_first_export_on_a_clean_machine_succeeds() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let logs = dir.path().join("logs"); // 故意**不建**它
+        assert!(!logs.exists());
+
+        let form = crate::form::Form::default();
+        let zip = export(&form, None, "客户端 0.1.0", &logs, dir.path())
+            .expect("第一次导出就失败了——干净机器上这是必然发生的那一次");
+
+        // 出来的是一个**打得开**的包，不是半成品。
+        let entries = entries_of(&zip);
+        assert_eq!(names_of(&entries), vec!["environment.txt"]);
+        assert_eq!(
+            String::from_utf8_lossy(text_of(&entries, "environment.txt")),
+            "客户端 0.1.0"
+        );
+    }
+
+    /// 日志目录**读不出来**（不是"不存在"）时，包里要说一句。
+    ///
+    /// 静默少一个 `logs/` 是最糟的：收到包的人会以为这台机器真的一条
+    /// 日志都没写过。
+    ///
+    /// 改红：把那个 `Err(e) => { ... }` 分支体换成 `{}`。
+    #[test]
+    fn a_log_directory_that_cannot_be_read_is_reported_inside_the_bundle() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        // 路径被一个**文件**占住：`read_dir` 必然失败，且不是 NotFound。
+        let logs = dir.path().join("logs");
+        std::fs::write(&logs, b"not a directory").unwrap();
+
+        let form = crate::form::Form::default();
+        let zip = export(&form, None, "客户端 0.1.0", &logs, dir.path())
+            .expect("日志读不出来不该让整次导出失败");
+
+        let entries = entries_of(&zip);
+        assert!(
+            names_of(&entries).contains(&LOGS_UNAVAILABLE),
+            "日志读不出来却一声不响：{:?}",
+            names_of(&entries)
+        );
+        // 反向自证：环境信息照样进包了，包不是空的。
+        assert!(names_of(&entries).contains(&"environment.txt"));
+    }
+
+    /// 失败时**不留半成品**。
+    ///
+    /// # 夹具必须让失败发生在 zip **已经建出来之后**
+    ///
+    /// 第一版让输出目录本身是一个文件，于是 `File::create` 就失败了，
+    /// 盘上压根没出现过 zip——那种夹具下把 `remove_file` 删掉**一条都
+    /// 不红**（实测过）。要观察到"半成品"，失败必须发生在
+    /// `File::create` 成功之后：这里让日志目录里躺着一个**名字像日志
+    /// 文件的目录**，`read_dir` 会把它列出来，随后 `std::fs::read`
+    /// 在它上面失败（`EISDIR`），而那时 zip 已经建出来了。
+    ///
+    /// 改红：把 `bundle` 里那句 `let _ = std::fs::remove_file(&out_path);`
+    /// 删掉。
+    #[test]
+    fn a_failed_export_leaves_no_broken_zip_behind() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let out = dir.path().join("out");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        // 一个**目录**，名字却长得像日志文件。
+        std::fs::create_dir(logs.join("rmc-2026-09-13.log")).unwrap();
+
+        let form = crate::form::Form::default();
+        let err = bundle(
+            &out,
+            &BundleInput {
+                environment: "x",
+                report: None,
+                log_dir: &logs,
+                redaction: &redaction_for(&form),
+            },
+        );
+        assert!(err.is_err(), "夹具没能让导出失败，下面那条断言是空转的");
+        // 主断言：输出目录里一个文件都没留下。
+        let left: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "失败之后留下了打不开的半成品：{left:?}");
     }
 
     // ================= 环境信息 =================

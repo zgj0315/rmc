@@ -163,6 +163,22 @@ pub fn parse_line(raw: &str) -> Result<LogLine, LineReject> {
         Some(cut) => &rest[..cut],
         None => rest,
     };
+    // 这条校验管的是**格式**：时分秒只能是数字与冒号。
+    //
+    // # W179：它曾经还兼着一件没写下来的事，现在不兼了
+    //
+    // 上一轮日志页左边两列用的是 `iced::Font::MONOSPACE`，而那个泛族在
+    // cosmic-text 里绑死在一个通常没装的字体上，**非 ASCII 会让渲染
+    // 管线溢出 panic**。当时唯一挡着这件事的就是这一行——它把非 ASCII
+    // 的时间挡在了界面之外。而这条校验的文档里一个字都没提这件事：
+    // 下一个人为了显示毫秒或时区把它放宽，会同时拆掉一条他根本不知道
+    // 存在的防线。
+    //
+    // 现在那一侧换成了本机真实存在的等宽族（见
+    // `crate::view::logs::monospace_family`），这一行**只管格式**。
+    // 「非 ASCII 的时间也画得出来」由 `view/logs.rs` 的
+    // `a_time_column_with_non_ascii_still_renders` 单独钉住，不再依赖
+    // 这里。
     if time.is_empty() || !time.chars().all(|c| c.is_ascii_digit() || c == ':') {
         return Err(LineReject::Malformed(Malformed::BadTime));
     }

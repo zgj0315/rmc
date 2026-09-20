@@ -152,6 +152,38 @@ pub fn program(
         .subscription(subscription)
 }
 
+/// 把内核接上去，交出一个可以 `run()` 的程序。
+///
+/// # W177：`main()` 里最后那两根线，这里才接得住
+///
+/// `main()` 是一个薄 bin（W103），里面的东西在这台无头机器上一个字都
+/// 验不了。上一轮实测过两枪，**七道闸门全绿**：
+///
+/// - 删掉 `install_event_source(&core)` → 界面永远收不到任何内核事件，
+///   状态卡停在"未开启"，而按钮照样点得动；
+/// - 把 `program(Some(core))` 写成 `program(None)` → 内核根本没接上。
+///
+/// 出路是 Task 6 那把钥匙再往前一步：`iced::Program::boot()` 是**公开**
+/// 的（`iced_program-0.14.0/src/lib.rs:47`），Task 6 只用它取过
+/// `title`/`theme`/`window`/`view`，**没有用它取状态**。把这两根线从
+/// `main()` 挪进这个函数之后，测试可以 `boot()` 出真正的 [`App`] 来看
+/// 内核有没有到它手上。
+///
+/// `main()` 于是只剩 `rmc_app::assemble(core).run()` 一行。
+///
+/// 守它的是 [`tests::assemble_hands_the_core_to_the_ui_and_installs_the_event_source`]。
+pub fn assemble(
+    core: Core,
+) -> iced::application::Application<
+    impl iced::Program<State = App, Message = Message, Theme = iced::Theme>,
+> {
+    // 订阅那一条路只能走进程级的事件源，见
+    // `wiring::subscribe_installed` 上关于"为什么这里必须有一个全局"
+    // 的说明；命令与路径走 `App` 自己持有的那一份。
+    wiring::install_event_source(&core);
+    program(Some(core))
+}
+
 /// 每秒一跳。计时器与日志刷新都跟着它。
 ///
 /// 一秒是「已连接时长」那个 `HH:MM:SS` 的最小刻度定的——再慢秒数会跳，
@@ -940,29 +972,40 @@ mod tests {
         );
     }
 
-    /// 没接上内核时点按钮**不崩，而且一个字节都不往磁盘上写**。
+    /// 没接上内核时点按钮**不崩，而且什么都不往盘上写**。
     ///
-    /// `App::default()` 就是这个状态（`tests/ui.rs` 里全是它）。两件事
-    /// 都要守：
+    /// `App::default()` 就是这个状态（`tests/ui.rs` 里全是它）。
     ///
-    /// 1. **不崩**——写成 `todo!()`/`unwrap()` 的话一次误点直接崩掉进程；
-    /// 2. **不猜落点**。这一条是实测出来的教训：第一版在没有内核时退回
-    ///    `AppPaths::resolve()`，于是「导出诊断包」那一格每跑一次
-    ///    `cargo test` 就往开发机真实的 `~/.rmc/` 里扔一个诊断包
-    ///    （攒到 27 个才被发现），「打开日志目录」那一格还会真的弹出一个
-    ///    文件管理器窗口。
+    /// # W180：这条测试上一版名不副实
+    ///
+    /// 它叫 `..._touches_no_disk`，开头建了一个临时目录当"假 HOME"、
+    /// 断言它是空的，**然后既没有把 `HOME` 指过去、也没有再查一次**。
+    /// 那三行是**纯死代码**，名字里的 `touches_no_disk` 没有任何断言
+    /// 支撑——跟上一轮刚修掉的那条空转断言是同一个形状。已删。
+    ///
+    /// 现在名字只说它证明得了的事，而"不往盘上写"这件事改由**两道**
+    /// 更管用的防线守：
+    ///
+    /// 1. 下面这几条断言（没有内核就不会有 `last_export`、日志尾部恒定
+    ///    是 `NotWrittenYet`）——它们直接观察"有没有发生"；
+    /// 2. [`tests::only_main_decides_where_the_app_directory_is`] 那道
+    ///    源码扫描——它挡住**故障的来源**（在别处退回
+    ///    `AppPaths::resolve()`），而且不依赖任何一次真实的文件系统状态。
+    ///
+    /// 第 2 道尤其要紧：评审复现过，退回那个写法之后，**干净机器上的
+    /// 第一次运行**里 `bundle` 会先建出 zip 再因为 `log_dir` 不存在而
+    /// 返回 `Err`，于是 `last_export` 仍是 `None`——**测试绿，而 zip
+    /// 已经落在盘上**，第二次跑才会红。也就是说靠观察 `last_export`
+    /// 去防这场事故，恰恰会在事故发生的那一次放过它。
+    /// （那个"先建 zip 后失败"本身也是个真 bug，已一并修掉，见
+    /// `diag::tests::the_very_first_export_on_a_clean_machine_succeeds`。）
     ///
     /// 改红：把 `export_diagnostics` / `Action::OpenLogDir` 里那两句
     /// `let Some(..) = self.paths() else { return }` 换回
-    /// `AppPaths::resolve()`——第二组断言当场红。
+    /// `AppPaths::resolve()`——源码扫描那条当场红（这一条则未必，
+    /// 见上）。
     #[test]
-    fn pressing_buttons_without_a_core_is_harmless_and_touches_no_disk() {
-        // 把 HOME 指到一个空的临时目录：真有人去猜落点，痕迹会落在这里，
-        // 而不是开发机的家目录里。
-        let home = tempfile::tempdir().expect("建临时目录");
-        let before = std::fs::read_dir(home.path()).unwrap().count();
-        assert_eq!(before, 0);
-
+    fn pressing_buttons_without_a_core_is_harmless() {
         for action in Action::ALL {
             let mut app = App {
                 form: filled_form(),
@@ -985,6 +1028,191 @@ mod tests {
             app.log_file_name.starts_with("rmc-") && app.log_file_name.ends_with(".log"),
             "{}",
             app.log_file_name
+        );
+    }
+
+    /// **只有 `main.rs` 可以决定落点在哪儿。**
+    ///
+    /// # 为什么这是一道闸门，而不是一句约定
+    ///
+    /// `AppPaths::resolve()` 读的是真实环境变量，指向的是**开发机的家
+    /// 目录**。在 `main.rs` 之外调它，等于让某一段代码在"还不知道落点"
+    /// 的时候自己猜一个——而这件事已经在本项目烧掉了整整一轮：
+    /// 上一轮 `App::export_diagnostics` 与 `Action::OpenLogDir` 在没有
+    /// 内核时退回它，于是**每跑一次 `cargo test` 就往真实的 `~/.rmc/`
+    /// 里扔一个诊断包**（攒到 27 个才被发现），并且会真的弹出一个文件
+    /// 管理器窗口。
+    ///
+    /// 这道扫描挡的是**故障的来源**，不是它的痕迹：它不依赖任何一次
+    /// 真实的文件系统状态，也就不会像"事后查目录空不空"那样在干净机器
+    /// 的第一次运行里放过去（W180，见
+    /// [`tests::pressing_buttons_without_a_core_is_harmless`]）。
+    ///
+    /// 形状照 `diag.rs` 那条
+    /// `this_crate_never_polls_the_transport_for_the_current_proxy`。
+    ///
+    /// 改红：在 `lib.rs`（或别的任何非 `main.rs` 的文件）里写一行
+    /// `let p = wiring::AppPaths::resolve();`——这条当场红。
+    #[test]
+    fn only_main_decides_where_the_app_directory_is() {
+        // needle 拼出来而不是写成字面量：写成字面量的话**这一行自己**
+        // 就是一处命中，测试永远红。
+        let needle = concat!("AppPaths::", "resolve");
+        let hits = grep_src(needle);
+        let outside: Vec<&String> = hits.iter().filter(|h| !h.starts_with("main.rs:")).collect();
+        assert!(
+            outside.is_empty(),
+            "只有 main.rs 可以调 {needle}()——别处调它意味着有代码在\
+             「还不知道落点」时自己猜了一个，而那个猜测指向开发机的家目录：\n{outside:#?}"
+        );
+
+        // 反向自证之一：`main.rs` 里确实有一处，扫描器真的会命中。
+        assert!(
+            hits.iter().any(|h| h.starts_with("main.rs:")),
+            "main.rs 里居然没有调用 {needle}()——扫描器八成没走到，\
+             上面那条断言是空转的：{hits:?}"
+        );
+        // 反向自证之二：扫描器真的走到了 src/ 的别的文件。
+        let anchor = grep_src("pub const WINDOW_TITLE");
+        assert!(
+            anchor.iter().any(|h| h.starts_with("lib.rs:")),
+            "扫描器没在 lib.rs 里找到 WINDOW_TITLE：{anchor:?}"
+        );
+    }
+
+    /// rmc-app 的 `src/` 下含 `needle` 的**非注释行**，形如
+    /// `main.rs:42: <原文>`。
+    ///
+    /// 跟 `diag.rs` 里那份是同一个形状；没有提出来共用，是因为它只有
+    /// 二十行、而把它挪到某个公共位置会让两条扫描互相牵动。
+    fn grep_src(needle: &str) -> Vec<String> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("读 src 目录") {
+                let path = entry.expect("读目录项").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                let text = std::fs::read_to_string(&path).expect("读源文件");
+                for (i, line) in text.lines().enumerate() {
+                    let t = line.trim_start();
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    if t.contains(needle) {
+                        out.push(format!("{rel}:{}: {t}", i + 1));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // ---------- 线 1.5：W177 —— `main()` 最后那两根线 ----------
+
+    /// **`assemble()` 真的把内核交到了界面手上，也真的登记了事件源。**
+    ///
+    /// # 断的是哪一根线
+    ///
+    /// 上一轮这两根线在 `main()` 里，而 `main()` 在这台无头机器上一个字
+    /// 都验不了。实测两枪、七道闸门全绿：删掉 `install_event_source`
+    /// （界面永远收不到任何内核事件），或者把 `program(Some(core))` 写成
+    /// `program(None)`（内核根本没接上）。
+    ///
+    /// 钥匙是 `iced::Program::boot()` 本来就是**公开**的——Task 6 用它取
+    /// 过 `title`/`theme`/`window`/`view`，**没取过状态**。取出状态之后
+    /// 这两根线都看得见了：
+    ///
+    /// 1. **内核到没到界面手上**：往这个内核的落点里写一行带记号的审计
+    ///    日志，断言 `App::log_tail()` 里读得到它。这个判据是免费的——
+    ///    `App::with_core` 本来就会 `reload_logs()`，而
+    ///    [`wiring::read_tail`] 在没有内核时**按设计**返回
+    ///    `NotWrittenYet`，所以"读到了这个目录下的那一行"就等价于
+    ///    "内核交到界面手上了"，不需要任何新 API。
+    /// 2. **事件源登没登记**：[`wiring::subscribe_installed`] 本来就是
+    ///    公开的，先反向自证它是 `None`，`assemble` 之后断言拿得到、
+    ///    而且真的收得到一条事件。
+    ///
+    /// 两枪打在**两条不同的断言**上。
+    ///
+    /// **这条测试是整个测试二进制里唯一调用 `assemble()` 的**——
+    /// `install_event_source` 用的是 `OnceLock`，第二次调用不生效，
+    /// 所以第一条断言（登记之前必须是 `None`）只有在"只有这一条测试会
+    /// 登记"的前提下才站得住。
+    #[tokio::test]
+    async fn assemble_hands_the_core_to_the_ui_and_installs_the_event_source() {
+        const MARK: &str = "mark-assemble-3e7a";
+
+        // 绕开固有方法遮蔽：`Application` 自己有同名的 builder 方法，
+        // 对具体类型直接 `p.boot()` 解析不到 trait 上那一份。同
+        // `program_wires_the_tested_title_theme_and_window`。
+        fn boot_state<P>(p: &P) -> App
+        where
+            P: iced::Program<State = App, Message = Message, Theme = iced::Theme>,
+        {
+            let (state, _task) = p.boot();
+            state
+        }
+
+        // 反向自证之一：还没登记过。
+        assert!(
+            wiring::subscribe_installed().is_none(),
+            "有别的测试抢先登记了进程级事件源，这条测试的前提不成立"
+        );
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = wiring::AppPaths::at(dir.path().to_path_buf());
+        // 往**这个内核的落点**里写一行只有它才看得到的日志。
+        let a = rmc_core::audit::Audit::open(paths.log_dir()).expect("建日志目录");
+        a.record(rmc_core::audit::Level::Info, MARK);
+
+        // 反向自证之二：不接内核的话读不到它——下面那条断言因此带载。
+        assert_eq!(
+            App::with_core(None).log_tail(),
+            &LogTail::NotWrittenYet,
+            "没有内核居然也读到了日志，下面那条断言证明不了内核接上了"
+        );
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (ev_tx, ev_rx) = broadcast::channel(4);
+        let core = wiring::Core::new(cmd_tx, ev_rx, paths, None);
+
+        let state = boot_state(&assemble(core));
+
+        // 第一根线：内核到了界面手上。
+        let got: Vec<&str> = state
+            .log_tail()
+            .lines()
+            .iter()
+            .map(|l| l.message.as_str())
+            .collect();
+        assert!(
+            got.contains(&MARK),
+            "界面没拿到内核——它读的不是这个内核的日志目录：{got:?}"
+        );
+
+        // 第二根线：事件源登记了，而且真的通。
+        let mut rx = wiring::subscribe_installed().expect("进程级事件源没有登记");
+        ev_tx
+            .send(TunnelEvent::State(State::Preflight))
+            .expect("发事件");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("登记的事件源收不到东西")
+                .expect("事件通道断了"),
+            TunnelEvent::State(State::Preflight)
         );
     }
 
