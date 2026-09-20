@@ -37,15 +37,36 @@ windows = "0.62"
 opt-level = "z"
 lto = true
 codegen-units = 1
-# panic = "abort" 去掉展开表。全仓库 `should_panic` 与 `catch_unwind` 各
-# 零处（已 grep 核过），没有任何代码依赖栈展开；`cargo test` 走 test profile，
-# 不受这一行影响。
+# **这里曾经有一行 `panic = "abort"`，交付前被去掉了。记下为什么。**
 #
-# **但它有代价，而且这个代价今天没有对冲**：`main.rs` 声明了
-# `windows_subsystem = "windows"`（不弹控制台），所以 panic 的那行文字写进
-# 一个没人接的 stderr，`strip` 又把符号表去掉了——现场崩一次，什么都留不下。
-# 装一个把 panic 写进 tracing 的钩子是几行的事，但那几行落在 `main()` 里，
-# 而 `main()` 至今零自动化证据（W216）。按用户方针「成本不随时间涨的记账
-# 不做」，记在 task-12-report.md 的「交付前还剩什么」表第 1 条。
-panic = "abort"
+# 当时给的理由是「全仓库 `should_panic` 与 `catch_unwind` 各零处（已 grep
+# 核过），没有任何代码依赖栈展开」。**后半句是假的**：
+# `crates/rmc-win/src/events.rs:712` 的 `std::panic::catch_unwind` 是生产
+# 代码——电源事件的 Win32 回调（`unsafe extern "system" fn on_power_event`），
+# 由系统线程调用。
+#
+# 而那一处的文档注释在七个任务之前就写下了这个预言：
+#
+#   > 它挡不住 `panic = "abort"`（Task 10 的 app crate 如果那样配置，
+#   > 这一层就是装饰品）
+#
+# 依赖里还有两层一并被作废：tokio 的 task harness（`runtime/task/harness.rs`
+# 等 10 个文件）——今天一个 `spawn` 任务 panic 只变成 `JoinError`、运行时
+# 照活，abort 之后**隧道任务里任何一个 panic 直接带走整个 GUI 进程**；
+# winit 的 Windows 后端把整条消息回路包在 `catch_unwind` 里（那是为了不让
+# 栈展开穿过 Win32 FFI 边界），abort 之后 panic **不再走「干净退出事件循环」
+# 那条路，所有 `Drop` 都不执行——包括托盘的 `NIM_DELETE`**，现场表现是
+# 窗口瞬间消失、通知区留一个幽灵圆点。
+#
+# 最现实的触发点正是验收清单里的正常操作：合盖唤醒 → `tracing::info!` →
+# 文件 appender 写盘失败（盘满、路径被域策略重定向、权限）——今天被那层
+# `catch_unwind` 吞掉，abort 之后是**客户端在工程师午休回来时凭空消失**，
+# 而 `windows_subsystem = "windows"` + `strip` 让它什么都留不下。
+#
+# 换来的只是二进制小一点。不值。
+#
+# 崩溃现场取证那件事仍然没做（panic 的文字写进一个没人接的 stderr、符号表
+# 被 strip 掉）。装一个把 panic 写进 tracing 的钩子是几行的事，但那几行落在
+# `main()` 里，而 `main()` 至今零自动化证据（W216）——记在「交付前还剩什么」
+# 表第 1 条，**现在至少三层展开兜底都还在**。
 strip = true

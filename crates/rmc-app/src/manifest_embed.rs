@@ -13,13 +13,26 @@
 //! 「产物给谁用」。从 Linux 交叉编译到 Windows 时它是 `false`，清单静默不嵌。
 //!
 //! 所以判断写在这里（普通模块，下面有测试），`build.rs` 用
-//! `include!("src/manifest_embed.rs")` 把它引进去，自己只剩「读两个环境
-//! 变量、把结果打印成 cargo 指令」这一层纯搬运。
+//! `#[path = "src/manifest_embed.rs"] mod manifest_embed;` 把它引进去，
+//! 自己只剩「读两个环境变量、把结果打印成 cargo 指令」这一层纯搬运。
+//!
+//! **不能用 `include!`**——`include!` 展开出来的位置不允许内部属性，
+//! 上面这段 `//!` 文档会直接编译失败（`build.rs` 那边实测过）。
 //!
 //! # 这份判断**证明不了**的事
 //!
 //! 它证明不了 `link.exe` 真的认这两个参数、也证明不了清单真的进了 PE 的
-//! 资源段。那件事的唯一验证是 `app.yml` 的「确认清单已嵌入」那一步
+//! 资源段。**还有一层**：`build.rs` 打印时用的那个指令键名
+//! （`cargo:rustc-link-arg-bins=`）本身一条测试都没有，而 cargo 对单冒号的
+//! 未知 `cargo:` 指令是**当 metadata 静默忽略**的——手滑写成
+//! `cargo:rustc-link-arg-bin=` 就是「测试全绿、构建全绿、清单静默不嵌」。
+//!
+//! 那件事的唯一验证是 `app.yml` 的「确认清单已嵌入」那一步。
+//! **注意那一步的三个关键词里 `asInvoker` 不带载**：MSDN 明写，指定
+//! `/MANIFEST` 而未指定 `/MANIFESTUAC`/`/DLL` 时链接器会自动插一段
+//! level 为 `asInvoker` 的 UAC 片段——就算 `/MANIFESTINPUT:` 完全没生效，
+//! 它照样出现在 exe 字节里。真正钉住「我们这份文件进去了」的是
+//! `PerMonitorV2` 与 `longPathAware` 这两条。原文是
 //! （在 exe 的字节里找 `asInvoker` / `PerMonitorV2` / `longPathAware`），
 //! 而那一步在开发机上跑不了。别把这里的绿灯读成「清单嵌好了」。
 

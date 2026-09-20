@@ -388,6 +388,30 @@ fn no_step_in_any_job_is_silently_disabled_with_if_false() {
                 !step_is_disabled(step),
                 "job {job_name} 的 step {name:?} 带 if: false，会被静默跳过"
             );
+            // 复审实测：光守 `if: false` 不够。**给 windows 的测试步骤加
+            // `continue-on-error: true`，14 条全绿**——那一步失败、job 照样
+            // 绿、产物照样上传，而它是 401 条测试唯一的出口。
+            // `if: ${{ false }}` 同理：`step_is_disabled` 认 `false` 与
+            // `"false"`，不认 `${{ }}` 那种表达式写法。
+            //
+            // 所以这里改成**全等**：这两个 job 的 step 今天一个 `if` 都没有，
+            // 一个 `continue-on-error` 也没有。将来真要加条件步骤，
+            // 来改这条断言的人必须显式想一遍「这一步被跳过会怎样」。
+            //
+            // 这个洞的成本**是随时间涨的**——工作流步骤只会越加越多。
+            //
+            // 改红：给任意一个 step 加 `continue-on-error: true`
+            // 或任意形式的 `if:`。
+            assert!(
+                step["continue-on-error"].is_badvalue(),
+                "job {job_name} 的 step {name:?} 带 continue-on-error：\
+                 它失败了 job 还是绿的"
+            );
+            assert!(
+                step["if"].is_badvalue(),
+                "job {job_name} 的 step {name:?} 带 if: 条件。\
+                 要加条件步骤先想清楚「这一步被跳过会怎样」，再来改这条断言"
+            );
         }
     }
 }
