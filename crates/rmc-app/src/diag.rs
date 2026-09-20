@@ -1106,6 +1106,15 @@ mod tests {
             ),
         )
         .unwrap();
+        // **条目名那一侧的载荷**。评审实测：没有这一份时，下面那句
+        // `!name.contains(canary)` 是**空转的**——把 `apply(name)` 换回
+        // `name` 一条都不红，因为没有任何来源把金丝雀灌进文件名。
+        // 日志按账号分文件不是杜撰的形状：出问题时按人找日志是常见做法。
+        std::fs::write(
+            logs.join(format!("rmc-{ACCOUNT}.log")),
+            format!("INFO {MARK_LOG} 按账号分出来的那一份\n"),
+        )
+        .unwrap();
 
         let r = PreflightReport {
             steps: vec![
@@ -1140,7 +1149,8 @@ mod tests {
             vec![
                 "environment.txt",
                 "preflight.txt",
-                "logs/rmc-2026-09-13.log"
+                "logs/rmc-2026-09-13.log",
+                "logs/rmc-[已脱敏].log"
             ],
             "三个来源没有都进包，下面的扫描会在一个空包上空转"
         );

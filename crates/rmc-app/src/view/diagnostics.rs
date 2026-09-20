@@ -159,6 +159,48 @@ mod tests {
     use crate::diag::Verdict;
     use crate::APP_THEME;
 
+    /// **「两段文字画反了」也是可观测的——靠 `bounds`，不是靠快照。**
+    ///
+    /// 实现者原先判这条守不住，理由是「行首文字与说明都是
+    /// `Candidate::Text`，只有字号与上下顺序不同，`iced_test` 两样都看不见；
+    /// 要堵得写一个按 `bounds` 收集全部文本的收集器，因为 `Simulator::find`
+    /// 只返回第一个命中」。**这个前提是错的**：`iced_selector` 的 `&str`
+    /// 选择器按**内容整段相等**匹配（`iced_selector-0.14.0/src/lib.rs:53-83`），
+    /// 只要两段文字本身不同，两次 `find` 就分别拿得到各自那一个
+    /// `Candidate::Text`；而 `target::Text::bounds()`（`target.rs:266-272`）
+    /// 直接给出 `Rectangle`。**不需要收集器。**
+    ///
+    /// 差分快照在这里反而够不着：[`a_failed_row_really_draws_in_different_colors`]
+    /// 用的是每次现建的临时基线，画反之后基线与对照帧**一起变**，恒为真。
+    ///
+    /// # Task 10/11 照抄什么
+    ///
+    /// 跟 W146 并列的第二条：**`iced_test` 看不到样式，但看得到位置与尺寸。**
+    /// 凡是「谁在上、谁更大、谁更宽」这类版面语义，都能用 `bounds` 钉住，
+    /// 而不必等一个收集器。
+    ///
+    /// 改红（三种形状都实测过）：把 `name` 与 `detail` 整个画反；
+    /// 只对调两个字号（13↔12）；只对调上下顺序。
+    #[test]
+    fn the_row_puts_its_name_above_its_detail_and_in_a_bigger_type() {
+        let r = DiagRow {
+            name: "AAA".into(),
+            detail: "BBB".into(),
+            verdict: Verdict::Pass,
+        };
+        let mut ui = iced_test::simulator(diag_line(&r));
+        let name = ui.find("AAA").expect("行首文字").bounds();
+        let detail = ui.find("BBB").expect("说明").bounds();
+        assert!(
+            name.y < detail.y,
+            "行首文字没画在说明上面：{name:?} {detail:?}"
+        );
+        assert!(
+            name.height > detail.height,
+            "行首文字没用更大的字号：{name:?} {detail:?}"
+        );
+    }
+
     /// 两份**文字逐字相同、只有结论不同**的行。
     ///
     /// 这是 W146 那个技法的第一步：找一个**让样式变化与文本变化解耦**的
