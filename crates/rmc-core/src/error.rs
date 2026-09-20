@@ -17,10 +17,10 @@ pub enum ErrorClass {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Gateway host key 与已记录的不一致，已拒绝连接（记录 {expected}，本次 {actual}）")]
+    #[error("运维服务器 host key 与已记录的不一致，已拒绝连接（记录 {expected}，本次 {actual}）")]
     HostKeyMismatch { expected: String, actual: String },
 
-    #[error("Gateway TLS 证书链无效：{0}")]
+    #[error("运维服务器 TLS 证书链无效：{0}")]
     TlsInvalidCert(String),
 
     #[error("代理要求认证，协商失败：{0}")]
@@ -56,7 +56,7 @@ pub enum Error {
     // 承诺的契约，写进面向用户的文案里，一旦哪天数字变了就会跟着过期，
     // 不如干脆不出现，避免重犯 Gateway 侧同一个错误（把一次性的实测值
     // 当成可以到处引用的常量）。
-    #[error("Gateway 长时间未响应 keepalive，判定连接已断开")]
+    #[error("运维服务器长时间未响应 keepalive，判定连接已断开")]
     KeepaliveTimeout,
 
     #[error("SSH 链路中断：{0}")]

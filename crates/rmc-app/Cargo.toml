@@ -11,6 +11,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# 视图模型（`model.rs`）消费 rmc-core 的 `State`/`TunnelEvent`/
+# `RemoteSessionInfo`/`PreflightReport`，并 re-export 它的 `BANNED_WORDS`。
+# **不新增依赖包**：rmc-core 本来就在 workspace 里（rmc-win 依赖它），
+# 这条只是多一条 workspace 内部的路径依赖边——`Cargo.lock` 里 rmc-app 的
+# dependencies 多一行 "rmc-core"，包数不变。
+rmc-core.workspace = true
 # W101：tracing 已在 `[workspace.dependencies]` 里，写死 "0.1" 会绕开
 # 统一版本管理。
 tracing.workspace = true

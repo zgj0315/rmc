@@ -49,7 +49,7 @@ impl Default for Config {
 /// 校验通过这件事在类型上留下证据，而不是校验完之后又能被随手绕开。
 fn validate_addresses(gateway: &HostPort, appliance: &HostPort) -> Result<()> {
     if appliance == gateway {
-        return Err(Error::Config("一体机地址不能与 Gateway 地址相同".into()));
+        return Err(Error::Config("一体机地址不能与运维服务器地址相同".into()));
     }
     if appliance.is_loopback() {
         return Err(Error::Config(format!(

@@ -27,6 +27,7 @@
 //! 正例：把 `tab_style(is_active) -> (Color, Color)` 抽出来单测，视图里
 //! 只写 `let (fg, line) = tab_style(is_active);`。
 
+pub mod model;
 pub mod theme;
 pub mod view;
 
@@ -40,15 +41,27 @@ pub const WINDOW_TITLE: &str = "远程运维客户端";
 
 /// 需求硬禁令的词表：界面上叫「运维服务器」，不叫 Gateway/网关。
 ///
-/// 三处防线共用这一份——`tests/ui.rs` 的
-/// `no_widget_in_the_tree_says_gateway` 扫 `App::view` 的整棵树，
-/// 本文件的 `program_view_is_the_app_view_and_says_no_gateway` 扫
-/// **`main()` 实际装配进去的那棵**，`window_title_is_chinese_and_never_says_gateway`
-/// 扫操作系统窗口标题。
+/// **W125：词表已经搬到 rmc-core**（[`rmc_core::wording`]），这里只是原样
+/// re-export，`rmc_app::BANNED_WORDS` 这个路径不变。搬家的理由是违反发生在
+/// 源头：rmc-core 的 `Error` 文案会经 `State::Failed { message }` 变成状态
+/// 卡副标题，`preflight::ALL_STEPS` 是诊断页的行首文字，审计日志是日志页的
+/// 正文——实测有八处写着 Gateway，而界面侧这道控件树扫描**一条都抓不到**
+/// （它扫的是当前渲染出来的那棵树，那些字符串只在特定状态下才出现）。
 ///
-/// 刻意不让它分叉成三份字面量：Task 7-11 还要加三个页面，
+/// 现在四处防线共用这一份字面量：
+/// - `rmc_core::wording` 的 `no_production_string_literal_says_gateway`
+///   扫 rmc-core 生产代码里的全部字符串字面量；
+/// - 同模块的 `no_error_variant_says_gateway` 按变体穷尽扫 `Error` 的 Display；
+/// - `tests/ui.rs` 的 `no_widget_in_the_tree_says_gateway` 扫 `App::view`
+///   的整棵树，`model.rs` 的 `nothing_the_status_card_says_is_banned` 扫
+///   八条显示分支各自的状态卡与按钮；
+/// - 本文件的 `program_view_is_the_app_view_and_says_no_gateway` 扫
+///   **`main()` 实际装配进去的那棵**，
+///   `window_title_is_chinese_and_never_says_gateway` 扫操作系统窗口标题。
+///
+/// 刻意不让它分叉成几份字面量：Task 8-11 还要加三个页面，
 /// 词表一旦分叉，迟早有一份漏掉新加的词。
-pub const BANNED_WORDS: [&str; 4] = ["Gateway", "gateway", "GATEWAY", "网关"];
+pub use rmc_core::BANNED_WORDS;
 
 /// 单实例互斥体的名字。
 ///

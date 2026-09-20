@@ -863,7 +863,7 @@ fn begin(
     ctx.audit.record(
         Level::Info,
         &format!(
-            "开始连接：账号 {username}，Gateway {}，一体机 {}",
+            "开始连接：账号 {username}，运维服务器 {}，一体机 {}",
             addrs.gateway(),
             addrs.appliance()
         ),
@@ -1373,7 +1373,7 @@ async fn handle_msg(
             ctx.audit.record(
                 Level::Info,
                 &format!(
-                    "Gateway 认证通过，host key {host_key_fp}{}",
+                    "运维服务器认证通过，host key {host_key_fp}{}",
                     if first_seen { "（首次记录）" } else { "" }
                 ),
             );

@@ -78,10 +78,29 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
-pub const STEP_APPLIANCE_TCP: &str = "一体机 TCP";
-pub const STEP_APPLIANCE_HOSTKEY: &str = "一体机 host key 指纹";
-pub const STEP_GATEWAY_DNS: &str = "Gateway 域名解析";
-pub const STEP_GATEWAY_TLS: &str = "Gateway TLS";
+/// 预检步骤名。W125：**加一条新步骤必须走这个宏**。
+///
+/// 这四个字符串是诊断页（Task 9）直接画在屏幕上的行首文字，也就是说它们
+/// 受需求硬禁令「界面上叫运维服务器，不叫 Gateway/网关」管——而
+/// `wording.rs` 的禁用词扫描只看得见 [`ALL_STEPS`]。宏同时生成常量与
+/// `ALL_STEPS`，绕开它另写一个 `pub const STEP_*` 就等于给扫描器开了
+/// 一个天窗：常量名可以随便叫（`STEP_GATEWAY_DNS` 这个名字本身不上屏，
+/// 刻意没改），值必须进表。
+macro_rules! steps {
+    ($($(#[$m:meta])* $name:ident = $value:literal;)+) => {
+        $($(#[$m])* pub const $name: &str = $value;)+
+
+        /// 全部步骤名，按声明顺序（也就是 [`run`] 产出 `steps` 的顺序）。
+        pub const ALL_STEPS: &[&str] = &[$($name),+];
+    };
+}
+
+steps! {
+    STEP_APPLIANCE_TCP = "一体机 TCP";
+    STEP_APPLIANCE_HOSTKEY = "一体机 host key 指纹";
+    STEP_GATEWAY_DNS = "运维服务器域名解析";
+    STEP_GATEWAY_TLS = "运维服务器 TLS";
+}
 
 /// 单个网络操作的超时预算。预检存在的意义就是把"连不上"这件事在工程师
 /// 现场几秒内说清楚，而不是让界面无限期转圈——见下面 `bounded` 上的说明：

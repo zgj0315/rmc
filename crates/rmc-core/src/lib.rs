@@ -14,7 +14,10 @@ pub mod state;
 pub mod supervisor;
 pub mod transport;
 pub mod tunnel;
+pub mod wording;
 
 pub use addr::HostPort;
 pub use error::{Error, ErrorClass, Result};
 pub use state::{Command, State, TunnelEvent};
+
+pub use wording::{banned_word_in, BANNED_WORDS};

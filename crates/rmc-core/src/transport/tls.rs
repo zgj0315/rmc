@@ -58,7 +58,7 @@ pub async fn wrap_tls<S: Io>(
     roots: &TlsRoots,
 ) -> Result<TlsStream<S>> {
     let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
-        .map_err(|_| Error::Config(format!("Gateway 主机名不能用于 TLS：{server_name}")))?;
+        .map_err(|_| Error::Config(format!("运维服务器主机名不能用于 TLS：{server_name}")))?;
     roots
         .connector()
         .connect(name, stream)

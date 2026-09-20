@@ -2643,6 +2643,7 @@ version = "0.1.0"
 dependencies = [
  "iced",
  "iced_test",
+ "rmc-core",
  "rmc-win",
  "tempfile",
  "tracing",
