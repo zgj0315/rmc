@@ -151,11 +151,52 @@ mod tests {
         }
     }
 
+    /// 把 `\` 续行接成一条逻辑行，返回 `(首行行号, 逻辑行)`。
+    ///
+    /// **这是评审抓到的一个静默盲区的修补。** 原先是逐物理行切词，
+    /// 于是跨行字面量
+    ///
+    /// ```text
+    /// format!(
+    ///     "第一段 \
+    ///      第二段"
+    /// )
+    /// ```
+    ///
+    /// 的第一行那个 `"` 永远等不到闭合，**整条字面量被丢掉、一声不响**。
+    /// 这不是假想：rmc-core 的生产代码已经在用这种写法写用户可见文案
+    /// （`knownhosts.rs` 的 `corrupt(format!(..))` 经 `Error` 进
+    /// `State::Failed{message}` 上屏，`supervisor.rs` 的审计行经 Task 11
+    /// 的日志页上屏）。评审实测：把禁用词埋进那样一条续行里，**八条防线
+    /// 一条都没响**。
+    ///
+    /// 接法跟 Rust 自己一致：吃掉换行与下一行的前导空白。
+    fn join_continuations(text: &str) -> Vec<(usize, String)> {
+        let mut out: Vec<(usize, String)> = Vec::new();
+        let mut pending: Option<(usize, String)> = None;
+        for (i, line) in text.lines().enumerate() {
+            let continues = line.trim_end().ends_with('\\');
+            let piece = line.trim_end().trim_end_matches('\\');
+            match pending.as_mut() {
+                // 已经在接续中：吃掉前导空白再拼上去。
+                Some((_, buf)) => buf.push_str(piece.trim_start()),
+                None => pending = Some((i + 1, piece.to_string())),
+            }
+            if !continues {
+                out.push(pending.take().expect("刚刚填过"));
+            }
+        }
+        if let Some(last) = pending {
+            out.push(last);
+        }
+        out
+    }
+
     /// 把一行 Rust 源码里的双引号字符串字面量切出来。
     ///
-    /// 只够用于本 crate 的源码形态：处理 `\"` 转义，不处理跨行字符串与
-    /// `r#"..."#`。跨行字符串在本 crate 里只出现在 `mod tests` 之后
-    /// （被下面的扫描截断掉了）。
+    /// 只够用于本 crate 的源码形态：处理 `\"` 转义，不处理 `r#"..."#`。
+    /// **跨行字面量不在这里处理**——调用方先用 [`join_continuations`]
+    /// 把 `\` 续行接成一条逻辑行再喂进来。
     fn string_literals_in(line: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();
@@ -258,7 +299,7 @@ mod tests {
                     .display()
                     .to_string();
                 let text = std::fs::read_to_string(&path).expect("读源文件");
-                for (i, line) in text.lines().enumerate() {
+                for (i, line) in join_continuations(&text) {
                     let trimmed = line.trim_start();
                     if trimmed.starts_with("mod tests {") {
                         break;
@@ -266,8 +307,8 @@ mod tests {
                     if trimmed.starts_with("//") || trimmed.starts_with(".field(") {
                         continue;
                     }
-                    for lit in string_literals_in(line) {
-                        out.push((name.clone(), i + 1, lit));
+                    for lit in string_literals_in(&line) {
+                        out.push((name.clone(), i, lit));
                     }
                 }
             }

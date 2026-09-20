@@ -222,8 +222,25 @@ impl Model {
         }
     }
 
-    /// 已连接时长，形如 `01:34:14`。未连接返回 `None`。
+    /// 已连接时长，形如 `01:34:14`。**只有隧道确实还在时才有值**
+    /// （`Connected` 与 `Stopping`）。
+    ///
+    /// 评审抓到的一处文档与行为不符：`connected_since` 只在 `Idle` 被清
+    /// （那是对的——断线重连时计时该接着走，不该从零重来），但如果这里
+    /// 照旧无条件返回，界面就会在「连接失败」的卡片旁边显示一个还在往上
+    /// 涨的「已连接 00:01:30」。那跟编造一个不存在的端口号是同一类
+    /// 「显示一句不真的话」。
+    ///
+    /// **`Stopping` 留在报数那一侧是刻意的**，与 W129 同一个理由：正在
+    /// 停止时隧道确实还在、远程会话可能真的还开着，说「已连接」不是假话。
+    /// 假话是 `Backoff`（已经断了，在重试）与 `Failed`（根本没连上）。
+    ///
+    /// 所以字段负责**记着**，这个方法负责**说实话**：重新 `Connected`
+    /// 之后接着从原起点算，累计时长不丢。
     pub fn elapsed(&self, now: SystemTime) -> Option<String> {
+        if !matches!(self.state, State::Connected { .. } | State::Stopping) {
+            return None;
+        }
         let since = self.connected_since?;
         let secs = now.duration_since(since).ok()?.as_secs();
         Some(format!(
@@ -698,6 +715,9 @@ mod tests {
     fn elapsed_formats_as_hms() {
         let mut m = Model::default();
         let start = SystemTime::UNIX_EPOCH;
+        // 这条测的是 HH:MM:SS 的排版，状态只是背景；但 `elapsed` 只在隧道
+        // 确实还在时才报数，所以得先真的连上。
+        m.apply(TunnelEvent::State(State::Connected { degraded: false }));
         m.apply(TunnelEvent::ConnectedSince(start));
         let now = start + Duration::from_secs(3600 + 34 * 60 + 14);
         assert_eq!(m.elapsed(now).unwrap(), "01:34:14");
@@ -724,6 +744,49 @@ mod tests {
     #[test]
     fn elapsed_is_none_before_connecting() {
         assert!(Model::default().elapsed(SystemTime::now()).is_none());
+    }
+
+    /// 计时只在 `Connected` 时对外报数，但**起点不丢**。
+    ///
+    /// 改红：把 `elapsed` 开头那个 `matches!(self.state, Connected)` 守卫
+    /// 删掉——`Backoff`/`Failed` 两格会各自报出一个还在涨的「已连接」。
+    #[test]
+    fn elapsed_speaks_only_while_connected_but_remembers_the_start() {
+        let start = SystemTime::UNIX_EPOCH;
+        let now = start + Duration::from_secs(90);
+        let mut m = Model::default();
+        m.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        m.apply(TunnelEvent::ConnectedSince(start));
+        assert_eq!(m.elapsed(now).unwrap(), "00:01:30");
+
+        for s in [
+            State::Backoff {
+                attempt: 1,
+                delay: Duration::from_secs(1),
+            },
+            State::Failed {
+                class: ErrorClass::Fatal,
+                message: "x".into(),
+            },
+        ] {
+            m.apply(TunnelEvent::State(s.clone()));
+            assert!(
+                m.elapsed(now).is_none(),
+                "{s:?} 时不该还报「已连接」：{:?}",
+                m.elapsed(now)
+            );
+        }
+
+        // Stopping 是另一侧：隧道还在、会话可能真的还开着，报数不是假话。
+        // 这一格由 `stopping_keeps_showing_what_is_still_open_until_idle`
+        // 正面守着，这里只确认守卫没把它一起收走。
+        m.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        m.apply(TunnelEvent::State(State::Stopping));
+        assert!(m.elapsed(now).is_some(), "Stopping 时隧道还在，该照报");
+
+        // 重新连上：接着从原起点算，不从零重来。
+        m.apply(TunnelEvent::State(State::Connected { degraded: true }));
+        assert_eq!(m.elapsed(now).unwrap(), "00:01:30", "重连后计时起点丢了");
     }
 
     /// 笔记本的时钟被往回拨（或 NTP 校时）时 `duration_since` 会失败，
