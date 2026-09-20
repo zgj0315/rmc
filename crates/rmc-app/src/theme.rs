@@ -101,6 +101,19 @@ pub fn tab_style(is_active: bool) -> (Color, Color) {
     }
 }
 
+/// 输入框的边框色：填错的框标红，其余用常规边框。
+///
+/// W143 / crate 级约定：这是纯判断，不许留在 `view::maintain` 里——
+/// 留在那里就没有任何东西看得见它（`iced_test` 的选择器只能看到文本、
+/// id 与 bounds，**看不到任何样式**）。表驱动两格在下面。
+pub fn input_border(is_invalid: bool) -> Color {
+    if is_invalid {
+        color::FAILED
+    } else {
+        color::BORDER
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +241,15 @@ mod tests {
     #[test]
     fn tab_all_lists_every_variant_once_in_display_order() {
         assert_eq!(Tab::ALL, [Tab::Maintain, Tab::Diagnostics, Tab::Logs]);
+    }
+
+    /// 同样两格。`input_border` 的两格必须真的不同，否则填错的框跟正常的
+    /// 框长一个样，「标红」这件事根本没发生。
+    #[test]
+    fn input_border_marks_only_invalid_fields() {
+        assert_eq!(input_border(true), color::FAILED);
+        assert_eq!(input_border(false), color::BORDER);
+        assert_ne!(input_border(true), input_border(false));
     }
 
     /// W99：表驱动两格。这段判断原本埋在 `chrome::tabs` 的 iced 视图函数里，

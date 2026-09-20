@@ -20,6 +20,11 @@ rmc-core.workspace = true
 # W101：tracing 已在 `[workspace.dependencies]` 里，写死 "0.1" 会绕开
 # 统一版本管理。
 tracing.workspace = true
+# 口令只用 `Zeroizing<String>` 承载（`form::Form::password`、
+# `Message::PasswordChanged`）。**不新增依赖包**：zeroize 已经是
+# `[workspace.dependencies]` 的一员，rmc-core 与 rmc-win 都在用，
+# Cargo.lock 里的包数不变，只多一条 workspace 内部的依赖边。
+zeroize.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 界面框架。**只开 tiny-skia，不开 wgpu**——修复轮 1 的定案：
 #

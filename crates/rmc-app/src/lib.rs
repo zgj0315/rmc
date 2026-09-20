@@ -27,11 +27,15 @@
 //! 正例：把 `tab_style(is_active) -> (Color, Color)` 抽出来单测，视图里
 //! 只写 `let (fg, line) = tab_style(is_active);`。
 
+pub mod form;
 pub mod model;
 pub mod theme;
 pub mod view;
 
+use form::Form;
+use model::Model;
 use theme::{Tab, WINDOW_SIZE};
+use zeroize::Zeroizing;
 
 /// 窗口标题，也是标题栏里画的那行字。
 ///
@@ -134,21 +138,90 @@ pub fn program() -> iced::application::Application<
         .window(window_settings())
 }
 
-/// 界面消息。Task 7 起会往这里加隧道事件与表单输入。
-#[derive(Debug, Clone)]
+/// 界面消息。
+///
+/// # W141 的延伸：`PasswordChanged` 不许被 `derive(Debug)` 打出来
+///
+/// `#[derive(Debug)]` 在这个枚举上会把口令原样印进任何一条
+/// `tracing::debug!("{msg:?}")`——而 Task 10 要做的正是把消息接进
+/// Supervisor，那种顺手的日志行几乎一定会出现。`Zeroizing` 帮不上忙，
+/// 它的 `Debug` 是转发的。所以这里跟 [`form::Form`] 一样手写。
+///
+/// 载荷用 `Zeroizing<String>` 而不是裸 `String`，让这段口令在 `update`
+/// 消费完之后被抹掉。**说清楚它不能做到什么**：iced 的 `TextInput` 内部
+/// 自己持有一份输入内容（`text_input::Value`），那一份不归我们管，
+/// 这个类型管不到。
+#[derive(Clone)]
 pub enum Message {
     TabSelected(Tab),
+    ApplianceHostChanged(String),
+    AppliancePortChanged(String),
+    GatewayHostChanged(String),
+    GatewayPortChanged(String),
+    UsernameChanged(String),
+    PasswordChanged(Zeroizing<String>),
+    RememberToggled(bool),
+    ActionPressed(model::Action),
+    DisconnectSession(u64),
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 变体名走 `stringify!`，不写字符串字面量。
+        //
+        // **这是 W138 那道新扫描当场抓到的一条**：手写 `Debug` 时顺手写的
+        // `f.debug_tuple("GatewayHostChanged")` 是一条含禁用词的字符串
+        // 字面量。它其实不上屏（`Debug` 只进日志与调试器），但扫描器的
+        // 跳过规则是按**行首**匹配 `.field(` 的，`match` 的这种写法行首是
+        // `Message::`，够不着。
+        //
+        // 没有去放宽跳过规则，而是让字面量整个消失：放宽规则等于在扫描器
+        // 上开一个新的盲区，而 `stringify!` 顺带保证变体名跟枚举定义
+        // 不会漂移。
+        macro_rules! plain {
+            ($name:ident, $value:expr) => {
+                f.debug_tuple(stringify!($name)).field($value).finish()
+            };
+        }
+        match self {
+            Message::TabSelected(v) => plain!(TabSelected, v),
+            Message::ApplianceHostChanged(v) => plain!(ApplianceHostChanged, v),
+            Message::AppliancePortChanged(v) => plain!(AppliancePortChanged, v),
+            Message::GatewayHostChanged(v) => plain!(GatewayHostChanged, v),
+            Message::GatewayPortChanged(v) => plain!(GatewayPortChanged, v),
+            Message::UsernameChanged(v) => plain!(UsernameChanged, v),
+            // 唯一一条被遮住的：口令。
+            Message::PasswordChanged(v) => plain!(
+                PasswordChanged,
+                &format_args!("<redacted {} chars>", v.len())
+            ),
+            Message::RememberToggled(v) => plain!(RememberToggled, v),
+            Message::ActionPressed(v) => plain!(ActionPressed, v),
+            Message::DisconnectSession(v) => plain!(DisconnectSession, v),
+        }
+    }
 }
 
 /// 界面状态。
+///
+/// `Debug` 可以 `derive`：[`Form`] 自己手写了遮口令的那一份，派生出来的
+/// `App::fmt` 调的是它。`app_debug_output_redacts_the_password` 守这条。
 #[derive(Debug)]
 pub struct App {
     tab: Tab,
+    /// 视图模型。Task 10 把 `TunnelEvent` 接进来之后由 [`App::apply`] 推进。
+    model: Model,
+    form: Form,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self { tab: Tab::Maintain }
+        Self {
+            // 默认停在维护页，那是用户唯一要操作的一屏。
+            tab: Tab::Maintain,
+            model: Model::default(),
+            form: Form::default(),
+        }
     }
 }
 
@@ -158,15 +231,54 @@ impl App {
         self.tab
     }
 
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    pub fn form(&self) -> &Form {
+        &self.form
+    }
+
+    /// 把一条隧道事件喂给视图模型。Task 10 的 `Subscription` 接这里。
+    pub fn apply(&mut self, event: rmc_core::TunnelEvent) {
+        self.model.apply(event);
+    }
+
     pub fn update(&mut self, message: Message) {
         match message {
             Message::TabSelected(t) => self.tab = t,
+            Message::ApplianceHostChanged(v) => self.form.appliance_host = v,
+            Message::AppliancePortChanged(v) => self.form.appliance_port = v,
+            Message::GatewayHostChanged(v) => self.form.gateway_host = v,
+            Message::GatewayPortChanged(v) => self.form.gateway_port = v,
+            Message::UsernameChanged(v) => self.form.username = v,
+            Message::PasswordChanged(v) => self.form.password = v,
+            Message::RememberToggled(v) => self.form.remember = v,
+            // Task 10 才接得上 Supervisor：这两条现在**确实什么都不做**。
+            // 界面上按钮点得动、消息发得出来（`tests/ui.rs` 逐条验），
+            // 但没有任何东西在另一头接。不写成 `todo!()` 是因为那会让
+            // 一次误点直接崩掉进程。见 task-8-report.md 的「后续完善」。
+            Message::ActionPressed(_) | Message::DisconnectSession(_) => {}
         }
     }
 
     pub fn view(&self) -> iced::Element<'_, Message> {
         use iced::widget::column;
-        column![view::chrome::title_bar(), view::chrome::tabs(self.tab)].into()
+        let page = match self.tab {
+            Tab::Maintain => view::maintain::view(
+                &self.model,
+                &self.form,
+                self.model.elapsed(std::time::SystemTime::now()),
+            ),
+            // Task 9 / Task 11。现在两页都只有页签框架。
+            Tab::Diagnostics | Tab::Logs => iced::widget::space::vertical().into(),
+        };
+        column![
+            view::chrome::title_bar(),
+            view::chrome::tabs(self.tab),
+            page
+        ]
+        .into()
     }
 }
 
@@ -316,6 +428,115 @@ mod tests {
         }
 
         check(&program());
+    }
+
+    /// W141 的第三道：`Message` 不许把口令印出来。
+    ///
+    /// 改红：把 `impl Debug for Message` 删掉换成 `#[derive(Debug)]`——
+    /// `Zeroizing` 的 `Debug` 是转发的，`PasswordChanged` 会原样印出口令。
+    #[test]
+    fn message_debug_redacts_the_password() {
+        const CANARY: &str = "canary-7f3a9e-must-never-be-printed";
+        let m = Message::PasswordChanged(Zeroizing::new(CANARY.into()));
+        let dumped = format!("{m:?}");
+
+        // 反向自证：`Debug` 真的印了东西、真的认出了这个变体。
+        assert!(dumped.contains("PasswordChanged"), "{dumped}");
+        assert!(!dumped.contains(CANARY), "口令原样进了 Debug：{dumped}");
+        assert!(!dumped.contains("7f3a9e"), "口令片段进了 Debug：{dumped}");
+
+        // 其余变体照常可读——遮的只有口令那一条，不是整个枚举被掏空。
+        assert!(format!("{:?}", Message::UsernameChanged("zhang".into())).contains("zhang"));
+        assert!(format!("{:?}", Message::TabSelected(Tab::Logs)).contains("Logs"));
+        assert!(format!("{:?}", Message::DisconnectSession(7)).contains('7'));
+    }
+
+    /// W141 的第四道：`App` 整份 `Debug` 出来也不许带口令。
+    ///
+    /// `App` 是 `derive(Debug)` 的，靠的是 [`Form`] 手写的那份。
+    #[test]
+    fn app_debug_output_redacts_the_password() {
+        const CANARY: &str = "canary-7f3a9e-must-never-be-printed";
+        let mut app = App::default();
+        app.update(Message::PasswordChanged(Zeroizing::new(CANARY.into())));
+        app.update(Message::UsernameChanged("tunnel-zhang".into()));
+        let dumped = format!("{app:?}");
+
+        assert!(dumped.contains("App"), "{dumped}");
+        assert!(dumped.contains("tunnel-zhang"), "{dumped}");
+        assert!(!dumped.contains(CANARY), "口令经 App 漏了出来：{dumped}");
+    }
+
+    /// 七条表单消息各自写进**自己**那个字段。
+    ///
+    /// 这个 `match` 有七条形状一样的分支，是复制粘贴最容易写串的地方
+    /// （把 `GatewayHostChanged` 写成 `self.form.appliance_host = v`），
+    /// 而写串之后界面看起来完全正常——只是改运维服务器地址会改到一体机上。
+    ///
+    /// 逐条验：每次只发一条消息，断言**只有那一个字段变了**。
+    #[test]
+    fn each_form_message_writes_only_its_own_field() {
+        fn snapshot(app: &App) -> Vec<String> {
+            let f = app.form();
+            vec![
+                f.appliance_host.clone(),
+                f.appliance_port.clone(),
+                f.gateway_host.clone(),
+                f.gateway_port.clone(),
+                f.username.clone(),
+                f.password.to_string(),
+                f.remember.to_string(),
+            ]
+        }
+
+        let messages = [
+            Message::ApplianceHostChanged("a".into()),
+            Message::AppliancePortChanged("b".into()),
+            Message::GatewayHostChanged("c".into()),
+            Message::GatewayPortChanged("d".into()),
+            Message::UsernameChanged("e".into()),
+            Message::PasswordChanged(Zeroizing::new("f".into())),
+            Message::RememberToggled(true),
+        ];
+        assert_eq!(messages.len(), snapshot(&App::default()).len());
+
+        for (i, m) in messages.into_iter().enumerate() {
+            let mut app = App::default();
+            let before = snapshot(&app);
+            app.update(m.clone());
+            let after = snapshot(&app);
+            for (j, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+                if i == j {
+                    assert_ne!(b, a, "{m:?} 没有改动它自己那个字段");
+                } else {
+                    assert_eq!(b, a, "{m:?} 顺手改了第 {j} 个字段");
+                }
+            }
+        }
+    }
+
+    /// 页签切换不碰表单，表单输入也不碰页签。
+    #[test]
+    fn typing_into_the_form_does_not_move_the_tab() {
+        let mut app = App::default();
+        app.update(Message::TabSelected(Tab::Logs));
+        app.update(Message::UsernameChanged("zhang".into()));
+        assert_eq!(app.tab(), Tab::Logs);
+        assert_eq!(app.form().username, "zhang");
+    }
+
+    /// 隧道事件经 `App::apply` 推进视图模型。
+    ///
+    /// 改红：把 `apply` 的函数体换成 `{}`，这条立刻红。Task 10 的
+    /// `Subscription` 接的就是这个入口。
+    #[test]
+    fn tunnel_events_reach_the_view_model() {
+        use rmc_core::state::State;
+        let mut app = App::default();
+        assert_eq!(app.model().state, State::Idle);
+        app.apply(rmc_core::TunnelEvent::State(State::Connecting));
+        assert_eq!(app.model().state, State::Connecting);
+        assert!(!app.model().credentials_visible(), "连接过程中凭据区该隐藏");
     }
 
     /// 需求硬禁令在常量这一层的防线；控件树那一层在 `tests/ui.rs`。

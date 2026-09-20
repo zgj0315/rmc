@@ -252,6 +252,49 @@ impl Model {
     }
 }
 
+/// 主按钮此刻该不该可按。
+///
+/// 只有「开启」要看表单填没填全；其余三个动作（取消、停止、立即重试）
+/// 任何时候都该能按——那几个动作是**止损**，把它们跟表单绑在一起等于
+/// 「表单填错了就停不下来」。
+///
+/// W143 / crate 级约定：这是判断，不许留在 `view::maintain` 里。brief
+/// 原稿写的是视图里的一行 `!matches!(action, Action::Start) || form.can_start()`,
+/// 那一行在这台无头机器上没有任何东西看得见。表驱动八格在下面。
+pub fn action_enabled(action: Action, form_ready: bool) -> bool {
+    match action {
+        Action::Start => form_ready,
+        Action::Cancel | Action::Stop | Action::RetryNow => true,
+    }
+}
+
+/// 字节数的人读写法。会话列表每条要用两次。
+///
+/// 阈值用 1024，单位写 KB/MB——跟 Windows 资源管理器一致，现场人员
+/// 对得上。
+pub fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{} KB", n / KB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// 一条远程会话的流量说明，画在会话列表里。
+///
+/// 方向必须写死在文字里：两个数字长得一样，画反了没有任何东西看得出来。
+pub fn session_traffic(s: &RemoteSessionInfo) -> String {
+    format!(
+        "发往一体机 {} · 来自一体机 {}",
+        human_bytes(s.to_appliance),
+        human_bytes(s.from_appliance)
+    )
+}
+
 /// 向上取整到秒，最小 1。见 `status_card` 里 `Backoff` 分支的说明。
 fn round_up_secs(d: std::time::Duration) -> u64 {
     let secs = d.as_secs_f64().ceil() as u64;
@@ -871,6 +914,64 @@ mod tests {
         m.apply(TunnelEvent::State(State::Idle));
         assert!(m.sessions.is_empty());
         assert!(m.elapsed(SystemTime::now()).is_none());
+    }
+
+    /// 表驱动八格：四个动作 × 表单就绪与否。
+    ///
+    /// 改红：把 `action_enabled` 写成恒 `true`（brief 那行判断被误删的
+    /// 样子），第一格立刻红；写成 `form_ready` 恒返回，后三个动作的
+    /// `false` 那半边一起红。
+    #[test]
+    fn only_start_waits_for_the_form_to_be_ready() {
+        let cases = [
+            (Action::Start, true, true),
+            (Action::Start, false, false),
+            (Action::Cancel, true, true),
+            (Action::Cancel, false, true),
+            (Action::Stop, true, true),
+            (Action::Stop, false, true),
+            (Action::RetryNow, true, true),
+            (Action::RetryNow, false, true),
+        ];
+        for (action, ready, want) in cases {
+            assert_eq!(
+                action_enabled(action, ready),
+                want,
+                "{action:?} / form_ready={ready}"
+            );
+        }
+        // 两格必须真的不同，否则上面那张表可以被"恒 true"糊过去。
+        assert_ne!(
+            action_enabled(Action::Start, true),
+            action_enabled(Action::Start, false)
+        );
+    }
+
+    /// 三个量级各钉一格，外加两个边界。brief 那版一个字都没测它。
+    #[test]
+    fn human_bytes_switches_unit_at_the_1024_boundaries() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1 KB");
+        assert_eq!(human_bytes(1024 * 1024 - 1), "1023 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 / 2), "1.5 MB");
+        // 三个量级必须真的用了不同的单位，否则上面几条可以被
+        // "一律按 B 打印" 糊过去（那样 1024 会变成 "1024 B"）。
+        assert!(human_bytes(1024).ends_with("KB"));
+        assert!(human_bytes(1024 * 1024).ends_with("MB"));
+    }
+
+    /// 方向不能画反。两个数字刻意取不同量级，对调就看得出来。
+    #[test]
+    fn session_traffic_never_swaps_the_two_directions() {
+        let s = RemoteSessionInfo {
+            id: 1,
+            opened_at: SystemTime::UNIX_EPOCH,
+            to_appliance: 1024 * 1024,
+            from_appliance: 340 * 1024,
+        };
+        assert_eq!(session_traffic(&s), "发往一体机 1.0 MB · 来自一体机 340 KB");
     }
 
     fn connected_with_one_session() -> Model {
