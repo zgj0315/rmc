@@ -1,6 +1,41 @@
 [advisories]
 yanked = "deny"
 
+# **不要把 advisories 整段降成 `"warn"`/`"allow"`。** 这个项目的
+# `rustls-pemfile`（RUSTSEC-2025-0134）正是靠 `cargo deny check advisories`
+# 变红才被发现并迁移掉的（改成直接用 `rustls-pki-types` 的 `PemObject`），
+# 那条通道要留着。要豁免就逐条豁免，每条写清楚理由。
+ignore = [
+    # RUSTSEC-2026-0192：`ttf-parser` unmaintained。
+    #
+    # 跟 `webpki-roots` 的 CDLA-Permissive-2.0 一样，这是一次刻意拍板，
+    # 不是被 CI 逼红之后顺手糊过去。
+    #
+    # **是哪个包**：`ttf-parser 0.25.1`，经
+    # `iced_tiny_skia` / `iced_graphics` → `cosmic-text 0.15` → `fontdb 0.23`
+    # 拉进来。它是 iced 文本排版链路上的 TrueType/OpenType 字形解析器。
+    #
+    # **为什么绕不开**：公告本身写着 "No safe upgrade is available!"——
+    # 作者归档了仓库，推荐改用 `skrifa`，但那是 `fontdb`/`cosmic-text`
+    # 要做的迁移，不是我们能单方面做的；而 iced 0.14 把 `cosmic-text`
+    # 钉在 0.15。除非不用 iced（或自己 fork 整条文本链路），否则这条
+    # 消不掉。
+    #
+    # **为什么可以接受**：这是 `unmaintained` 而不是 `vulnerability`——
+    # 公告里没有任何已知的可利用缺陷，只是"作者不再维护"。而且
+    # `ttf-parser` 是纯 Rust、`#![no_std]`、`#![forbid(unsafe_code)]` 的
+    # 解析库，输入是我们自己进程里加载的系统字体文件，不是网络上来的
+    # 不可信数据——威胁模型跟"解析远端发来的 TLS 证书"完全不同。
+    #
+    # **什么条件下重新评估**：
+    #   1. 这条公告从 `unmaintained` 升级成 `vulnerability`（出现真实 CVE）
+    #      ——立刻重新评估，不要因为这里写着 ignore 就放过；
+    #   2. `cosmic-text` / `fontdb` 迁移到 `skrifa` 并发布新版，且 iced
+    #      跟进——那时候删掉这一条；
+    #   3. 每次升 iced 大版本时顺手复查一次这条还在不在。
+    "RUSTSEC-2026-0192",
+]
+
 [licenses]
 # rmc-core 自己的 `license = "UNLICENSED"`（workspace 内部专有代码的
 # 惯例写法）不是合法的 SPDX 表达式，会被判成 "unlicensed" 错误——这
@@ -22,6 +57,25 @@ private = { ignore = true }
 # 分发，不要求开源衍生作品），性质上类似 CC-BY，用来给"这一批证书数据
 # 能不能被打进闭源客户端"这件事发许可，不是给可执行代码发许可；
 # 允许它进这份列表不会把任何 copyleft 义务带进这个 crate。
+#
+# `BSL-1.0` 是第二个例外，随 Task 6 的 iced 界面层进来，同样是一次刻意
+# 拍板：
+#
+# **是哪些包**：`clipboard-win 5.4.1` 与它的依赖 `error-code 3.4.0`，
+# 经 `iced` → `iced_winit` → `window_clipboard` 拉进来，负责 Windows 上的
+# 剪贴板读写（界面里"复制诊断信息"这类操作要用）。
+#
+# **为什么绕不开**：`window_clipboard` 是 iced 官方的剪贴板抽象，Windows
+# 后端就是 `clipboard-win`。除非不用 iced、或者自己 fork 掉剪贴板支持，
+# 否则这两个包必然在依赖图里。
+#
+# **为什么可以接受**：Boost Software License 1.0 是 OSI 认可、FSF 认定
+# 自由的宽松许可，条款比 MIT 还宽松——二进制分发形式下甚至不要求随附
+# 版权声明，没有任何 copyleft 义务，不会因为链接它而要求我们开源。
+#
+# **什么条件下重新评估**：如果哪天 `window_clipboard` 换了 Windows 后端
+# 实现、或者我们不再依赖 iced，复查这一条是否还有包在用；判断依据是
+# `cargo deny check licenses` 不再因为移除它而变红。
 allow = [
     "MIT",
     "Apache-2.0",
@@ -31,6 +85,7 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CDLA-Permissive-2.0",
+    "BSL-1.0",
 ]
 
 [bans]

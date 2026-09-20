@@ -15,13 +15,24 @@ publish.workspace = true
 # 统一版本管理。
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# 界面框架。`wgpu` 与 `tiny-skia` 同时开启时，iced 在 wgpu 初始化失败
-# （RDP 会话、无 GPU 的虚拟机）时自动回落到软件渲染——现场工程师的笔记本
-# 经常就在这两种环境里。`tokio` 让 iced 的 runtime 用 tokio 而不是
-# async-std/smol，跟 rmc-core 用同一套 reactor；Task 7 起要把
-# `TunnelEvent` 的 channel 接进 `Subscription`，这条现在就得定下来。
-iced = { version = "0.13", default-features = false, features = [
-  "wgpu",
+# 界面框架。**只开 tiny-skia，不开 wgpu**——修复轮 1 的定案：
+#
+# 1. 0.14 才有 `iced_test`（headless 控件树断言）。Task 6 第一轮报出六条
+#    「改了实现但没有任何测试会红」的盲区，其中三条在控件树里，只有
+#    `iced_test` 够得着；界面还有 Task 7-11 五个任务要写，盲区只会变大。
+# 2. 砍掉 wgpu 把依赖树从 306 包降到 243 包，`cargo deny` 的 advisories
+#    从 2 条降到 1 条、licenses 从 3 条降到 1 条。
+# 3. 砍掉 wgpu 顺带解决了 windows-gnu 链接失败——`d3dcompiler` 是 wgpu 的
+#    DX12 后端要的导入库，zig 的 sysroot 里没有。
+# 4. brief 原本要 wgpu+tiny-skia 并存的理由是「RDP 与虚拟机里能起来」。
+#    只留 tiny-skia 之后**根本没有 GPU 初始化这条会失败的路**，那个目标
+#    反而更稳。代价是纯软件绘制，对这个 520×720、只有文字和几个按钮的
+#    工具窗口判为看不出差别。
+#
+# `tokio` 让 iced 的 runtime 用 tokio 而不是 smol，跟 rmc-core 同一套
+# reactor；Task 7 起要把 `TunnelEvent` 的 channel 接进 `Subscription`，
+# 这条现在就得定下来。
+iced = { version = "0.14", default-features = false, features = [
   "tiny-skia",
   "tokio",
   "advanced",
@@ -32,6 +43,17 @@ iced = { version = "0.13", default-features = false, features = [
 # 单实例互斥。不在 `[workspace.dependencies]` 里（rmc-core 不依赖它），
 # 用路径引。
 rmc-win = { path = "../rmc-win" }
+
+[dev-dependencies]
+# headless 控件树断言。只在测试期编译，不进发布二进制。
+# 它自带 `iced_renderer/fira-sans`，所以测试里的默认字体是内嵌的 Fira Sans，
+# 跟运行时走系统字体不是一回事——见 task-6-fix-1-report.md 关于快照测试的
+# 那一节。
+iced_test = "0.14"
+# 差分快照测试要一个临时目录放基线哈希（跑完即扔，不进仓库）。
+# **不新增依赖包**：`tempfile = "3"` 已经是 rmc-core 的 dev-dependency，
+# Cargo.lock 里就有。
+tempfile = "3"
 
 [lib]
 name = "rmc_app"

@@ -12,7 +12,9 @@
 //! 这里只做三件 `main` 才能做的事：初始化日志、抢单实例锁、起 iced 事件
 //! 循环。往这个文件加任何判断之前，先看一眼 `lib.rs` 顶部的 crate 级约定。
 
-use rmc_app::{theme::WINDOW_SIZE, App};
+#[cfg(windows)]
+use rmc_app::SINGLE_INSTANCE_NAME;
+use rmc_app::{window_settings, App, APP_THEME, WINDOW_TITLE};
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -25,7 +27,7 @@ fn main() -> iced::Result {
     // `SingleInstance` 不是 Send/Sync，只能在主线程持有；iced 的事件循环
     // 也跑在主线程，`_instance` 活到 `main` 结束正好覆盖整个进程生命周期。
     #[cfg(windows)]
-    let _instance = match rmc_win::single_instance::SingleInstance::acquire("rmc-client") {
+    let _instance = match rmc_win::single_instance::SingleInstance::acquire(SINGLE_INSTANCE_NAME) {
         Some(i) => i,
         None => {
             tracing::info!("已有实例在运行，退出");
@@ -33,11 +35,14 @@ fn main() -> iced::Result {
         }
     };
 
-    iced::application("远程运维客户端", App::update, App::view)
-        .window(iced::window::Settings {
-            size: iced::Size::new(WINDOW_SIZE.0, WINDOW_SIZE.1),
-            resizable: false,
-            ..Default::default()
-        })
+    // iced 0.14 的 `application` 第一个参数是 **boot 函数**（返回初始 state，
+    // 或 `(state, Task)`），标题改由 `.title(..)` 设置；0.13 是
+    // `application(title, update, view)`。
+    iced::application(App::default, App::update, App::view)
+        .title(WINDOW_TITLE)
+        // iced 0.14 不显式指定主题时会跟随系统深浅色（0.13 关掉
+        // `auto-detect-theme` 后恒为 Light）。画板是固定浅色的，必须钉死。
+        .theme(APP_THEME)
+        .window(window_settings())
         .run()
 }

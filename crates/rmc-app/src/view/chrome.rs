@@ -6,14 +6,16 @@
 
 use crate::theme::{color, tab_style, Tab};
 use crate::Message;
-use iced::widget::{button, container, row, text, Space};
-use iced::{Alignment, Element, Length};
+use iced::widget::{button, container, row, space, text};
+use iced::{Alignment, Element};
 
 pub fn title_bar<'a>() -> Element<'a, Message> {
     container(
         row![
-            text("远程运维客户端").size(12).color(color::TEXT_SUB),
-            Space::with_width(Length::Fill),
+            text(crate::WINDOW_TITLE).size(12).color(color::TEXT_SUB),
+            // iced 0.14：`Space::with_width(Length::Fill)` 没了，换成
+            // `space::horizontal()`。
+            space::horizontal(),
         ]
         .align_y(Alignment::Center)
         .padding([0, 14]),
