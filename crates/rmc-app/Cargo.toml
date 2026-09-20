@@ -32,6 +32,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `tokio` 让 iced 的 runtime 用 tokio 而不是 smol，跟 rmc-core 同一套
 # reactor；Task 7 起要把 `TunnelEvent` 的 channel 接进 `Subscription`，
 # 这条现在就得定下来。
+#
+# `advanced` 本任务**一行都没用到**（评审实测摘掉它仍然全绿）。留着是因为
+# 它是纯 re-export 开关：`advanced = ["iced_core/advanced",
+# "iced_widget/advanced"]`，两侧都是已在依赖图里的 crate 的 feature、没有
+# `dep:`，摘掉前后 `Cargo.lock` 一个字节不变、包数同为 400。Task 7 做自定义
+# 控件多半要用。
+#
+# **`default-features = false` 的一个副作用**：0.14 把 `x11` 与 `wayland`
+# 放进了 `default`（`iced-0.14.0/Cargo.toml:63-72`），所以这份配置在 Linux
+# 上**没有窗口后端**——`cargo run -p rmc-app` 起不来窗口。本产品是 Windows
+# 客户端，不打算为此加 feature；但 `cargo test -p rmc-app` 在 Linux 上是
+# 能跑也应该跑的（`iced_test` 是无头模拟器，不碰 winit 的窗口创建路径），
+# 所以**刻意没用 `compile_error!` 去拦**：那是按 target 判而不是按用途判，
+# 会把 Linux 上的 `cargo test --workspace` 一并拦掉。
 iced = { version = "0.14", default-features = false, features = [
   "tiny-skia",
   "tokio",

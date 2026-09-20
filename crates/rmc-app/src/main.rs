@@ -12,9 +12,9 @@
 //! 这里只做三件 `main` 才能做的事：初始化日志、抢单实例锁、起 iced 事件
 //! 循环。往这个文件加任何判断之前，先看一眼 `lib.rs` 顶部的 crate 级约定。
 
+use rmc_app::program;
 #[cfg(windows)]
 use rmc_app::SINGLE_INSTANCE_NAME;
-use rmc_app::{window_settings, App, APP_THEME, WINDOW_TITLE};
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -35,14 +35,10 @@ fn main() -> iced::Result {
         }
     };
 
-    // iced 0.14 的 `application` 第一个参数是 **boot 函数**（返回初始 state，
-    // 或 `(state, Task)`），标题改由 `.title(..)` 设置；0.13 是
-    // `application(title, update, view)`。
-    iced::application(App::default, App::update, App::view)
-        .title(WINDOW_TITLE)
-        // iced 0.14 不显式指定主题时会跟随系统深浅色（0.13 关掉
-        // `auto-detect-theme` 后恒为 Light）。画板是固定浅色的，必须钉死。
-        .theme(APP_THEME)
-        .window(window_settings())
-        .run()
+    // 装配全部在 `rmc_app::program()` 里，那边有测试看得见；这里只负责把它
+    // 跑起来。**往这一行加任何东西之前先看 `program()` 的文档注释**——
+    // 写在 `main()` 里的装配在这台无头机器上一个字都验不了，评审实测过
+    // `.title("Gateway")`、绕开 `window_settings()`、删掉 `.theme(..)`、
+    // 乃至挂一棵字面画着 "Gateway" 的控件树，九道闸门全绿。
+    program().run()
 }

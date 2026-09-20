@@ -14,7 +14,8 @@ use rmc_app::theme::Tab;
 use rmc_app::{App, Message, APP_THEME};
 
 /// 需求硬禁令：界面上叫「运维服务器」，不叫 Gateway/网关。
-const BANNED: [&str; 4] = ["Gateway", "gateway", "GATEWAY", "网关"];
+// 词表在 lib 里，三处防线共用一份——分叉了迟早有一份漏掉新加的词。
+use rmc_app::BANNED_WORDS as BANNED;
 
 /// 把三个页签都点一遍会得到三棵不同的树，禁用词要在每一棵里都不存在。
 fn every_tab_state() -> [App; 3] {
