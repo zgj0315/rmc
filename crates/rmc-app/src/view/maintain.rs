@@ -324,3 +324,168 @@ pub fn view<'a>(model: &'a Model, form: &'a Form, elapsed: Option<String>) -> El
 
     body.into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::APP_THEME;
+    use rmc_core::state::State;
+    use zeroize::Zeroizing;
+
+    /// 一份只改**运维服务器那一对地址**的表单。
+    ///
+    /// 一体机那两个框里的字（`192.168.100.10` / `61001`）在所有夹具里
+    /// 逐字相同——这是下面那条测试成立的前提。
+    fn form_with_server(host: &str, port: &str) -> Form {
+        Form {
+            appliance_host: "192.168.100.10".into(),
+            appliance_port: "61001".into(),
+            gateway_host: host.into(),
+            gateway_port: port.into(),
+            username: "tunnel-zhang".into(),
+            // 这一页别的测试用金丝雀守 `Debug`，这里不测 `Debug`，
+            // 只需要一个非空口令让 `validate` 走得到语义校验那一步。
+            password: Zeroizing::new("placeholder".into()),
+            remember: false,
+            detected_proxy: None,
+        }
+    }
+
+    /// 只渲染**一体机那一行**，跟基线哈希比。
+    fn appliance_row_matches(form: &Form, baseline: &std::path::Path) -> bool {
+        let element = addr_row(
+            "一体机",
+            form,
+            (&form.appliance_host, &form.appliance_port),
+            (Field::ApplianceHost, Field::AppliancePort),
+            (Message::ApplianceHostChanged, Message::AppliancePortChanged),
+            true,
+        );
+        let mut ui = iced_test::simulator(element);
+        ui.snapshot(&APP_THEME)
+            .expect("渲染一体机那一行")
+            .matches_hash(baseline)
+            .expect("读写基线哈希")
+    }
+
+    /// **「填错的框标红」这条连线是可观测的。**
+    ///
+    /// # 断的是哪一根线
+    ///
+    /// [`Form::is_marked`] 有单测，[`crate::theme::input_border`] 有表驱动，
+    /// **中间那一个表达式两头都没人守**——就是 [`input`] 里的
+    /// `color: input_border(invalid)`。
+    ///
+    /// 实测：把它改成 `input_border(false && invalid)`（填错的框永远不
+    /// 标红），`cargo test --workspace --no-fail-fast` **一条都不红**。
+    /// 原因是 `iced_test` 的选择器（`iced_selector::Candidate`，
+    /// `iced_selector-0.14.0/src/target.rs:160-198`）只带
+    /// `id` / `bounds` / `visible_bounds` / 文本内容，**样式、颜色、边框
+    /// 一个字段都没有**。
+    ///
+    /// # 为什么要用 `Reason::Rejected` 来解耦
+    ///
+    /// 差分快照的难处在于：[`Form::visible_errors`] 同时驱动红框和红字。
+    /// 通常「某个框被标红」必然伴随「那个框里的字是错的」，于是两帧的
+    /// 差别绝不止边框一处，快照比出不同也说明不了是边框的功劳。
+    ///
+    /// [`Reason::Rejected`] 是唯一的例外。它挂在 [`Field::ApplianceHost`]
+    /// 上，但触发条件是 rmc-core 对**一体机与运维服务器这对地址的关系**
+    /// 的判断，跟一体机那两个框里的字一个都不沾。于是能造出两份表单：
+    ///
+    /// - `clean`：运维服务器是别的地址 → 合法 → 一体机地址框**不标红**
+    /// - `marked`：运维服务器填得跟一体机一模一样 → rmc-core 拒 →
+    ///   一体机地址框**标红**，而一体机那两个框里的字**逐字未变**
+    ///
+    /// # 为什么喂 `addr_row` 而不是整页
+    ///
+    /// 整页做不到：`marked` 那一帧还多着运维服务器那两个框里不同的字、
+    /// 以及 [`hints`] 画出来的那行红字，两帧**无论标不标红都不同**——
+    /// 这一点由 [`the_whole_page_cannot_isolate_the_border`] 反向钉住。
+    ///
+    /// 边框确实会落到像素上：`iced_widget-0.14.2/src/text_input.rs:1763`
+    /// 的默认 `border.width` 是 `1.0`，[`input`] 的样式闭包只换 `color`、
+    /// 保留宽度。
+    ///
+    /// # Task 9-11 照抄什么
+    ///
+    /// 「样式在 `iced_test` 这一层不可观测」不等于「不可测」。两步：
+    ///
+    /// 1. 找一个**让样式变化与文本变化解耦**的输入组合（这里是
+    ///    `Reason::Rejected`）；
+    /// 2. 把渲染范围缩到**能单独渲染的最小子元素**，而不是整页。
+    ///
+    /// 代价是那个子元素得从本模块的测试里够得到——所以这条测试住在
+    /// `view/maintain.rs` 自己的 `mod tests` 里，而不是 `tests/ui.rs`
+    /// （那里只看得见 `pub fn view`）。**零公开 API 变化、零新依赖。**
+    #[test]
+    fn a_marked_field_really_draws_a_different_border() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let baseline = dir.path().join("appliance-row");
+
+        // 合法：一体机地址框不标红。
+        let clean = form_with_server("ops.example.com", "443");
+        assert!(clean.validate().is_ok(), "夹具 clean 本该通过校验");
+        assert!(!clean.is_marked(Field::ApplianceHost));
+
+        // 一体机 == 运维服务器：rmc-core 拒绝，错误挂在 ApplianceHost 上。
+        let marked = form_with_server("192.168.100.10", "61001");
+        assert!(
+            marked.is_marked(Field::ApplianceHost),
+            "夹具 marked 本该让一体机地址框标红：{:?}",
+            marked.visible_errors()
+        );
+        // 解耦的自证：一体机那两个框里的字**逐字相同**，而且端口框两边
+        // 都没被标红——两帧的差别只可能出在一体机地址框的边框上。
+        assert_eq!(marked.appliance_host, clean.appliance_host);
+        assert_eq!(marked.appliance_port, clean.appliance_port);
+        assert!(!clean.is_marked(Field::AppliancePort));
+        assert!(!marked.is_marked(Field::AppliancePort));
+
+        // 第一帧：基线不存在，`matches_hash` 写一份并返回 true。
+        assert!(
+            appliance_row_matches(&clean, &baseline),
+            "第一帧应当写入基线并返回 true"
+        );
+        // 反向自证：同一份表单画两次必须一致，否则下面那条只是在测
+        // 渲染不稳定，而不是在测边框。
+        assert!(
+            appliance_row_matches(&clean, &baseline),
+            "同一份表单渲染两次结果不一致，快照不可作为判据"
+        );
+        // 主断言。
+        assert!(
+            !appliance_row_matches(&marked, &baseline),
+            "标红的一体机地址框跟正常的框画出来逐字节相同——\
+             input_border 的结果没有进到 Border.color 里"
+        );
+    }
+
+    /// [`a_marked_field_really_draws_a_different_border`] 为什么必须缩到
+    /// 一行：同样那两份表单走**整页**，两帧无论标不标红都不同。
+    ///
+    /// 这条不是防回归，是把上面那条的**范围选择**钉成文档——少了它，
+    /// 后人会顺手把它改成整页，然后得到一条永远为真的断言。
+    #[test]
+    fn the_whole_page_cannot_isolate_the_border() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let baseline = dir.path().join("whole-page");
+        let model = Model {
+            state: State::Idle,
+            ..Model::default()
+        };
+        let page = |form: &Form| {
+            let mut ui = iced_test::simulator(view(&model, form, None));
+            ui.snapshot(&APP_THEME)
+                .expect("渲染整页")
+                .matches_hash(&baseline)
+                .expect("读写基线哈希")
+        };
+
+        assert!(page(&form_with_server("ops.example.com", "443")));
+        assert!(
+            !page(&form_with_server("192.168.100.10", "61001")),
+            "整页两帧居然相同"
+        );
+    }
+}

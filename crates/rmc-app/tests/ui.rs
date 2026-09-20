@@ -683,3 +683,69 @@ fn the_app_actually_mounts_the_maintain_page() {
     // 反向自证：页签框架还在。
     assert!(ui.find("日志").is_ok());
 }
+
+/// Backoff 下的**次按钮**是止损出口。
+///
+/// `Model::buttons()` 在 `Backoff` 下给的是 primary =「立即重试」、
+/// **secondary =「停止远程维护」**——那是现场人员从一个反复重连的循环里
+/// 脱身的唯一出路。
+///
+/// 补这条之前实测：把 `view` 里整块
+/// `if let Some((label, action)) = buttons.secondary { .. }` 删掉，
+/// `cargo test --workspace --no-fail-fast` **一条都不红**。没有任何 ui
+/// 测试点过次按钮——`stopping_never_depends_on_the_form` 走的是
+/// `Connected`（Stop 在主按钮位），`nothing_the_maintain_page_draws_is_banned`
+/// 渲染了 `Backoff` 但只查禁用词。
+///
+/// 这跟 `the_remember_checkbox_toggles_both_ways` 补掉的那两条是**同一个
+/// 形状**：控件画出来了，但从没有人点过它。
+///
+/// 表单刻意用 `Form::default()`（全空）：止损按钮不该跟表单绑在一起，
+/// 表单填错了就停不下来是最糟的失败模式。
+#[test]
+fn the_secondary_button_is_the_way_out_of_a_backoff_loop() {
+    let model = model_in(State::Backoff {
+        attempt: 3,
+        delay: std::time::Duration::from_secs(5),
+    });
+    let blank = Form::default();
+    let mut ui = simulator(maintain::view(&model, &blank, None));
+
+    // 反向自证：主按钮确实画出来了，而且它**不是**「停止远程维护」。
+    // 少了这一步，次按钮整块消失、而主按钮恰好也叫这个名字时，
+    // 下面的 click 会点到主按钮上，这条测试就变成空转。
+    assert!(ui.find("立即重试").is_ok(), "Backoff 下主按钮没画出来");
+
+    ui.click("停止远程维护")
+        .expect("Backoff 下点不到次按钮「停止远程维护」");
+    let messages: Vec<Message> = ui.into_messages().collect();
+    assert_eq!(messages.len(), 1, "点次按钮应当恰好一条消息：{messages:?}");
+    assert!(
+        matches!(messages[0], Message::ActionPressed(Action::Stop)),
+        "次按钮带的不是 Stop：{messages:?}"
+    );
+}
+
+/// 顺带：`state.text()` 拿到的就是**遮蔽后**的值，所以口令框的遮蔽
+/// 有一句不依赖字体与渲染器的直接断言。
+///
+/// `iced_widget` 的 `layout`/`update` 先算
+/// `secure_value = is_secure.then(|| value.secure())`
+/// （text_input.rs:328/407/462），写进 paragraph 的就是遮蔽后的那份，
+/// 而 `operation::TextInput::text()` 读的正是它（text_input.rs:1568）。
+///
+/// 与 `the_password_box_masks_what_it_draws` 的分工：那条证的是**像素**
+/// 这一层（两个等长口令画出来逐字节相同），这条证的是**paragraph** 这一层
+/// 已经是圆点。两条都能抓 `.secure(true)` → `false`，但这一条不依赖
+/// 字体与渲染器，跨平台更稳。
+#[test]
+fn the_password_box_reports_bullets_not_the_password() {
+    let idle = model_in(State::Idle);
+    let mut f = filled();
+    f.password = Zeroizing::new("abcdefgh".into());
+    let mut ui = simulator(maintain::view(&idle, &f, None));
+    assert!(
+        has_input(&mut ui, "••••••••"),
+        "口令框报出来的不是 8 个圆点"
+    );
+}
