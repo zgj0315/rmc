@@ -192,9 +192,10 @@ fn switching_tabs_changes_what_is_actually_drawn() {
 //   但说不出差在哪。
 // ===================================================================
 
+use rmc_app::diag::{ConnectOutcome, ProxyAuthSummary, ProxyStatus, PROXY_AUTH_ROW};
 use rmc_app::form::Form;
 use rmc_app::model::{Action, Model};
-use rmc_app::view::maintain;
+use rmc_app::view::{diagnostics, maintain};
 use rmc_core::state::{RemoteSessionInfo, State};
 use std::time::SystemTime;
 use zeroize::Zeroizing;
@@ -748,4 +749,271 @@ fn the_password_box_reports_bullets_not_the_password() {
         has_input(&mut ui, "••••••••"),
         "口令框报出来的不是 8 个圆点"
     );
+}
+
+// ===================================================================
+// Task 9：诊断页的控件树测试。
+//
+// 同一条纪律：`diag.rs` 的单测只证明**算出来的行是对的**，证明不了那些
+// 行真的画进了树；`theme::row_palette` 的表驱动只证明颜色的值对，证明
+// 不了颜色进了控件（那一条在 `view/diagnostics.rs` 自己的 mod tests 里
+// 用差分快照守，见 W146）。
+// ===================================================================
+
+/// 一份四步全过的预检结果。
+fn all_pass() -> rmc_core::preflight::PreflightReport {
+    use rmc_core::preflight::{PreflightStep, StepOutcome, ALL_STEPS};
+    rmc_core::preflight::PreflightReport {
+        steps: ALL_STEPS
+            .iter()
+            .map(|name| PreflightStep {
+                name,
+                outcome: StepOutcome::Pass {
+                    detail: "通过".into(),
+                },
+            })
+            .collect(),
+    }
+}
+
+/// 一份运维服务器 TLS 卡在审计设备上的预检结果——现场最常见的那一种。
+fn tls_intercepted() -> rmc_core::preflight::PreflightReport {
+    use rmc_core::preflight::{PreflightStep, StepOutcome, STEP_GATEWAY_TLS};
+    let mut r = all_pass();
+    *r.steps
+        .iter_mut()
+        .find(|s| s.name == STEP_GATEWAY_TLS)
+        .unwrap() = PreflightStep {
+        name: STEP_GATEWAY_TLS,
+        outcome: StepOutcome::Fail {
+            detail: "运维服务器 TLS 证书链无效：UnknownIssuer".into(),
+            class: rmc_core::ErrorClass::Fatal,
+        },
+    };
+    r
+}
+
+fn proxy_status(connect: ConnectOutcome) -> ProxyStatus {
+    ProxyStatus {
+        endpoint: "proxy.company.com:8080".into(),
+        connect,
+        auth: ProxyAuthSummary::FinalTokenIssued {
+            package: "NTLM".into(),
+            rounds: 2,
+        },
+    }
+}
+
+/// 没跑过预检时，诊断页仍然画出四行「还没有检查过」。
+///
+/// 这是现场第一次打开诊断页看到的那一屏。空白一片会让人以为页面坏了。
+#[test]
+fn the_untouched_diagnostics_page_still_lists_every_step() {
+    let model = model_in(State::Idle);
+    let mut ui = simulator(diagnostics::view(&model, None, "客户端 0.1.0", false));
+    for name in rmc_core::preflight::ALL_STEPS {
+        assert!(ui.find(*name).is_ok(), "诊断页上找不到步骤「{name}」");
+    }
+    assert!(ui.find("还没有检查过").is_ok());
+    // 没有失败项就不画处置建议卡。
+    assert!(
+        ui.find("导出诊断包").is_ok(),
+        "按钮任何时候都要在——现场要导出诊断包的时候恰恰就是连不上的时候"
+    );
+}
+
+/// 预检失败时，失败原因与处置建议**都真的画在屏幕上**。
+///
+/// 改红：把 `view` 里 `if let Some(c) = advice_card(&advice)` 整块删掉
+/// ——后两条断言变红。（删掉它不会让任何 `diag.rs` 的单测红：那边测的是
+/// `advice_for` 的返回值，不是它有没有被画出来。）
+#[test]
+fn a_failing_preflight_puts_the_reason_and_the_advice_on_screen() {
+    let mut model = model_in(State::Failed {
+        class: rmc_core::ErrorClass::Fatal,
+        message: "运维服务器 TLS 证书链无效：UnknownIssuer".into(),
+    });
+    model.preflight = Some(tls_intercepted());
+    let mut ui = simulator(diagnostics::view(&model, None, "客户端 0.1.0", false));
+
+    // `Simulator::find(&str)` 是**整段相等**，不是子串包含；失败原因
+    // 是「运维服务器 TLS 证书链无效：UnknownIssuer」一整句，所以这里
+    // 用谓词。第一次写成 `find("UnknownIssuer")` 当场红。
+    let contains = |ui: &mut iced_test::Simulator<'_, Message>, want: &str| {
+        let want = want.to_string();
+        ui.find(move |c: Candidate<'_>| match c {
+            Candidate::Text { content, .. } if content.contains(&want) => Some(()),
+            _ => None,
+        })
+        .is_ok()
+    };
+    assert!(contains(&mut ui, "UnknownIssuer"), "失败原因没有画出来");
+    // 处置建议卡的标题是失败的那一步，正文点名审计设备。
+    assert!(
+        ui.find(rmc_core::preflight::STEP_GATEWAY_TLS).is_ok(),
+        "处置建议卡的标题没画出来"
+    );
+    let mut ui = simulator(diagnostics::view(&model, None, "客户端 0.1.0", false));
+    assert!(contains(&mut ui, "审计设备"), "处置建议的正文没有画出来");
+}
+
+/// 代理那三行画出来了，而且代理认证那一行的行首文字就是
+/// `rmc_core` 错误文案指着的那个常量（W164 的落地）。
+#[test]
+fn the_proxy_rows_reach_the_screen_under_the_name_the_error_text_points_at() {
+    let mut model = model_in(State::Connecting);
+    model.preflight = Some(all_pass());
+    let p = proxy_status(ConnectOutcome::Established);
+    let mut ui = simulator(diagnostics::view(&model, Some(&p), "客户端 0.1.0", false));
+
+    assert!(
+        ui.find("proxy.company.com:8080").is_ok(),
+        "代理地址没画出来"
+    );
+    assert!(ui.find(PROXY_AUTH_ROW).is_ok(), "代理认证那一行没画出来");
+}
+
+/// 两个按钮各自带自己的动作，而且**跟表单无关**。
+///
+/// 表单刻意用「没填好」（`form_ready = false`）：现场需要导出诊断包的
+/// 时候恰恰就是表单填不对、连不上的时候。把它们跟表单绑在一起等于
+/// 「连不上就导不出证据」。
+///
+/// 改红：把 `actions` 里 `action_enabled(Action::ExportDiagnostics, ..)`
+/// 换成 `form_ready`——`click` 点不到（按钮没有 `on_press`），当场红。
+#[test]
+fn both_diagnostics_buttons_work_even_when_the_form_is_not_ready() {
+    let model = model_in(State::Idle);
+
+    for (label, want) in [
+        ("导出诊断包", Action::ExportDiagnostics),
+        ("复制检查结果", Action::CopyDiagnostics),
+    ] {
+        let mut ui = simulator(diagnostics::view(&model, None, "客户端 0.1.0", false));
+        ui.click(label)
+            .unwrap_or_else(|e| panic!("点不到「{label}」：{e:?}"));
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "点「{label}」应当恰好一条消息：{messages:?}"
+        );
+        assert!(
+            matches!(messages[0], Message::ActionPressed(a) if a == want),
+            "「{label}」带的不是 {want:?}：{messages:?}"
+        );
+    }
+}
+
+/// 整棵诊断页树的禁用词扫描，把几种会改变树形状的输入都走一遍。
+#[test]
+fn nothing_the_diagnostics_page_draws_is_banned() {
+    /// 一种会改变诊断页树形状的输入组合：说明、预检结果、代理、host key。
+    struct Case {
+        why: &'static str,
+        report: Option<rmc_core::preflight::PreflightReport>,
+        proxy: Option<ProxyStatus>,
+        host_key: Option<(String, bool)>,
+    }
+    let case = |why, report, proxy, host_key| Case {
+        why,
+        report,
+        proxy,
+        host_key,
+    };
+    let cases: [Case; 5] = [
+        case("还没跑过预检", None, None, None),
+        case("四步全过", Some(all_pass()), None, None),
+        case("TLS 被审计设备拦下", Some(tls_intercepted()), None, None),
+        case(
+            "经代理且 CONNECT 建立",
+            Some(all_pass()),
+            Some(proxy_status(ConnectOutcome::Established)),
+            Some(("SHA256:kM9v7bQe".to_string(), true)),
+        ),
+        case(
+            "经代理但 CONNECT 没建立",
+            Some(tls_intercepted()),
+            Some(proxy_status(ConnectOutcome::Failed)),
+            Some(("SHA256:kM9v7bQe".to_string(), false)),
+        ),
+    ];
+
+    for c in cases {
+        let why = c.why;
+        let mut model = model_in(State::Idle);
+        model.preflight = c.report;
+        model.host_key = c.host_key;
+        let mut ui = simulator(diagnostics::view(
+            &model,
+            c.proxy.as_ref(),
+            "客户端 0.1.0",
+            false,
+        ));
+
+        // 反向自证：扫描器真的遍历到了这一页的文本控件。少了它，
+        // 「树是空的」时下面那条是永远为真的空转。
+        assert!(
+            ui.find("导出诊断包").is_ok(),
+            "{why}：一个文本控件都没遍历到，下面的断言会空转"
+        );
+
+        let hit = banned_in_tree(&mut ui);
+        assert!(
+            hit.is_none(),
+            "{why} 的诊断页里出现了需求禁用的词：{}",
+            hit.unwrap_or_default()
+        );
+    }
+
+    // 反向自证之二：扫描器本身真的会对这一页发火。喂一棵故意违规的树
+    // ——环境信息那一行是最容易顺手写进一个域名的地方。
+    let model = model_in(State::Idle);
+    let mut ui = simulator(diagnostics::view(
+        &model,
+        None,
+        "客户端 0.1.0 · 经 gateway.company.com 出网",
+        false,
+    ));
+    assert!(
+        banned_in_tree(&mut ui).is_some(),
+        "往环境信息里塞一个含禁用词的值，扫描器居然没响"
+    );
+}
+
+/// `App::view` 真的把诊断页挂上去了。
+///
+/// 跟 `the_app_actually_mounts_the_maintain_page` 同一个理由：上面那些
+/// `diagnostics::view(..)` 的直接调用证明不了 `App` 在「诊断」页签下画的
+/// 是它。Task 6 实测过，`main()` 可以挂一棵完全不相干的树而所有针对
+/// `view` 函数的测试全绿。
+///
+/// 改红：把 `App::view` 里 `Tab::Diagnostics` 那一支改回
+/// `iced::widget::space::vertical().into()`——前三条断言一起红。
+#[test]
+fn the_app_actually_mounts_the_diagnostics_page() {
+    let mut app = App::default();
+    app.update(Message::TabSelected(Tab::Diagnostics));
+    let mut ui = simulator(app.view());
+    for label in ["连接诊断", "导出诊断包", "复制检查结果"] {
+        assert!(
+            ui.find(label).is_ok(),
+            "App::view 里找不到诊断页的「{label}」"
+        );
+    }
+    // 环境信息那一行也真的挂上去了（它来自 `App` 自己存的那份，不是
+    // 视图现算的）。
+    let mut ui = simulator(app.view());
+    let env = ui.find(|c: Candidate<'_>| match c {
+        Candidate::Text { content, .. } if content.contains(env!("CARGO_PKG_VERSION")) => Some(()),
+        _ => None,
+    });
+    assert!(env.is_ok(), "诊断页底部的环境信息没有挂上去");
+
+    // 切回维护页就不该还画着诊断页。
+    let mut app = App::default();
+    app.update(Message::TabSelected(Tab::Maintain));
+    let mut ui = simulator(app.view());
+    assert!(ui.find("导出诊断包").is_err(), "切回维护页还画着诊断页");
+    assert!(ui.find("维护目标").is_ok(), "维护页没画出来");
 }

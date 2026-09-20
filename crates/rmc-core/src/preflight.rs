@@ -615,6 +615,25 @@ mod tests {
         )
         .await;
 
+        // ★ W161（落实 W137）：`steps!` 宏的文档承诺「[`ALL_STEPS`] 的
+        // 声明顺序 == `run()` 产出 `steps` 的顺序」，而在这一条补上之前
+        // **没有任何东西守它**——把 `steps!` 里四行的顺序打乱，或者把
+        // `run()` 里四个 `steps.push` 的次序换一下，六道闸门全绿。
+        //
+        // 这条承诺从 Task 9 起有了真实的消费者：诊断页照 `ALL_STEPS` 排版
+        // （没跑过预检时按它列出四行「未检查」，见 `rmc_app::diag::rows`），
+        // 而跑过之后画的是 `report.steps` 的顺序。两个顺序一旦分叉，现场
+        // 工程师会看到四行在重新检查前后自己跳位置。
+        //
+        // 改红：把 `steps!` 里任意两行对调；或者把 `run()` 里
+        // 「一体机 host key」与「运维服务器域名解析」两段 push 的先后换掉。
+        let produced: Vec<&str> = r.steps.iter().map(|s| s.name).collect();
+        assert_eq!(
+            produced,
+            ALL_STEPS.to_vec(),
+            "run() 产出的步骤顺序跟 ALL_STEPS 的声明顺序不一致"
+        );
+
         let tcp = r
             .steps
             .iter()

@@ -63,6 +63,17 @@ iced = { version = "0.14", default-features = false, features = [
   "advanced",
 ] }
 
+# 诊断包导出（`diag::bundle`）。**W163：这是本任务唯一的新依赖**，派发前
+# 已实测过：解析出 25 个包，但对本工作区真正新增的只有两个——`zip` 与
+# `displaydoc`（flate2/crc32fast/indexmap/thiserror/syn 等本来就在锁里）。
+# `cargo deny check advisories bans licenses sources` 四项的实际输出见
+# task-9-report.md。
+#
+# `default-features = false` 砍掉 bzip2/zstd/lzma/aes 等一串压缩与加密
+# 后端，只留 `deflate`——诊断包里是日志与文本，deflate 够用，而那几个
+# 后端全是 C 代码，会把 windows-gnu 的交叉编译（闸门 5/6）拖下水。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 # Win32 调用只在 windows target 上编译。
 [target.'cfg(windows)'.dependencies]
 # 单实例互斥。不在 `[workspace.dependencies]` 里（rmc-core 不依赖它），

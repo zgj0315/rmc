@@ -27,6 +27,7 @@
 //! 正例：把 `tab_style(is_active) -> (Color, Color)` 抽出来单测，视图里
 //! 只写 `let (fg, line) = tab_style(is_active);`。
 
+pub mod diag;
 pub mod form;
 pub mod model;
 pub mod theme;
@@ -212,6 +213,12 @@ pub struct App {
     /// 视图模型。Task 10 把 `TunnelEvent` 接进来之后由 [`App::apply`] 推进。
     model: Model,
     form: Form,
+    /// 诊断页底部那行环境信息。
+    ///
+    /// 算一次存着，不是每帧调一次 [`diag::environment_line`]：`view` 要
+    /// 借出 `&str`，而现算的 `String` 是个临时值，借不出去。顺带也对——
+    /// 这行字在一次运行里不会变。
+    environment: String,
 }
 
 impl Default for App {
@@ -221,6 +228,7 @@ impl Default for App {
             tab: Tab::Maintain,
             model: Model::default(),
             form: Form::default(),
+            environment: diag::environment_line(),
         }
     }
 }
@@ -270,8 +278,14 @@ impl App {
                 &self.form,
                 self.model.elapsed(std::time::SystemTime::now()),
             ),
-            // Task 9 / Task 11。现在两页都只有页签框架。
-            Tab::Diagnostics | Tab::Logs => iced::widget::space::vertical().into(),
+            Tab::Diagnostics => view::diagnostics::view(
+                &self.model,
+                self.model.proxy.as_ref(),
+                &self.environment,
+                self.form.can_start(),
+            ),
+            // Task 11。日志页现在只有页签框架。
+            Tab::Logs => iced::widget::space::vertical().into(),
         };
         column![
             view::chrome::title_bar(),

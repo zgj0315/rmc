@@ -73,6 +73,7 @@
 
 use base64::Engine;
 use rmc_core::addr::HostPort;
+use rmc_core::diagnostic::{ConnectOutcome, ProxyAuthLine, ProxyAuthSummary};
 use rmc_core::platform::{ProxyAuthenticator, ProxyResolver};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -666,69 +667,69 @@ declare_auth_outcome! {
 }
 
 impl AuthOutcome {
-    /// 诊断页那一行要显示的东西：`(是否通过, 说明文字)`。
+    /// 把自己转抄成**平台中立**的 [`ProxyAuthSummary`]，交给诊断页。
     ///
-    /// **第一项永远不会是 `Some(true)`**，这不是偷懒：协商器只知道
-    /// 自己发出了什么，"代理接受了"这件事只有拿到 200 的
-    /// `http_connect` 知道。由调用方把"CONNECT 成功"与这里的
-    /// [`AuthOutcome::TokenIssued`] 合起来才是那一行的"通过"。写成
-    /// `Some(true)` 就又是一条"测试通过 ≠ 验证了名字声称的事"。
+    /// # 为什么要转抄一次（W158）
     ///
-    /// `None` 表示这一项没有结论（还没轮到，或者结论不在这里）。
-    pub fn diagnostic(&self) -> (Option<bool>, String) {
+    /// `rmc-win` 是 rmc-app 的 `cfg(windows)` 专属依赖，所以 macOS 上的
+    /// `cargo test` 里 **rmc-app 根本看不见 `AuthOutcome`**。历史裁决 W38
+    /// 要的那张「CONNECT 结果 × 协商结局」完整映射如果写在 rmc-app 的
+    /// `#[cfg(windows)]` 里，就落进了本项目**按构造检测不到任何语义改动**
+    /// 的那一层（闸门 5 只编译、闸门 6 只静态检查，都不跑测试；Task 5 用
+    /// 八枪实测过，连把 `Box::leak` 换成悬垂栈指针都六道全绿）。
+    ///
+    /// 于是判断与文案整体搬去 `rmc_core::diagnostic`，这里只剩这一次
+    /// 一一对应的转抄。**转抄本身在 macOS 上也跑得到**——本模块是
+    /// rmc-win 的纯逻辑层，不带 `#[cfg(windows)]`，
+    /// `every_auth_outcome_transcribes_into_its_own_summary` 逐个变体
+    /// 钉住它。
+    ///
+    /// `SspiPackage` 在镜像里换成了它的 `package_name()`：rmc-core 不该
+    /// 认识任何 Windows 概念，而现场工程师要看的本来就是 `Negotiate` /
+    /// `NTLM` 这两个字。
+    pub fn summary(&self) -> ProxyAuthSummary {
         match self {
-            Self::NotAttempted => (None, "代理没有要求认证".into()),
-            Self::UnsupportedScheme(s) => (
-                Some(false),
-                format!("代理要求 {s} 认证，本机只做 Negotiate 与 NTLM"),
-            ),
-            Self::UnknownProxyEndpoint => (
-                Some(false),
-                "代理要求认证，但当前链路没有记录到代理地址，无法构造 SPN".into(),
-            ),
-            Self::MalformedChallenge => (
-                Some(false),
-                "代理返回的 challenge 不是合法的 base64，协商无法继续".into(),
-            ),
-            Self::ChallengeWithoutNegotiation => (
-                Some(false),
-                "代理在没有在途协商的情况下送来 challenge，协商状态不一致".into(),
-            ),
-            Self::ContextUnavailable(p) => (
-                Some(false),
-                format!("无法建立 {} 安全上下文，请确认本机已加入域且当前用户已登录", p.package_name()),
-            ),
-            Self::TokenIssued { package, round } => (
-                None,
-                format!(
-                    "已向代理发出第 {round} 段 {} token，协商还要继续",
-                    package.package_name()
-                ),
-            ),
-            Self::FinalTokenIssued { package, rounds } => (
-                None,
-                format!(
-                    "{} 协商的最后一段 token 已发出（共 {rounds} 段），等代理裁决；\
-                     代理若仍要求认证，说明凭据格式没问题，是代理不接受当前用户",
-                    package.package_name()
-                ),
-            ),
-            Self::Completed { package, rounds } => (
-                Some(false),
-                format!(
-                    "{} 协商在 {rounds} 段之后走完，代理仍要求认证——凭据格式没问题，是代理不接受当前用户",
-                    package.package_name()
-                ),
-            ),
+            Self::NotAttempted => ProxyAuthSummary::NotAttempted,
+            Self::UnsupportedScheme(s) => ProxyAuthSummary::UnsupportedScheme(s.clone()),
+            Self::UnknownProxyEndpoint => ProxyAuthSummary::UnknownProxyEndpoint,
+            Self::MalformedChallenge => ProxyAuthSummary::MalformedChallenge,
+            Self::ChallengeWithoutNegotiation => ProxyAuthSummary::ChallengeWithoutNegotiation,
+            Self::ContextUnavailable(p) => ProxyAuthSummary::ContextUnavailable {
+                package: p.package_name().to_string(),
+            },
+            Self::TokenIssued { package, round } => ProxyAuthSummary::TokenIssued {
+                package: package.package_name().to_string(),
+                round: *round,
+            },
+            Self::FinalTokenIssued { package, rounds } => ProxyAuthSummary::FinalTokenIssued {
+                package: package.package_name().to_string(),
+                rounds: *rounds,
+            },
+            Self::Completed { package, rounds } => ProxyAuthSummary::Completed {
+                package: package.package_name().to_string(),
+                rounds: *rounds,
+            },
             Self::Failed {
                 package,
                 round,
                 detail,
-            } => (
-                Some(false),
-                format!("{} 协商在第 {round} 段失败：{detail}", package.package_name()),
-            ),
+            } => ProxyAuthSummary::Failed {
+                package: package.package_name().to_string(),
+                round: *round,
+                detail: detail.clone(),
+            },
         }
+    }
+
+    /// 诊断页那一行：结论 + 说明文字。只是 [`Self::summary`] 之后转手调
+    /// `ProxyAuthSummary::line`，**本模块不再自己写一份文案**。
+    ///
+    /// W164 收拾的就是「同一件事在两个 crate 里各写一句话」：
+    /// `http_connect` 抛的「本机无法协商」与这里说的「是代理不接受当前
+    /// 用户」曾经互相矛盾。文案现在只有一份，住在 rmc-core；那张表还多
+    /// 了一根 W38 要的轴（`connect`），十格因此变成二十格。
+    pub fn line(&self, connect: ConnectOutcome) -> ProxyAuthLine {
+        self.summary().line(connect)
     }
 }
 
@@ -1064,6 +1065,12 @@ pub fn system_sspi_authenticator(
 mod tests {
     use super::*;
     use rmc_core::addr::HostPort;
+    use rmc_core::diagnostic::Verdict;
+
+    /// 一个结局的 `Debug` 加上它的诊断行，拼成一串拿去查禁字。
+    fn rendered_with_line(o: &AuthOutcome) -> String {
+        format!("{o:?} {}", o.line(ConnectOutcome::Failed).detail)
+    }
     use rmc_core::platform::ProxyAuthenticator;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1573,32 +1580,42 @@ mod tests {
 
         // 诊断页那一行（§3.10「代理认证（SSPI Negotiate）」）拿到的说明
         // 也必须不一样，否则现场工程师看到的还是同一句话。
-        let (done_ok, done_text) = done.last_outcome().diagnostic();
-        let (failed_ok, failed_text) = failed.last_outcome().diagnostic();
-        assert_ne!(done_text, failed_text);
-        assert_eq!(done_ok, Some(false));
-        assert_eq!(failed_ok, Some(false));
+        let done_line = done.last_outcome().line(ConnectOutcome::Failed);
+        let failed_line = failed.last_outcome().line(ConnectOutcome::Failed);
+        assert_ne!(done_line.detail, failed_line.detail);
+        assert_eq!(done_line.verdict, Verdict::Fail);
+        assert_eq!(failed_line.verdict, Verdict::Fail);
     }
 
     #[tokio::test]
     async fn a_token_that_was_issued_is_not_reported_as_a_pass() {
         // 协商器只知道自己发出了什么，"代理接受了"这件事只有拿到 200
-        // 的 `http_connect` 知道。诊断行因此不给 `Some(true)`——否则
-        // 就是又一条"测试通过 ≠ 验证了名字声称的事"。
+        // 的 `http_connect` 知道。所以 `TokenIssued` 本身不是结论：
+        // CONNECT 没建立时它是 `Fail`，建立了才是 `Pass`。
         //
-        // 改红：让 `TokenIssued` 那一支返回 `(Some(true), ...)`。
+        // W158 之后本模块只剩转抄，判断整体在 `rmc_core::diagnostic`；
+        // 完整的二十格由那边的
+        // `every_summary_and_connect_pair_has_its_own_verdict_and_its_own_words`
+        // 守着（W30/W38）。这一条钉的是**转手之后两根轴还在**。
         //
-        // 这一条只钉 `TokenIssued` 一格；"十个变体没有一个给
-        // `Some(true)`"由
-        // `every_outcome_gives_the_diagnostic_line_its_own_verdict_and_its_own_words`
-        // 整张表守着（W30）。
+        // 改红：把 `AuthOutcome::line` 的 `connect` 参数丢掉、写死成
+        // `ConnectOutcome::Established`——第一条断言变红。
         let (a, _) = scripted(endpoint(), Ending::Completed);
         a.next_token("Negotiate", None).await.unwrap();
         assert!(matches!(
             a.last_outcome(),
             AuthOutcome::TokenIssued { round: 1, .. }
         ));
-        assert_eq!(a.last_outcome().diagnostic().0, None);
+        assert_eq!(
+            a.last_outcome().line(ConnectOutcome::Failed).verdict,
+            Verdict::Fail,
+            "协商还没走完 CONNECT 就断了——W38 当初缺的正是这一格"
+        );
+        assert_eq!(
+            a.last_outcome().line(ConnectOutcome::Established).verdict,
+            Verdict::Pass,
+            "同一个结局配上「CONNECT 建立了」必须给出不同的结论"
+        );
     }
 
     #[tokio::test]
@@ -1846,7 +1863,7 @@ mod tests {
         // 让 `TokenIssued` 带上 token——两条断言分别变红。
         let (a, _) = scripted(endpoint(), Ending::Completed);
         a.next_token("Negotiate", None).await.unwrap();
-        let issued = format!("{:?} {}", a.last_outcome(), a.last_outcome().diagnostic().1);
+        let issued = rendered_with_line(&a.last_outcome());
         assert!(!issued.contains(NEGOTIATE_B64), "{issued}");
         assert!(!issued.contains("SECRET"), "{issued}");
 
@@ -1854,7 +1871,7 @@ mod tests {
             .next_token("Negotiate", Some("!!SECRET-CHALLENGE!!"))
             .await
             .is_none());
-        let bad = format!("{:?} {}", a.last_outcome(), a.last_outcome().diagnostic().1);
+        let bad = rendered_with_line(&a.last_outcome());
         assert!(!bad.contains("SECRET-CHALLENGE"), "{bad}");
     }
     // ================= SSPI 状态码的解读 =================
@@ -2107,8 +2124,16 @@ mod tests {
                 rounds: 2
             }
         );
-        // 仍然"没有结论"：代理接不接受只有 CONNECT 知道。
-        assert_eq!(a.last_outcome().diagnostic().0, None);
+        // 本机这边收工了，代理接不接受只有 CONNECT 知道——所以这一格
+        // 的结论**由 CONNECT 决定**，不由协商器单方面给。
+        assert_eq!(
+            a.last_outcome().line(ConnectOutcome::Established).verdict,
+            Verdict::Pass
+        );
+        assert_eq!(
+            a.last_outcome().line(ConnectOutcome::Failed).verdict,
+            Verdict::Fail
+        );
         assert_eq!(h.legs().len(), 2);
     }
 
@@ -2141,12 +2166,13 @@ mod tests {
                 rounds: 2
             }
         );
-        let (ok, text) = a.last_outcome().diagnostic();
-        assert_eq!(ok, Some(false));
-        assert!(text.contains("不接受当前用户"), "{text}");
+        let l = a.last_outcome().line(ConnectOutcome::Failed);
+        assert_eq!(l.verdict, Verdict::Fail);
+        assert!(l.detail.contains("不接受当前用户"), "{}", l.detail);
         assert!(
-            !text.contains("这个上下文里已经走完"),
-            "不能把内部行话推给现场工程师：{text}"
+            !l.detail.contains("这个上下文里已经走完"),
+            "不能把内部行话推给现场工程师：{}",
+            l.detail
         );
         assert_eq!(
             h.legs().len(),
@@ -2230,76 +2256,89 @@ mod tests {
         );
     }
 
-    // ================= W30：诊断行的每一格 =================
+    // ============ W158：AuthOutcome → ProxyAuthSummary 的转抄 ============
 
+    /// 十个 [`AuthOutcome`] 各自转抄成**自己**那一个 `ProxyAuthSummary`，
+    /// 载荷一个不丢。
+    ///
+    /// # 这条测试替掉了什么
+    ///
+    /// 它接替的是 W30 那张
+    /// `every_outcome_gives_the_diagnostic_line_its_own_verdict_and_its_own_words`。
+    /// 判断与文案按 W158 整体搬去了 `rmc_core::diagnostic`（理由见
+    /// [`AuthOutcome::summary`] 的文档：写在这边的话，消费它的诊断页只能
+    /// 住在 rmc-app 的 `#[cfg(windows)]` 里，而那一层按构造测不到）。
+    /// 那张表在 rmc-core 里不但原样保住，还多了一根 W38 要的 `connect`
+    /// 轴，十格变二十格。留在这边的只有「转抄」这一件事。
+    ///
+    /// # 为什么这张表也写成定长数组
+    ///
+    /// 跟原来一样：长度取 `AuthOutcome::VARIANTS`（声明宏从变体列表数
+    /// 出来），少一格就是 `error[E0308]: expected an array with a size
+    /// of N`，**编译不过**，而不是绿着骗人。
+    ///
+    /// # 改实现的哪一行会让它红
+    ///
+    /// - `summary()` 里任意两支的目标变体对调 → 变体名那条断言红；
+    /// - `ContextUnavailable` 的 `package` 写死成 `"Negotiate"` →
+    ///   NTLM 那一格的载荷断言红；
+    /// - `round: *round` 写成 `round: 0` → 载荷那条红；
+    /// - 给 `AuthOutcome` 加一个变体不动表 → 编译不过。
     #[test]
-    fn every_outcome_gives_the_diagnostic_line_its_own_verdict_and_its_own_words() {
-        // ★ W30。改之前十个分支只有三个被断言碰过，**`NotAttempted`
-        // 连身份测试都没有**——而它正是绝大多数没有代理的现场唯一会看到
-        // 的那一行。复审把六个分支的文案全清空、并把 `NotAttempted` 的
-        // 判定从 `None` 翻成 `Some(false)`，62 条全绿；后果是没有代理的
-        // 机器上诊断页报一条硬失败，没有任何闸门会响。
-        //
-        // 改红：
-        // - 把任意一格的文案清空 → 关键词那条断言 +「十句话两两不同」
-        //   那条同时失败；
-        // - 把 `NotAttempted` 翻成 `Some(false)` → 第一格的 `ok` 对不上；
-        // - 把任意一格写成 `Some(true)` → 「永不为 Some(true)」那条失败；
-        // - 给 `AuthOutcome` 加一个变体却不动这张表 → **编译不过**
-        //   （W46，下面那个定长数组）。
-        //
-        // ★ 这张表写成定长数组、长度取 `AuthOutcome::VARIANTS`（由声明宏
-        // 从变体列表数出来），少一格就是
-        // `error[E0308]: expected an array with a size of N`。上一版是
-        // `Vec` + 一句 `names.len() == cases.len()`，那只查得出重复、查不
-        // 出遗漏：加第十一格、顺手补一行 `variant_name`、不动表，测试照样
-        // 全绿。
-        let cases: [(AuthOutcome, Option<bool>, &str); AuthOutcome::VARIANTS] = [
-            (AuthOutcome::NotAttempted, None, "代理没有要求认证"),
+    fn every_auth_outcome_transcribes_into_its_own_summary() {
+        let cases: [(AuthOutcome, ProxyAuthSummary); AuthOutcome::VARIANTS] = [
+            (AuthOutcome::NotAttempted, ProxyAuthSummary::NotAttempted),
             (
                 AuthOutcome::UnsupportedScheme("Basic".into()),
-                Some(false),
-                "代理要求 Basic 认证",
+                ProxyAuthSummary::UnsupportedScheme("Basic".into()),
             ),
             (
                 AuthOutcome::UnknownProxyEndpoint,
-                Some(false),
-                "无法构造 SPN",
+                ProxyAuthSummary::UnknownProxyEndpoint,
             ),
-            (AuthOutcome::MalformedChallenge, Some(false), "base64"),
+            (
+                AuthOutcome::MalformedChallenge,
+                ProxyAuthSummary::MalformedChallenge,
+            ),
             (
                 AuthOutcome::ChallengeWithoutNegotiation,
-                Some(false),
-                "协商状态不一致",
+                ProxyAuthSummary::ChallengeWithoutNegotiation,
             ),
             (
-                AuthOutcome::ContextUnavailable(SspiPackage::Negotiate),
-                Some(false),
-                "请确认本机已加入域",
+                AuthOutcome::ContextUnavailable(SspiPackage::Ntlm),
+                ProxyAuthSummary::ContextUnavailable {
+                    package: "NTLM".into(),
+                },
             ),
             (
                 AuthOutcome::TokenIssued {
                     package: SspiPackage::Negotiate,
                     round: 1,
                 },
-                None,
-                "协商还要继续",
+                ProxyAuthSummary::TokenIssued {
+                    package: "Negotiate".into(),
+                    round: 1,
+                },
             ),
             (
                 AuthOutcome::FinalTokenIssued {
                     package: SspiPackage::Ntlm,
                     rounds: 2,
                 },
-                None,
-                "等代理裁决",
+                ProxyAuthSummary::FinalTokenIssued {
+                    package: "NTLM".into(),
+                    rounds: 2,
+                },
             ),
             (
                 AuthOutcome::Completed {
                     package: SspiPackage::Negotiate,
                     rounds: 3,
                 },
-                Some(false),
-                "代理仍要求认证",
+                ProxyAuthSummary::Completed {
+                    package: "Negotiate".into(),
+                    rounds: 3,
+                },
             ),
             (
                 AuthOutcome::Failed {
@@ -2307,16 +2346,18 @@ mod tests {
                     round: 2,
                     detail: "域拒绝了这次登录（SEC_E_LOGON_DENIED）".into(),
                 },
-                Some(false),
-                "SEC_E_LOGON_DENIED",
+                ProxyAuthSummary::Failed {
+                    package: "Negotiate".into(),
+                    round: 2,
+                    detail: "域拒绝了这次登录（SEC_E_LOGON_DENIED）".into(),
+                },
             ),
         ];
 
-        // 数组的长度已经由编译器钉住了，这里再把**是哪些**变体对上——
-        // 数量对而变体重复（同一格写两遍、另一格没写）会在这里当场说出
-        // 漏的是谁。
+        // 数组长度由编译器钉住；这里把**是哪些**变体对上，数量对而某一格
+        // 写了两遍会在这里说出漏的是谁。
         let listed: std::collections::BTreeSet<&str> =
-            cases.iter().map(|(o, _, _)| o.variant_name()).collect();
+            cases.iter().map(|(o, _)| o.variant_name()).collect();
         let declared: std::collections::BTreeSet<&str> =
             AuthOutcome::VARIANT_NAMES.iter().copied().collect();
         assert_eq!(
@@ -2326,27 +2367,33 @@ mod tests {
             declared.difference(&listed).collect::<Vec<_>>()
         );
 
-        for (outcome, want_ok, keyword) in &cases {
-            let (ok, text) = outcome.diagnostic();
-            assert_eq!(ok, *want_ok, "{}", outcome.variant_name());
-            assert_ne!(
-                ok,
-                Some(true),
-                "{}：协商器只知道自己发出了什么，「代理接受了」只有拿到 200 的 CONNECT 知道",
-                outcome.variant_name()
+        // 十个结局必须落到十个**不同**的摘要变体上。少了这一条，把
+        // `summary()` 整个写成 `ProxyAuthSummary::NotAttempted` 也只会让
+        // 下面那堆 `assert_eq!` 红，而红出来的信息看不出是「映射塌成一格」。
+        let mirrored: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(_, want)| want.variant_name()).collect();
+        assert_eq!(
+            mirrored.len(),
+            AuthOutcome::VARIANTS,
+            "十个结局没有映射到十个不同的摘要变体：{mirrored:?}"
+        );
+
+        for (outcome, want) in &cases {
+            let got = outcome.summary();
+            assert_eq!(
+                got.variant_name(),
+                want.variant_name(),
+                "{} 转抄成了 {}",
+                outcome.variant_name(),
+                got.variant_name()
             );
-            assert!(
-                text.contains(keyword),
-                "{} 的诊断行里没有「{keyword}」：{text}",
+            assert_eq!(
+                &got,
+                want,
+                "{} 的载荷没有原样带过去",
                 outcome.variant_name()
             );
         }
-
-        // 每一句话两两不同：两个结局给出同一句话，等于现场工程师看到的
-        // 还是同一条信息。
-        let texts: std::collections::BTreeSet<String> =
-            cases.iter().map(|(o, _, _)| o.diagnostic().1).collect();
-        assert_eq!(texts.len(), cases.len(), "有两个结局给出了同一句话");
     }
 
     // ================= W32：scheme 名的长度上限 =================
@@ -2367,7 +2414,7 @@ mod tests {
         assert!(a.next_token(&junk, None).await.is_none());
 
         let outcome = a.last_outcome();
-        let text = outcome.diagnostic().1;
+        let text = outcome.line(ConnectOutcome::Failed).detail;
         assert!(text.len() < 1000, "诊断行没有被截断：{} 字节", text.len());
         assert!(
             format!("{outcome:?}").len() < 1000,
@@ -2385,7 +2432,7 @@ mod tests {
             panic!("不支持的 scheme 不该创建上下文")
         });
         assert!(a.next_token("Neg\u{0}otiate", None).await.is_none());
-        let rendered = format!("{:?} {}", a.last_outcome(), a.last_outcome().diagnostic().1);
+        let rendered = rendered_with_line(&a.last_outcome());
         assert!(
             !rendered.contains('\u{0}'),
             "NUL 被原样塞进了诊断文案：{rendered:?}"
@@ -2646,12 +2693,13 @@ mod tests {
                 rounds: 2
             }
         );
-        let (ok, text) = a.last_outcome().diagnostic();
-        assert_eq!(ok, Some(false));
-        assert!(text.contains("不接受当前用户"), "{text}");
+        let l = a.last_outcome().line(ConnectOutcome::Failed);
+        assert_eq!(l.verdict, Verdict::Fail);
+        assert!(l.detail.contains("不接受当前用户"), "{}", l.detail);
         assert!(
-            !text.contains("协商还要继续"),
-            "CONNECT 已经确定失败了，不能对现场工程师说协商还要继续：{text}"
+            !l.detail.contains("协商还要继续"),
+            "CONNECT 已经确定失败了，不能对现场工程师说协商还要继续：{}",
+            l.detail
         );
     }
 

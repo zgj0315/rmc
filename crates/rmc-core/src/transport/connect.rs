@@ -3,6 +3,7 @@
 //! 服务端会认成另一个客户端，协商永远推进不到第二轮。
 
 use crate::addr::HostPort;
+use crate::diagnostic::PROXY_AUTH_ROW;
 use crate::error::{Error, Result};
 use crate::platform::{Io, ProxyAuthenticator};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -354,12 +355,7 @@ pub async fn http_connect<S: Io>(
                     Some(token) => {
                         authorization = Some(authorization_header(&challenge.scheme, &token))
                     }
-                    None => {
-                        return Err(Error::ProxyAuthFailed(format!(
-                            "代理要求 {}，本机无法协商",
-                            challenge.scheme
-                        )))
-                    }
+                    None => return Err(negotiation_gave_no_token(&challenge.scheme)),
                 }
             }
             other => {
@@ -371,6 +367,39 @@ pub async fn http_connect<S: Io>(
     Err(Error::ProxyAuthFailed(format!(
         "代理认证协商超过 {MAX_ROUNDS} 轮仍未通过"
     )))
+}
+
+/// 协商器一段 token 都给不出来时的错误文案。
+///
+/// # W164：这一句**不许说原因**
+///
+/// 它原来写的是「代理要求 {scheme}，**本机无法协商**」。那句话跟诊断页
+/// 「代理认证」那一行说的「**凭据格式没问题，是代理不接受当前用户**」
+/// 直接矛盾，而 W45 落地之后这个矛盾从罕见变成了**最常见的形状**：
+/// NTLM 最后一段发出去、代理回 407 拒绝，`next_token` 返回 `None`，
+/// 于是状态卡上写着「本机无法协商」，诊断页上写着「本机协商得好好的，
+/// 是代理不认这个用户」。现场工程师照前一句去查「这台笔记本加域了吗」，
+/// 方向整个反了。
+///
+/// **哪一句对**：诊断页那一句。理由是**谁知道真相**——
+/// [`ProxyAuthSummary`](rmc_core_doc_link) 分得清「方式不支持」「建不出
+/// 上下文」「协商走完了代理还不认」这十种结局；而 `http_connect` 在这里
+/// 手上只有一个 `None`，它**结构上说不出原因**。这跟 W36 当初给
+/// `next_token` 换带类型的出口、跟 `resolve()`/`load()`/`validate()`
+/// 那几次是同一个缺陷类：把多种情形压进一个 `Option`，然后在只剩
+/// `None` 的地方硬编一个原因出来。
+///
+/// 所以这一句改成只陈述事实（代理要了哪种认证、这次没过），并把原因
+/// 指给真正知道的那一行。指路用 [`PROXY_AUTH_ROW`] 这个常量而不是字面量：
+/// 诊断页的行名改了而这里没改，`rmc_app::diag` 的
+/// `the_error_text_points_at_a_row_the_page_really_draws` 会变红。
+///
+/// `rmc_core_doc_link`：`crate::diagnostic::ProxyAuthSummary`（写成链接会
+/// 让 `cargo doc` 在 rmc-win 侧解析不到，这里只留文字）。
+fn negotiation_gave_no_token(scheme: &str) -> Error {
+    Error::ProxyAuthFailed(format!(
+        "代理要求 {scheme} 认证，本次没有通过；原因见诊断页的「{PROXY_AUTH_ROW}」一行"
+    ))
 }
 
 #[cfg(test)]
@@ -529,6 +558,46 @@ mod tests {
         assert_eq!(picked.token68.as_deref(), Some("TlRMTVNTUAAC"));
     }
 
+    // ================= W164：这一句不许说原因 =================
+
+    /// W164（落实 W55）：`next_token` 返回 `None` 时抛的那句话**不许
+    /// 断言原因**，因为这里手上只有一个 `None`。
+    ///
+    /// # 改实现的哪一行会让它红
+    ///
+    /// 把 `negotiation_gave_no_token` 的文案改回
+    /// 「代理要求 {scheme}，本机无法协商」——第三条断言当场红（它又开始
+    /// 替协商器下结论了），第二条也红（不再指路）。
+    ///
+    /// # 为什么这里只有一半
+    ///
+    /// 另一半在 rmc-app：这句话指的那一行**真的要存在**。
+    /// `rmc_app::diag` 的 `the_error_text_points_at_a_row_the_page_really_draws`
+    /// 断言诊断页画出来的那一行行首就是 [`PROXY_AUTH_ROW`]。两句话在
+    /// Task 9 才第一次相遇，所以守它的两条测试也分住两个 crate。
+    #[test]
+    fn the_failure_text_states_the_fact_and_points_at_the_diagnostics_row() {
+        let text = negotiation_gave_no_token("Negotiate").to_string();
+
+        // 事实：代理要了哪种认证、这次没过。
+        assert!(text.contains("Negotiate"), "{text}");
+        assert!(text.contains("没有通过"), "{text}");
+        // 指路：指向诊断页上真实存在的那一行。
+        assert!(
+            text.contains(PROXY_AUTH_ROW),
+            "没有把原因指给知道真相的那一行：{text}"
+        );
+
+        // 不许替协商器下结论。`None` 至少对应七种结局（方式不支持、
+        // 建不出上下文、协商走完代理仍不认……），它们的处置完全不同。
+        for claim in ["本机无法协商", "无法协商", "本机不支持"] {
+            assert!(
+                !text.contains(claim),
+                "这里手上只有一个 None，说不出原因，却断言了「{claim}」：{text}"
+            );
+        }
+    }
+
     // ================= W32：scheme 名的长度上限 =================
 
     #[test]
@@ -547,7 +616,7 @@ mod tests {
             scheme.len()
         );
         assert!(scheme.starts_with("xxxx"), "至少要保留可读的一部分");
-        let text = Error::ProxyAuthFailed(format!("代理要求 {scheme}，本机无法协商")).to_string();
+        let text = negotiation_gave_no_token(scheme).to_string();
         assert!(text.len() < 1000, "错误文案没有被截断：{} 字节", text.len());
     }
 

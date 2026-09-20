@@ -36,6 +36,23 @@ pub enum Action {
     Cancel,
     Stop,
     RetryNow,
+    /// 诊断页：把诊断包写到磁盘上。
+    ExportDiagnostics,
+    /// 诊断页：把检查结果复制到剪贴板。
+    CopyDiagnostics,
+}
+
+impl Action {
+    /// 全部动作。[`action_enabled`] 那张表用它证明自己一格都没漏——
+    /// 加一个动作而忘了回答「它什么时候可按」，测试会当场说出漏的是谁。
+    pub const ALL: [Action; 6] = [
+        Action::Start,
+        Action::Cancel,
+        Action::Stop,
+        Action::RetryNow,
+        Action::ExportDiagnostics,
+        Action::CopyDiagnostics,
+    ];
 }
 
 /// 状态卡的全部可画内容。视图层只负责把这四个值摆进控件。
@@ -63,6 +80,13 @@ pub struct Model {
     pub preflight: Option<PreflightReport>,
     pub host_key: Option<(String, bool)>,
     pub connected_since: Option<SystemTime>,
+    /// 系统代理与代理认证的现况，诊断页那三行画的就是它。
+    ///
+    /// **由 Task 10 取好之后写进来**：诊断页不得自己去查
+    /// （W43/W160，见 [`crate::diag`] 的模块文档）。本任务里没有任何
+    /// 东西写它——跟 `Form::detected_proxy`、`Message::ActionPressed`
+    /// 一样是等 Task 10 的悬空数据，见 task-9-report.md 的「后续完善」。
+    pub proxy: Option<crate::diag::ProxyStatus>,
 }
 
 impl Default for Model {
@@ -73,6 +97,7 @@ impl Default for Model {
             preflight: None,
             host_key: None,
             connected_since: None,
+            proxy: None,
         }
     }
 }
@@ -265,6 +290,9 @@ pub fn action_enabled(action: Action, form_ready: bool) -> bool {
     match action {
         Action::Start => form_ready,
         Action::Cancel | Action::Stop | Action::RetryNow => true,
+        // 诊断页那两个**尤其**不能跟表单绑在一起：现场需要导出诊断包的
+        // 时候，恰恰就是表单填不对、连不上的时候。
+        Action::ExportDiagnostics | Action::CopyDiagnostics => true,
     }
 }
 
@@ -916,14 +944,19 @@ mod tests {
         assert!(m.elapsed(SystemTime::now()).is_none());
     }
 
-    /// 表驱动八格：四个动作 × 表单就绪与否。
+    /// 表驱动：每个动作 × 表单就绪与否，**一格都不许漏**。
     ///
     /// 改红：把 `action_enabled` 写成恒 `true`（brief 那行判断被误删的
-    /// 样子），第一格立刻红；写成 `form_ready` 恒返回，后三个动作的
-    /// `false` 那半边一起红。
+    /// 样子），第一格立刻红；写成 `form_ready` 恒返回，其余动作的
+    /// `false` 那半边一起红；给 `Action` 加一个变体却不动这张表 →
+    /// **编译不过**（定长数组，长度取 `Action::ALL.len() * 2`）。
+    ///
+    /// Task 9 加了 `ExportDiagnostics` / `CopyDiagnostics` 两个动作。
+    /// 它们**尤其**不能跟表单绑在一起：现场要导出诊断包的时候，恰恰就是
+    /// 表单填不对、连不上的时候。
     #[test]
     fn only_start_waits_for_the_form_to_be_ready() {
-        let cases = [
+        let cases: [(Action, bool, bool); Action::ALL.len() * 2] = [
             (Action::Start, true, true),
             (Action::Start, false, false),
             (Action::Cancel, true, true),
@@ -932,7 +965,16 @@ mod tests {
             (Action::Stop, false, true),
             (Action::RetryNow, true, true),
             (Action::RetryNow, false, true),
+            (Action::ExportDiagnostics, true, true),
+            (Action::ExportDiagnostics, false, true),
+            (Action::CopyDiagnostics, true, true),
+            (Action::CopyDiagnostics, false, true),
         ];
+        // 数量对而某个动作写了两遍、另一个没写，在这里当场说出漏的是谁。
+        for action in Action::ALL {
+            let n = cases.iter().filter(|(a, _, _)| *a == action).count();
+            assert_eq!(n, 2, "{action:?} 在表里出现了 {n} 次，应当是两次");
+        }
         for (action, ready, want) in cases {
             assert_eq!(
                 action_enabled(action, ready),

@@ -5,6 +5,7 @@ pub mod addr;
 pub mod audit;
 pub mod backoff;
 pub mod config;
+pub mod diagnostic;
 pub mod error;
 pub mod knownhosts;
 pub mod platform;

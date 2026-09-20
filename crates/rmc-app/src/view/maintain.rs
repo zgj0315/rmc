@@ -19,6 +19,7 @@
 //! `locked_addresses_swallow_typing`）。顺带也对：连着的时候现场人员仍然
 //! 需要看见自己连的是哪台一体机。
 
+use super::{card, section};
 use crate::form::{Field, Form};
 use crate::model::{action_enabled, session_traffic, Model};
 use crate::theme::{color, input_border};
@@ -26,27 +27,6 @@ use crate::Message;
 use iced::widget::{button, checkbox, column, container, row, space, text, text_input, Space};
 use iced::{Alignment, Border, Element, Length};
 use zeroize::Zeroizing;
-
-/// 分组小标题。
-fn section(label: &str) -> Element<'_, Message> {
-    text(label).size(12).color(color::TEXT_SUB).into()
-}
-
-/// 白底圆角卡片。
-fn card(content: Element<'_, Message>) -> Element<'_, Message> {
-    container(content)
-        .style(|_| container::Style {
-            background: Some(color::CARD.into()),
-            border: Border {
-                color: color::BORDER,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        })
-        .width(Length::Fill)
-        .into()
-}
 
 /// 卡片里的一行。
 fn line(content: iced::widget::Row<'_, Message>) -> Element<'_, Message> {

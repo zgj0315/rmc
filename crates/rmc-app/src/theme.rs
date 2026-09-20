@@ -6,6 +6,7 @@
 //! （见 task-6-report.md 的人工验收清单）。别把绿灯读成"配色正确"。
 
 use iced::Color;
+use rmc_core::diagnostic::Verdict;
 
 /// 固定窗口尺寸，不可最大化。
 pub const WINDOW_SIZE: (f32, f32) = (520.0, 720.0);
@@ -50,6 +51,19 @@ pub mod color {
     pub const CARD: Color = rgb(0xff, 0xff, 0xff);
     pub const BORDER: Color = rgb(0xe8, 0xe8, 0xe8);
     pub const WINDOW: Color = rgb(0xf3, 0xf3, 0xf3);
+
+    /// 诊断页上失败那一行的底色。画板 `design/body-Diagnostics.html`
+    /// 里写的就是这个值。
+    ///
+    /// 它跟 `tint(FAILED)`（`#faeeed`）**不是一个颜色**，刻意没有合并：
+    /// 状态卡整张卡片的淡底与诊断页一行的淡底由画板各自定过，合并等于
+    /// 单方面改画板。
+    pub const ROW_FAIL_BG: Color = rgb(0xfd, 0xf2, 0xf1);
+    /// 诊断页上失败那一行的文字色。画板同上。
+    ///
+    /// 比 [`FAILED`]（`#c42b1c`，画在图标与红字提示上）更深一点——一整行
+    /// 正文要压在淡底上，对比度不够会糊。
+    pub const ROW_FAIL_TEXT: Color = rgb(0xa4, 0x26, 0x2c);
 }
 
 /// 状态卡的浅色底：把状态色按 [`TINT_ALPHA`] 的比例叠在白底上。
@@ -101,6 +115,42 @@ pub fn tab_style(is_active: bool) -> (Color, Color) {
     }
 }
 
+/// 诊断页上一行的取色。
+///
+/// `background` 是 `Option`：只有失败那一行有自己的底色，其余两种直接
+/// 压在卡片的白底上。写成 `Option` 而不是「给非失败行一个等于卡片色的
+/// 背景」，是因为后者会在卡片换色时留下一层对不上的补丁。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowPalette {
+    pub background: Option<Color>,
+    pub text: Color,
+}
+
+/// 诊断页一行按结论取色。
+///
+/// W143 / crate 级约定：这是判断，不许留在 `view::diagnostics` 里——
+/// 留在那里就没有任何东西看得见它（`iced_test` 的选择器只能看到文本、
+/// id 与 bounds，**看不到任何样式**）。表驱动三格在下面，而「算出来的
+/// 颜色真的进了控件」由 `view/diagnostics.rs` 自己的差分快照守（W146）。
+pub fn row_palette(verdict: Verdict) -> RowPalette {
+    match verdict {
+        Verdict::Pass => RowPalette {
+            background: None,
+            text: color::TEXT,
+        },
+        Verdict::Fail => RowPalette {
+            background: Some(color::ROW_FAIL_BG),
+            text: color::ROW_FAIL_TEXT,
+        },
+        // 「还没轮到」要看得出是灰的，但**不能标红**：那等于在没跑过
+        // 预检的机器上凭空报一屏故障。
+        Verdict::Undecided => RowPalette {
+            background: None,
+            text: color::IDLE,
+        },
+    }
+}
+
 /// 输入框的边框色：填错的框标红，其余用常规边框。
 ///
 /// W143 / crate 级约定：这是纯判断，不许留在 `view::maintain` 里——
@@ -149,6 +199,58 @@ mod tests {
         assert_eq!(to_hex(color::CARD), "#ffffff");
         assert_eq!(to_hex(color::BORDER), "#e8e8e8");
         assert_eq!(to_hex(color::WINDOW), "#f3f3f3");
+    }
+
+    /// 诊断页那两个颜色也钉住十六进制值，跟画板对得上。
+    #[test]
+    fn diagnostics_row_colors_match_the_approved_palette() {
+        assert_eq!(to_hex(color::ROW_FAIL_BG), "#fdf2f1");
+        assert_eq!(to_hex(color::ROW_FAIL_TEXT), "#a4262c");
+    }
+
+    /// 三个结论各自取自己的色，**而且互不相同**。
+    ///
+    /// # 改实现的哪一行会让它红
+    ///
+    /// - 把 `Undecided` 的 `text` 从 `IDLE` 改成 `TEXT`（也就是让
+    ///   「没跑过」跟「通过」长得一样）→「三格两两不同」那条红；
+    /// - 给 `Undecided` 配上 `ROW_FAIL_BG` → 只有失败行有底色那条红；
+    /// - 把 `Fail` 的 `background` 改成 `None` → 同上。
+    ///
+    /// 这张表证明不了「算出来的颜色真的画到了像素上」——那由
+    /// `view/diagnostics.rs` 里的差分快照守（W146 的技法）。
+    #[test]
+    fn every_verdict_takes_its_own_row_colors() {
+        let cases = [
+            (Verdict::Pass, color::TEXT, false),
+            (Verdict::Fail, color::ROW_FAIL_TEXT, true),
+            (Verdict::Undecided, color::IDLE, false),
+        ];
+        let mut texts = std::collections::BTreeSet::new();
+        for (verdict, want_text, want_bg) in cases {
+            let p = row_palette(verdict);
+            assert_eq!(
+                to_hex(p.text),
+                to_hex(want_text),
+                "{verdict:?} 的文字色不对"
+            );
+            assert_eq!(
+                p.background.is_some(),
+                want_bg,
+                "{verdict:?} 的底色有无不对：{:?}",
+                p.background
+            );
+            texts.insert(to_hex(p.text));
+        }
+        assert_eq!(
+            texts.len(),
+            3,
+            "三个结论里有两个取了同一个文字色：{texts:?}"
+        );
+        assert_eq!(
+            row_palette(Verdict::Fail).background.map(to_hex),
+            Some("#fdf2f1".to_string())
+        );
     }
 
     #[test]

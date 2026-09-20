@@ -63,6 +63,9 @@ fn the_scan_really_reaches_this_crates_source() {
         ("theme.rs", "维护"),
         ("form.rs", "运维服务器地址"),
         ("view/maintain.rs", "记住密码"),
+        // Task 9 新增的两个文件也要真的被走到。
+        ("diag.rs", "系统代理"),
+        ("view/diagnostics.rs", "导出诊断包"),
     ] {
         assert!(
             lits.iter().any(|l| l.file == file && l.text == text),
@@ -111,4 +114,141 @@ fn no_string_literal_in_this_crate_says_gateway() {
 #[test]
 fn the_word_list_is_not_forked() {
     assert_eq!(rmc_app::BANNED_WORDS, rmc_core::wording::BANNED_WORDS);
+}
+
+/// W162（落实 W153）：**rmc-app 的生产代码里不许有原始字符串字面量。**
+///
+/// # 为什么这是一条测试，而不是一句约定
+///
+/// `rmc_core::wording` 的切词器**不认原始字符串**（它自己的文档写明了：
+/// 只处理转义的引号，遇上 `r` 打头的字面量会把后面的切词整段带偏）。
+/// 今天整个 workspace 里一条都没有，所以不漏。
+///
+/// 而 Task 9 的诊断页是这条纪律第一次真的受考验的地方：处置建议是五段
+/// 带标点的长中文，**写成原始字符串是最顺手的写法**。一旦有人那么写，
+/// 上面那条禁用词扫描会对那整段文案**一声不响地失明**——跟上一轮刚修掉
+/// 的「反斜杠续行整条字面量被丢掉」是同一个形状（W130）。
+///
+/// 裁决给的是两条路：先补切词器，或者明确不用。本任务选**不用**
+/// （五段文案用续行写，切词器上一轮刚补过那一支），并把这个选择从一句
+/// 承诺变成一道闸门。哪天真要用原始字符串，先去补切词器，然后连这条
+/// 测试一起改——两件事绑在一起，不会有人只做前一半。
+///
+/// 改红：把 `diag.rs` 里任意一段处置建议改成原始字符串写法。
+#[test]
+fn no_production_code_in_this_crate_uses_a_raw_string_literal() {
+    let hits = scan_lines(has_raw_string);
+    assert!(
+        hits.is_empty(),
+        "rmc-app 的生产代码里出现了原始字符串，禁用词扫描对它整段失明\n\
+         （要么先补 rmc_core::wording 的切词器，要么换成续行写法）：\n{}",
+        hits.join("\n")
+    );
+
+    // 反向自证之一：探测器真的认得出原始字符串。两种写法都用 `concat!`
+    // 拼出来——直接写字面量的话，**这几行自己**就是命中，测试永远红。
+    let plain = concat!("r", "\"");
+    let hashed = concat!("r", "#\"");
+    assert!(
+        has_raw_string(&format!("let s = {plain}abc\";")),
+        "探测器认不出不带井号的原始字符串"
+    );
+    assert!(
+        has_raw_string(&format!("let s = {hashed}abc\"#;")),
+        "探测器认不出带井号的原始字符串"
+    );
+    assert!(
+        has_raw_string(&format!("let s = b{plain}abc\";")),
+        "探测器认不出字节原始字符串"
+    );
+
+    // 反向自证之二：不会把普通字面量误判。这四条**全是本仓库真实踩过的
+    // 形状**——第一版探测器只查「r 后面跟着引号」，于是
+    // `"UnknownIssuer"`、`.field("remember", ..)`、`"placeholder"` 三处
+    // 全被判成原始字符串，测试一上来就红。
+    for ok in [
+        "let s = \"UnknownIssuer\";",
+        ".field(\"remember\", &self.remember)",
+        "password: Zeroizing::new(\"placeholder\".into()),",
+        "for r in &lines {",
+    ] {
+        assert!(!has_raw_string(ok), "误判成原始字符串：{ok}");
+    }
+
+    // 反向自证之三：扫描器真的走到了 rmc-app 的源码——拿一条已知存在的
+    // 生产代码行当锚点。
+    let anchor = scan_lines(|line| line.contains("pub const WINDOW_TITLE"));
+    assert!(
+        anchor.iter().any(|h| h.starts_with("lib.rs:")),
+        "扫描器没在 lib.rs 里找到 WINDOW_TITLE，它八成没走到 src/：{anchor:?}"
+    );
+}
+
+/// 这一行里有没有原始字符串字面量的开头。
+///
+/// 判据是 Rust 词法本身：一个 `r`（或字节串的 `br`），**前面不是标识符
+/// 字符**，后面跟零个或多个 `#`，再跟一个引号。
+///
+/// 「前面不是标识符字符」这一条不能省——省掉它，`"UnknownIssuer"` 的
+/// `r"` 就是一处命中。第一版就是这么写的，一上来打出三处误判。
+fn has_raw_string(line: &str) -> bool {
+    let b = line.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    for i in 0..b.len() {
+        if b[i] != b'r' {
+            continue;
+        }
+        if i > 0 && is_ident(b[i - 1]) {
+            // 唯一的例外：`br"..."`，此时真正的左边界在 `b` 之前。
+            let byte_prefix = b[i - 1] == b'b' && (i < 2 || !is_ident(b[i - 2]));
+            if !byte_prefix {
+                continue;
+            }
+        }
+        let mut j = i + 1;
+        while j < b.len() && b[j] == b'#' {
+            j += 1;
+        }
+        if j < b.len() && b[j] == b'"' {
+            return true;
+        }
+    }
+    false
+}
+
+/// `src/` 下满足 `pred` 的**非注释行**，形如 `diag.rs:123: <原文>`。
+fn scan_lines(pred: impl Fn(&str) -> bool) -> Vec<String> {
+    let root = rmc_app_src();
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("读 src 目录") {
+            let path = entry.expect("读目录项").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let text = std::fs::read_to_string(&path).expect("读源文件");
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                // 注释里写一个原始字符串不会被编译器当成字面量，扫描器
+                // 也不看注释——本文件的文档注释因此不会命中自己。
+                if t.starts_with("//") {
+                    continue;
+                }
+                if pred(t) {
+                    out.push(format!("{rel}:{}: {t}", i + 1));
+                }
+            }
+        }
+    }
+    out
 }
