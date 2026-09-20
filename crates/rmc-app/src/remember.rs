@@ -133,10 +133,25 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
     };
     let key = account.key();
 
+    // # W202：上一次记的是谁，**必须在这里读**
+    //
+    // `last-account.txt` 只记得住**一个**账号，所以任何一个不等于它的
+    // key 都是**谁也找不回来的孤儿**：`recall` 只会按记录里那一个去取。
+    //
+    // 修的是这样一条真实路径（评审写了 PoC）：用户记住 `A@运维服务器`
+    // → 把账号改成 `B` → 取消勾选「记住密码」。上一版按**当前表单**
+    // 拼出的 `B@运维服务器` 去清（本来就不存在），账号记录被删掉，而
+    // `A@运维服务器` 的密文**永久留在盘上，而且再也没有任何路径指得到
+    // 它**——用户明确说了「不再记住」。
+    //
+    // 读必须在 [`write_account`] **之前**：那一步会把它覆盖掉。
+    let previous = previous_key(paths);
+
     if !form.remember {
-        // 取消勾选（或者从来没勾）：两样都清掉。Task 4 的 `clear` 会连
-        // 写到一半留下的 `.tmp` 一起删（W25）。
-        return match clear(paths, store, &key) {
+        // 取消勾选（或者从来没勾）：当前 key、上一次那个 key、账号记录，
+        // 三样都清掉。Task 4 的 `clear` 会连写到一半留下的 `.tmp` 一起
+        // 删（W25）。
+        return match clear(paths, store, &key, previous.as_deref()) {
             Ok(()) => SaveOutcome::Cleared,
             Err(e) => SaveOutcome::Failed(e.to_string()),
         };
@@ -155,22 +170,53 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
     if let Err(e) = write_account(paths, &account) {
         // 密文已经写进去了，但账号记录写不成——把密文也清掉，不留一份
         // 谁也找不回来的孤儿密文。
+        //
+        // W203：这一支上一轮是**零覆盖**的（评审两枪双绿）。它跟 W202
+        // 是同一个危害面，夹具见
+        // `a_failed_account_record_rolls_the_ciphertext_back`。
         let _ = store.clear(&key);
         return SaveOutcome::Failed(e.to_string());
+    }
+    // W202 的另一半：账号换了，上一份密文从此再没有任何路径指得到它。
+    // **必须在新的两样都写成之后**才清——反过来的话，新密文写失败时
+    // 旧的那份已经被毁了，用户两边都没了。
+    if let Some(old) = previous.filter(|p| *p != key) {
+        if let Err(e) = store.clear(&old) {
+            // 不吞掉，但也不因此把这次「记住」判成失败：新的那份确实
+            // 存好了，用户要的事已经做到。
+            tracing::warn!(error = %e, "上一个账号的密文没能清掉，它已经取不回来了");
+        }
     }
     SaveOutcome::Saved { key }
 }
 
+/// 上一次记住的那个账号的 key。没有记录、或者记录坏了就是 `None`。
+fn previous_key(paths: &AppPaths) -> Option<String> {
+    let text = std::fs::read_to_string(paths.last_account()).ok()?;
+    Account::decode(&text).map(|a| a.key())
+}
+
 /// 把密文与账号记录都清掉。
-fn clear(paths: &AppPaths, store: &dyn SecretStore, key: &str) -> std::io::Result<()> {
-    // 两步都走完再报第一个错——半路 return 会留下另一半（同 Task 4 的
-    // `SecretStore::clear` 自己那条 W25）。
-    let secret = store.clear(key);
+///
+/// `previous` 是上一次记住的那个 key（W202）：账号改过之后它跟 `key`
+/// 不是一回事，而它才是盘上真正躺着密文的那一个。
+fn clear(
+    paths: &AppPaths,
+    store: &dyn SecretStore,
+    key: &str,
+    previous: Option<&str>,
+) -> std::io::Result<()> {
+    // 每一步都走完再报第一个错——半路 return 会留下另外几样（同 Task 4
+    // 的 `SecretStore::clear` 自己那条 W25）。
+    let mut result = store.clear(key);
+    if let Some(old) = previous.filter(|p| *p != key) {
+        result = result.and(store.clear(old));
+    }
     let account = match std::fs::remove_file(paths.last_account()) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,
     };
-    secret.and(account)
+    result.and(account)
 }
 
 fn write_account(paths: &AppPaths, account: &Account) -> std::io::Result<()> {
@@ -447,6 +493,258 @@ mod tests {
         assert_eq!(save(&paths, store.as_ref(), &f), SaveOutcome::Cleared);
     }
 
+    /// **W202：改了账号再取消勾选，旧密文不许留在盘上。**
+    ///
+    /// 评审的 PoC。上一版按**当前表单**拼出的 key 去清，于是：
+    ///
+    /// 1. 记住 `tunnel-zhang@ops.example.com:443`；
+    /// 2. 把账号改成 `tunnel-li`；
+    /// 3. 取消勾选「记住密码」→ 清的是 `tunnel-li@...`（本来就不存在），
+    ///    账号记录被删掉，而 `tunnel-zhang@...` 的密文**永久留在盘上，
+    ///    而且再也没有任何路径指得到它**（下次启动 `recall` 直接
+    ///    `NoAccount`）。
+    ///
+    /// 密文是 DPAPI 绑定的、不是明文泄露，但用户明确说了「不再记住」
+    /// 而东西还在、还删不掉。
+    ///
+    /// 改红：把 `save` 里 `clear(..)` 的第四个参数换成 `None`
+    /// （也就是退回只清当前 key），第二组断言当场红。
+    #[test]
+    fn changing_the_account_then_unchecking_leaves_no_orphan_ciphertext() {
+        const KEY_A: &str = "tunnel-zhang@ops.example.com:443";
+        const KEY_B: &str = "tunnel-li@ops.example.com:443";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+        let store = store_at(&paths, FlipSealer);
+
+        // 1. 记住 A。
+        assert_eq!(
+            save(&paths, store.as_ref(), &filled_form()),
+            SaveOutcome::Saved { key: KEY_A.into() }
+        );
+        // 反向自证：A 的密文确实躺在盘上，下面那条断言因此带载。
+        assert!(store.load(KEY_A).is_some());
+
+        // 2. 用户把账号改成 B，3. 取消勾选。
+        let mut f = filled_form();
+        f.username = "tunnel-li".into();
+        f.remember = false;
+        assert_eq!(save(&paths, store.as_ref(), &f), SaveOutcome::Cleared);
+
+        // 主断言：**旧账号的密文也清掉了**。
+        assert!(
+            store.load(KEY_A).is_none(),
+            "改了账号再取消勾选，上一个账号的密文永久留在了盘上，\
+             而且再也没有任何路径指得到它"
+        );
+        assert!(store.load(KEY_B).is_none());
+        assert!(!paths.last_account().exists());
+        // 盘上真的一个密文文件都不剩。
+        assert_eq!(
+            sealed_files(&paths).len(),
+            0,
+            "密文目录里还剩：{:?}",
+            sealed_files(&paths)
+        );
+    }
+
+    /// W202 的另一半：换一个账号继续记住，**上一份密文也不该留成孤儿**。
+    ///
+    /// `last-account.txt` 只记得住一个账号，所以旧那份从此取不回来。
+    ///
+    /// 改红：把 `save` 末尾那段 `if let Some(old) = previous.filter(..)`
+    /// 整块删掉——盘上会攒下两份密文，而其中一份谁也够不着。
+    #[test]
+    fn remembering_a_second_account_does_not_orphan_the_first_one() {
+        const KEY_A: &str = "tunnel-zhang@ops.example.com:443";
+        const KEY_B: &str = "tunnel-li@ops.example.com:443";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+        let store = store_at(&paths, FlipSealer);
+
+        save(&paths, store.as_ref(), &filled_form());
+        assert!(store.load(KEY_A).is_some(), "夹具本该先记住 A");
+
+        let mut f = filled_form();
+        f.username = "tunnel-li".into();
+        assert_eq!(
+            save(&paths, store.as_ref(), &f),
+            SaveOutcome::Saved { key: KEY_B.into() }
+        );
+
+        // 新的那份在，旧的那份没了。
+        assert_eq!(*store.load(KEY_B).expect("新账号没记住"), CANARY);
+        assert!(
+            store.load(KEY_A).is_none(),
+            "换了账号，上一份密文留成了谁也够不着的孤儿"
+        );
+        assert_eq!(sealed_files(&paths).len(), 1, "{:?}", sealed_files(&paths));
+
+        // 而且下一次启动取回的是新那个账号。
+        let mut form = Form::default();
+        recall(&paths, store.as_ref()).fill(&mut form);
+        assert_eq!(form.username, "tunnel-li");
+        assert_eq!(*form.password, CANARY);
+    }
+
+    /// **重复记住同一个账号，不许把刚存进去的那一份当成「上一个」清掉。**
+    ///
+    /// 这是生产里**最常发生**的一条路：用户勾着「记住密码」，每连成功
+    /// 一次就走一遍 [`save`]，第二次起 `previous` 就等于当前 key。
+    ///
+    /// 上一轮的 F5 那一枪（去掉 `filter(|p| *p != key)`）**全绿**——
+    /// 也就是说守着这条路的只有那一个 `filter`，而没有任何测试看得见它。
+    /// 补上。
+    ///
+    /// 改红：把 `save` 末尾 `previous.filter(|p| *p != key)` 里的
+    /// `filter` 去掉——第二次「记住」会把自己刚存的密文清掉，下次启动
+    /// 密码框是空的。
+    #[test]
+    fn remembering_the_same_account_twice_keeps_it() {
+        const KEY: &str = "tunnel-zhang@ops.example.com:443";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+        let store = store_at(&paths, FlipSealer);
+
+        assert_eq!(
+            save(&paths, store.as_ref(), &filled_form()),
+            SaveOutcome::Saved { key: KEY.into() }
+        );
+        // 反向自证：第一次之后 `last-account.txt` 确实在了，第二次的
+        // `previous` 因此**不是** `None`——少了这一步，下面那次调用走的
+        // 是跟第一次一样的路，什么都证明不了。
+        assert!(paths.last_account().exists());
+
+        assert_eq!(
+            save(&paths, store.as_ref(), &filled_form()),
+            SaveOutcome::Saved { key: KEY.into() }
+        );
+
+        assert_eq!(
+            *store.load(KEY).expect("第二次「记住」把自己刚存的清掉了"),
+            CANARY
+        );
+        assert_eq!(sealed_files(&paths).len(), 1, "{:?}", sealed_files(&paths));
+        // 下一次启动照常取得回来。
+        let mut form = Form::default();
+        recall(&paths, store.as_ref()).fill(&mut form);
+        assert_eq!(*form.password, CANARY);
+    }
+
+    /// **`clear` 里第一步失败也要把后面几步走完。**
+    ///
+    /// 同 Task 4 的 `SecretStore::clear` 自己那条 W25：半路 `return` 会
+    /// 把另外几样留在盘上，而用户点的是「不再记住密码」。
+    ///
+    /// 上一轮的 F6 那一枪（把 `.and(..)` 换成 `?` 提前返回）**全绿**——
+    /// 没有任何测试让 `store.clear` 失败过。补上，用一个会在指定 key 上
+    /// 报错的假存储。
+    ///
+    /// 改红：把 `clear` 里的 `result = result.and(store.clear(old));`
+    /// 换成 `store.clear(old)?;` 那一类提前返回的写法。
+    #[test]
+    fn clearing_finishes_every_step_even_after_the_first_one_fails() {
+        const KEY_A: &str = "tunnel-zhang@ops.example.com:443";
+        const KEY_B: &str = "tunnel-li@ops.example.com:443";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+        // 上一次记的是 A。
+        std::fs::create_dir_all(paths.root()).expect("建目录");
+        std::fs::write(
+            paths.last_account(),
+            Account {
+                username: "tunnel-zhang".into(),
+                host: "ops.example.com".into(),
+                port: "443".into(),
+            }
+            .encode(),
+        )
+        .expect("写账号记录");
+
+        // 当前表单是 B，取消勾选；而清 B 这一步会失败。
+        let store = RecordingStore::failing_on(KEY_B);
+        let mut f = filled_form();
+        f.username = "tunnel-li".into();
+        f.remember = false;
+
+        let out = save(&paths, &store, &f);
+
+        // 夹具自证：确实失败了，下面两条因此不是空转。
+        assert!(matches!(out, SaveOutcome::Failed(_)), "{out:?}");
+
+        let cleared = store.cleared();
+        // 第一步（当前 key）走了。
+        assert!(cleared.contains(&KEY_B.to_string()), "{cleared:?}");
+        // **主断言**：第一步失败了，第二步（上一个 key）照样走。
+        assert!(
+            cleared.contains(&KEY_A.to_string()),
+            "第一步失败就不走了，上一个账号的密文留在了盘上：{cleared:?}"
+        );
+        // 第三步（账号记录）也走了。
+        assert!(!paths.last_account().exists(), "账号记录也没删掉");
+    }
+
+    /// **W203：账号记录写不成时，已经写进去的密文要回滚。**
+    ///
+    /// 这一支上一轮是**零覆盖**的（评审两枪双绿：把 `store.clear(&key)`
+    /// 删掉、把失败分支改成返回 `Saved`，都没有任何测试变红）——它根本
+    /// 进不去。它守的跟 W202 是同一个危害面：一份谁也找不回来的孤儿密文。
+    ///
+    /// 夹具（评审给的造法）：把 `last-account.txt` 那个**路径先建成一个
+    /// 目录**，`std::fs::write` 必失败，于是 `save` 走进回滚支。
+    ///
+    /// 改红：把那一支里的 `let _ = store.clear(&key);` 删掉，或者把
+    /// `return SaveOutcome::Failed(..)` 改成 `SaveOutcome::Saved`。
+    #[test]
+    fn a_failed_account_record_rolls_the_ciphertext_back() {
+        const KEY: &str = "tunnel-zhang@ops.example.com:443";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+        let store = store_at(&paths, FlipSealer);
+        // 路径被一个**目录**占住：`fs::write` 必失败。
+        std::fs::create_dir_all(paths.last_account()).expect("建目录");
+
+        let out = save(&paths, store.as_ref(), &filled_form());
+
+        // 夹具自证：确实走进了失败那一支，下面两条断言因此不是空转。
+        assert!(
+            matches!(out, SaveOutcome::Failed(_)),
+            "夹具没能让账号记录写失败：{out:?}"
+        );
+        // 主断言：密文回滚了。
+        assert!(
+            store.load(KEY).is_none(),
+            "账号记录写不成，密文却留在了盘上——那是一份谁也找不回来的孤儿"
+        );
+        assert_eq!(
+            sealed_files(&paths).len(),
+            0,
+            "密文目录里还剩：{:?}",
+            sealed_files(&paths)
+        );
+        // 失败的说明里不许带口令。
+        let SaveOutcome::Failed(detail) = out else {
+            unreachable!("上面刚 match 过")
+        };
+        assert!(!detail.contains(CANARY), "失败说明里带上了口令：{detail}");
+
+        // 反向自证：路径不被占住时这条路是通的（否则上面那条
+        // 「密文没了」可能只是因为压根没写进去过）。
+        let dir2 = tempfile::tempdir().expect("建临时目录");
+        let paths2 = AppPaths::at(dir2.path().to_path_buf());
+        let store2 = store_at(&paths2, FlipSealer);
+        assert_eq!(
+            save(&paths2, store2.as_ref(), &filled_form()),
+            SaveOutcome::Saved { key: KEY.into() }
+        );
+        assert!(store2.load(KEY).is_some());
+    }
+
     /// 表单不完整、或者口令是空的，什么都不做。
     #[test]
     fn an_incomplete_form_saves_nothing() {
@@ -623,6 +921,58 @@ mod tests {
                 out.push(p);
             }
         }
+        out
+    }
+
+    /// 一个记录「clear 被调了哪些 key」、并且可以在指定 key 上报错的
+    /// 假存储。`clear` 的分步语义只能这样观察。
+    #[derive(Default)]
+    struct RecordingStore {
+        cleared: std::sync::Mutex<Vec<String>>,
+        fail_on: Option<String>,
+    }
+
+    impl RecordingStore {
+        fn failing_on(key: &str) -> Self {
+            Self {
+                fail_on: Some(key.to_string()),
+                ..Self::default()
+            }
+        }
+
+        fn cleared(&self) -> Vec<String> {
+            self.cleared.lock().expect("锁").clone()
+        }
+    }
+
+    impl SecretStore for RecordingStore {
+        fn save(&self, _key: &str, _secret: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn load_outcome(&self, _key: &str) -> LoadOutcome {
+            LoadOutcome::NotRemembered
+        }
+
+        fn clear(&self, key: &str) -> std::io::Result<()> {
+            self.cleared.lock().expect("锁").push(key.to_string());
+            if self.fail_on.as_deref() == Some(key) {
+                return Err(std::io::Error::other("模拟：这个 key 清不掉"));
+            }
+            Ok(())
+        }
+    }
+
+    /// 密文目录下的 `.sealed` 文件。W202/W203 靠它数「盘上还剩几份」。
+    fn sealed_files(paths: &AppPaths) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(paths.secrets_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sealed"))
+            .collect();
+        out.sort();
         out
     }
 

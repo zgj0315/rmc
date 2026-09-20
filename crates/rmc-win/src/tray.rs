@@ -257,22 +257,40 @@ mod win {
         }
 
         /// 换图标颜色与悬停提示。
+        ///
+        /// # W201：旧图标必须等 `NIM_MODIFY` **返回之后**才能销毁
+        ///
+        /// 上一版把 `DestroyIcon(old)` 写在 `Shell_NotifyIconW` **之前**，
+        /// 而紧挨着的注释写的却是「旧图标要等这一次 `NIM_MODIFY` 之后才
+        /// 不再被通知区引用」——**代码跟自己的注释是反的**。
+        ///
+        /// 后果：在通知区仍然持有旧 `HICON` 的那个窗口期把它销毁了。
+        /// 轻则换色的一瞬间托盘图标闪一下空白，重则那个 GDI 句柄号被系统
+        /// 复用之后，Explorer 拿着它去画的是**别的对象**。
+        ///
+        /// **这一层没有任何自动化闸门看得见**（本轮 B7 那一枪已经证明：
+        /// 让换状态时永远不换图标，四道语义闸门全绿）。所以顺序只能靠
+        /// 这段说明和人工验收守，条目见 task-11-fix-1-report.md。
         pub fn set_status(&self, tooltip: &str, rgba: &[u8]) {
             let mut data = self.base();
             data.uFlags = NIF_TIP;
             data.szTip = wide::<TIP_CAP>(tooltip);
+            // 先只是把新图标记进格子，**旧的那张还留着**——通知区在下面
+            // 那次调用返回之前仍然引用它。
+            let mut replaced = None;
             if let Some(icon) = make_icon(rgba) {
                 data.uFlags |= NIF_ICON;
                 data.hIcon = icon;
-                // 旧图标要等这一次 `NIM_MODIFY` 之后才不再被通知区引用。
-                if let Some(old) = self.icon.replace(Some(icon)) {
-                    // SAFETY: `old` 是我们自己 `CreateIcon` 出来的，且已经
-                    // 被新图标顶替。
-                    let _ = unsafe { DestroyIcon(old) };
-                }
+                replaced = self.icon.replace(Some(icon));
             }
             // SAFETY: 同 `open`。
             let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+            // 到这里通知区已经改用新图标，旧的那张才轮得到销毁。
+            if let Some(old) = replaced {
+                // SAFETY: `old` 是我们自己 `CreateIcon` 出来的，通知区
+                // 已经在上面那次 `NIM_MODIFY` 里改用新图标、不再引用它。
+                let _ = unsafe { DestroyIcon(old) };
+            }
         }
 
         /// 弹一条气泡通知。
