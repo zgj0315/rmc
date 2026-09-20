@@ -589,14 +589,73 @@ mod tests {
         assert_eq!(*form.password, CANARY);
     }
 
+    /// **新密文写失败时，上一份必须还在——顺序不能反过来。**
+    ///
+    /// `save` 里清旧 key 那一步**排在新的两样都写成之后**，注释写明了
+    /// 理由：反过来的话新密文写失败时旧的那份已经被毁，用户两边都没了。
+    ///
+    /// 复审实测：把顺序改成「先清旧、后写新」，**211 条全绿**——
+    /// 因为**从来没有任何测试让 `store.save` 在存在 `previous` 时失败过**，
+    /// 而那正是这个顺序唯一守的东西。这条就是补那一枪的。
+    ///
+    /// 改红：把 `save` 里的 `store.clear(&old)` 挪到 `store.save(..)` 之前。
+    #[test]
+    fn a_failed_save_leaves_the_previous_secret_alone() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+        // 上一次记的是 A，账号记录也指着它。
+        std::fs::create_dir_all(paths.root()).expect("建目录");
+        std::fs::write(
+            paths.last_account(),
+            Account {
+                username: "tunnel-zhang".into(),
+                host: "ops.example.com".into(),
+                port: "443".into(),
+            }
+            .encode(),
+        )
+        .expect("写账号记录");
+
+        // 这一次换成别的账号，而存储写不进去。
+        let store = RecordingStore::failing_to_save();
+        let mut f = filled_form();
+        f.username = "tunnel-li".into();
+        let outcome = save(&paths, &store, &f);
+
+        assert!(
+            matches!(outcome, SaveOutcome::Failed(_)),
+            "存储写不进去却报成功了：{outcome:?}"
+        );
+        // 主断言：**旧那份一次都没被清过**。顺序反过来时这里会看到 KEY_A。
+        assert!(
+            store.cleared().is_empty(),
+            "新密文没写成，却已经把上一份清掉了：{:?}",
+            store.cleared()
+        );
+        // 反向自证：夹具真的走到了「有 previous」那条路——账号记录还在，
+        // 也就是说 `previous_key` 读得出东西来。
+        assert!(
+            paths.last_account().exists(),
+            "夹具没造出「上一次记过别的账号」这个前提"
+        );
+    }
+
     /// **重复记住同一个账号，不许把刚存进去的那一份当成「上一个」清掉。**
     ///
-    /// 这是生产里**最常发生**的一条路：用户勾着「记住密码」，每连成功
+    /// 这是生产里**最常走到**的一条路：用户勾着「记住密码」，每连成功
     /// 一次就走一遍 [`save`]，第二次起 `previous` 就等于当前 key。
     ///
-    /// 上一轮的 F5 那一枪（去掉 `filter(|p| *p != key)`）**全绿**——
-    /// 也就是说守着这条路的只有那一个 `filter`，而没有任何测试看得见它。
-    /// 补上。
+    /// # 这道筛与它守的危害面**都是本轮新引入的**，不是历史缺陷
+    ///
+    /// 复审核过 `git show 86c5cc9:…/remember.rs`：上一版的 `save` 里
+    /// **根本没有 `previous` 这个概念**，`clear` 也只有三个参数——
+    /// 每次连成功只是用同一个 key 覆盖写一遍，**不存在「把刚存的清掉」
+    /// 这条路**。所以「记住密码第二次连接就失效」这个 bug
+    /// **从来没有发生过**。
+    ///
+    /// 这道 `filter` 是修 W202（换账号留孤儿密文）时顺带开出来的新危害面，
+    /// 筛和这条测试是同一轮里配套加上的。上一版注释把它写成
+    /// 「上一轮那一枪全绿」，容易被读成「旧代码里一直有这个坑」——**不是**。
     ///
     /// 改红：把 `save` 末尾 `previous.filter(|p| *p != key)` 里的
     /// `filter` 去掉——第二次「记住」会把自己刚存的密文清掉，下次启动
@@ -643,8 +702,21 @@ mod tests {
     /// 没有任何测试让 `store.clear` 失败过。补上，用一个会在指定 key 上
     /// 报错的假存储。
     ///
-    /// 改红：把 `clear` 里的 `result = result.and(store.clear(old));`
-    /// 换成 `store.clear(old)?;` 那一类提前返回的写法。
+    /// 改红：把 `clear` 里的 `let mut result = store.clear(key);` 换成
+    /// `store.clear(key)?;`。
+    ///
+    /// # 这条注释上一版是假的，订正记在这里
+    ///
+    /// 上一版写的是「把 `result = result.and(store.clear(old));` 换成
+    /// `store.clear(old)?;`」——**复审按字面注入，实测 211 全绿**。
+    /// 原因看得很清楚：这条测试让**第一步**（当前 key）失败，而那个 `?`
+    /// 挂在**第二步**（旧 key，它是成功的）上，早返根本不触发。
+    ///
+    /// 所以这条测试守的是「**第一步**失败也要走完后面几步」，
+    /// 而 **`clear` 第二步的早返至今零覆盖**——真发生时会跳过删账号记录，
+    /// 用户点了「不再记住密码」而 `last-account.txt` 还在。
+    /// 要覆盖它只需把 `RecordingStore::failing_on` 的目标换成旧 key，
+    /// 按 W206 记账不修。
     #[test]
     fn clearing_finishes_every_step_even_after_the_first_one_fails() {
         const KEY_A: &str = "tunnel-zhang@ops.example.com:443";
@@ -930,12 +1002,21 @@ mod tests {
     struct RecordingStore {
         cleared: std::sync::Mutex<Vec<String>>,
         fail_on: Option<String>,
+        /// `save` 一律失败。用来观察 `save` 里「先写新、后清旧」那个顺序。
+        save_fails: bool,
     }
 
     impl RecordingStore {
         fn failing_on(key: &str) -> Self {
             Self {
                 fail_on: Some(key.to_string()),
+                ..Self::default()
+            }
+        }
+
+        fn failing_to_save() -> Self {
+            Self {
+                save_fails: true,
                 ..Self::default()
             }
         }
@@ -947,6 +1028,9 @@ mod tests {
 
     impl SecretStore for RecordingStore {
         fn save(&self, _key: &str, _secret: &str) -> std::io::Result<()> {
+            if self.save_fails {
+                return Err(std::io::Error::other("假存储：写不进去"));
+            }
             Ok(())
         }
 
