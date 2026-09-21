@@ -51,12 +51,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 控件多半要用。
 #
 # **`default-features = false` 的一个副作用**：0.14 把 `x11` 与 `wayland`
-# 放进了 `default`（`iced-0.14.0/Cargo.toml:63-72`），所以这份配置在 Linux
-# 上**没有窗口后端**——`cargo run -p rmc-app` 起不来窗口。本产品是 Windows
-# 客户端，不打算为此加 feature；但 `cargo test -p rmc-app` 在 Linux 上是
-# 能跑也应该跑的（`iced_test` 是无头模拟器，不碰 winit 的窗口创建路径），
-# 所以**刻意没用 `compile_error!` 去拦**：那是按 target 判而不是按用途判，
-# 会把 Linux 上的 `cargo test --workspace` 一并拦掉。
+# 放进了 `default`（`iced-0.14.0/Cargo.toml:63-72`），所以这一条依赖单独看
+# 在 Linux 上**没有窗口后端**。Linux 那一档在下面的 target 表里单独补
+# ——见那里的说明，这段话原先的结论是推错了的。
 iced = { version = "0.14", default-features = false, features = [
   "tiny-skia",
   "tokio",
@@ -105,6 +102,28 @@ rmc-win = { path = "../rmc-win" }
 # 依赖边。
 tokio.workspace = true
 
+
+# **Linux 上必须给 iced 开一个窗口后端，否则整个 crate 编不过。**
+#
+# 这是第一次把 CI 推上 GitHub 才暴露的：`linux-checks` 在 clippy 那一步红，
+# `softbuffer` 报 25 条 E0004 / E0392 / E0282。根因：`iced_tiny_skia` 以
+# `default-features = false` 依赖 softbuffer，而 softbuffer 的 Linux 后端
+# （x11 / wayland / kms）**全靠 feature 开**，只能从 `iced/x11` 或
+# `iced/wayland` 传下来。`[dependencies]` 里那条 `default-features = false`
+# 把两个都关了，于是 Linux 上 softbuffer **零后端**、后端枚举是空的。
+# macOS 与 Windows 上它的后端按 target 自动选，所以本机与两条 windows-gnu
+# 闸门都看不见。
+#
+# 原先的注释写「`cargo test -p rmc-app` 在 Linux 上是能跑也应该跑的」
+# ——**那是推理不是实测，而且推错了**：不是「起不来窗口」，是「编不过」。
+#
+# 在 `rust:1.89` 容器里用最小探针两头验证过：softbuffer 零 feature →
+# 与 CI 同款错误；开 `x11` + `x11-dlopen`（`iced/x11` 传下来的正是这两个）
+# → 编过。**x11 那一套全是 dlopen，不需要装任何系统包。**
+# 只开 x11 不开 wayland：产品是 Windows 客户端，Linux 上只要能编、能跑
+# 无头测试；依赖面比两个都开小。
+[target.'cfg(target_os = "linux")'.dependencies]
+iced = { version = "0.14", default-features = false, features = ["x11"] }
 
 [dev-dependencies]
 # headless 控件树断言。只在测试期编译，不进发布二进制。

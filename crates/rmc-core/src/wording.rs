@@ -76,6 +76,25 @@ pub struct SourceLiteral {
     pub text: String,
 }
 
+/// 相对路径的**平台无关**写法：各段之间一律用 `/`。
+///
+/// 第一次把 CI 推上 GitHub，`windows-build` 当场红在
+/// `the_scan_really_reaches_this_crates_source`：锚点表里 `lib.rs`、
+/// `theme.rs`、`form.rs` 三条都过了，红的恰好是**第一条带分隔符的**
+/// `view/maintain.rs`。根因是这里原先用 `Path::display()`——Windows 上它
+/// 渲染成 `view\maintain.rs`，而锚点表写的是 `/`。豁免表（`ALLOWED`）按
+/// 同一个字段比对，今天唯一一条是不带目录的 `config.rs`，所以没撞上；
+/// 哪天豁免一个子目录里的文件，就会是同一个坑。
+///
+/// 这个 bug 在 macOS / Linux 上**结构上不可见**（两种写法渲染出来一样），
+/// 只有 Windows job 验得到——那条锚点测试就是它的回归测试。
+fn portable_name(rel: &std::path::Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// 扫一个 crate 的 `src/` 目录，返回其中**生产代码**里的全部字符串字面量。
 ///
 /// `skip_files` 按文件名（不含目录）整个跳过，例如 `wording.rs`。
@@ -119,11 +138,7 @@ pub fn scan_string_literals(src_root: &Path, skip_files: &[&str]) -> Vec<SourceL
             if skip_files.contains(&base) {
                 continue;
             }
-            let file = path
-                .strip_prefix(src_root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
+            let file = portable_name(path.strip_prefix(src_root).unwrap_or(&path));
             let text = std::fs::read_to_string(&path).expect("读源文件");
             for (line, logical) in join_continuations(&text) {
                 let trimmed = logical.trim_start();

@@ -54,7 +54,14 @@ const STEP_MANIFEST_CHECK: &str = "确认清单已嵌入";
 const STEP_UPLOAD: &str = "上传便携包";
 
 /// 两个 job 的测试步骤跑的都是这一条，一个字都不能多、不能少。
-const TEST_COMMAND: &str = "cargo test -p rmc-win -p rmc-app";
+// `--no-fail-fast` 是这条命令里**唯一**允许的附加项，而且是刻意的：
+// 第一次真跑 CI 时 `tests/wording.rs` 一红，cargo 就停在那里——rmc-win 那
+// 152 条在 Windows 上**一条都没跑到**。（那 152 条全是纯逻辑层的：
+// `#[cfg(windows)]` 那几层 Win32 封装**没有任何测试**，这条命令跑不到
+// DPAPI、托盘、电源事件；它验的是同一批逻辑在 Windows 的 std 与文件系统
+// 语义下成不成立。）每暴露一个问题就是一轮 20 分钟。它不削弱任何东西：
+// 有失败时退出码仍然非零，只是把所有测试目标跑完、一次把失败报全。
+const TEST_COMMAND: &str = "cargo test -p rmc-win -p rmc-app --no-fail-fast";
 const CLIPPY_COMMAND: &str = "cargo clippy -p rmc-win -p rmc-app --all-targets -- -D warnings";
 
 // 会让这条测试变红的实现改法：删掉两个 job 里的任意一个、改名、或者再加

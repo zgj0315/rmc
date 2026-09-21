@@ -118,12 +118,23 @@ pub fn monospace_family(os: &str) -> Option<&'static str> {
     }
 }
 
-/// 本机该用的那个字体。
-fn mono() -> Font {
-    match monospace_family(std::env::consts::OS) {
+/// 给定族名（或者没有）该用哪个字体。
+///
+/// **从 [`mono`] 里拆出来，是为了让 `None` 那一支在每台机器上都验得到。**
+/// 它在生产里只有「不认识的系统」才会走到，而开发机（macOS）与产品
+/// （Windows）都不是——第一次把 CI 推上 GitHub 之前，这一支**从来没被
+/// 任何一次测试执行过**，Linux job 是它头一回被跑到的地方。
+fn font_for(family: Option<&'static str>) -> Font {
+    match family {
         Some(name) => Font::with_name(name),
+        // **不能是 `Font::MONOSPACE`**，理由见 [`monospace_family`]。
         None => Font::default(),
     }
+}
+
+/// 本机该用的那个字体。
+fn mono() -> Font {
+    font_for(monospace_family(std::env::consts::OS))
 }
 
 /// 日志列表里的一行：时间、等级、正文。
@@ -427,12 +438,25 @@ mod tests {
         assert_eq!(monospace_family("macos"), Some("Menlo"));
         assert_eq!(monospace_family("freebsd"), None);
         assert_eq!(monospace_family("linux"), None);
-        // 本机这一档必须有字体，否则下面那条渲染测试是在测"默认字体
-        // 能不能画中文"，跟等宽一个关系都没有。
-        assert!(
-            monospace_family(std::env::consts::OS).is_some(),
-            "这台机器这一档没有等宽字体，下面那条渲染测试会空转"
-        );
+        // 这里原先还有一句「本机这一档必须有字体」。**它是一条环境假设，
+        // 不是一条性质**：上面第四格刚钉住 Linux 这一档是 `None`，那一句
+        // 却要求本机是 `Some`——两句在 Linux 上自相矛盾。本机（macOS）上
+        // 它恒真，所以一直没人看见；第一次在 Linux CI 上跑就红了。
+        // 「没有族名的那一档该怎么办」由下面那条 `font_for` 的测试钉。
+    }
+
+    /// 不认识的系统退回默认字体——**而不是 `Font::MONOSPACE`**。
+    ///
+    /// 这一支在生产里只有 Linux 之类才走到。拆成收 `Option` 的纯函数
+    /// 之后，它在这台 macOS 上也验得到。
+    ///
+    /// 改红：把 `font_for` 的 `None` 那一支改成 `Font::MONOSPACE`
+    /// （最顺手的「改进」——「没有族名就用泛等宽」）——前两格红。
+    #[test]
+    fn a_system_without_a_known_family_falls_back_to_the_default_font() {
+        assert_eq!(font_for(None), Font::default());
+        assert_ne!(font_for(None), Font::MONOSPACE);
+        assert_eq!(font_for(Some("Consolas")), Font::with_name("Consolas"));
     }
 
     /// **本机选的那个等宽字体画得出中文，不会把渲染管线炸掉。**
@@ -452,6 +476,10 @@ mod tests {
     ///    立刻红，而且**不会炸**；
     /// 2. **行为上**真的用本机这个族去渲染一段中文——族名要是写错
     ///    （比如 Windows 那一档写成一个不存在的字体），这条当场 panic。
+    ///
+    /// 在没有族名的那一档（Linux CI）上，`mono()` 就是默认字体，这条
+    /// 测的是 [`monospace_family`] 文档里那句「回到默认比例字体……但
+    /// **不会崩**」。
     #[test]
     fn the_monospace_font_really_draws_chinese() {
         // 第一半：结构。
@@ -461,9 +489,11 @@ mod tests {
             "又用回 Font::MONOSPACE 了——它绑在一个通常没装的族上，\
              中文会让渲染管线溢出 panic，见 monospace_family 的文档"
         );
+        // 不 `.expect()` 本机有族名：Linux 那一档按设计就是 `None`
+        // （第一次上 Linux CI 就是死在那个 `.expect` 上）。
         assert_eq!(
             mono(),
-            Font::with_name(monospace_family(std::env::consts::OS).expect("本机该有等宽字体")),
+            font_for(monospace_family(std::env::consts::OS)),
             "用的不是 monospace_family 给出的那个族"
         );
 
