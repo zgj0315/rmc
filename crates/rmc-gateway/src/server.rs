@@ -450,16 +450,27 @@ mod tests {
     ///
     /// 改红：`max_auth_attempts` 改回默认的 10——第 4 次不会被切断
     /// （连接还能继续认证），下面 `within` 会等到 20 秒超时 panic。
+    ///
+    /// **修复轮 1/5**：循环里原来是
+    /// `r.map(|a| !a.success()).unwrap_or(true)`——`r` 是 `Err` 时
+    /// `unwrap_or(true)` 直接放行，跟这句断言自己的文案「不是连接错误」
+    /// 自相矛盾。回归场景：如果 `max_auth_attempts` 被误改成 1，第 2 次
+    /// `authenticate_password` 在 russh 内部 `rejection_count(1) >= max(1)`
+    /// 那道检查上就会被直接断开（连 `auth_password` 都不会被调用），
+    /// `r` 变成 `Err`，旧断言照样放行，循环外「三次之后…」那句在已经关闭
+    /// 的连接上自然成立——整条测试全绿，但服务端实际只给了 1 次机会。
+    /// 改用 `match`：`Err` 直接 `panic!`，不再被 `unwrap_or` 悄悄吞掉。
+    /// 改红：把 `max_auth_attempts` 改成 `1`（实测记录见
+    /// task-4-report.md「修复轮 1/5」：修复前这一改仍然绿，修复后才红）。
     #[tokio::test]
     async fn three_failures_end_the_connection() {
         let (srv, _pw, _tmp) = server_with_account("zhang").await;
         let mut s = within("connect", ssh_connect(srv.local_addr())).await;
         for n in 1..=3 {
-            let r = within("第几次认证", s.authenticate_password("zhang", "wrong")).await;
-            assert!(
-                r.map(|a| !a.success()).unwrap_or(true),
-                "第 {n} 次应当是普通的认证失败，不是连接错误"
-            );
+            match within("第几次认证", s.authenticate_password("zhang", "wrong")).await {
+                Ok(a) => assert!(!a.success(), "第 {n} 次不该认证成功"),
+                Err(e) => panic!("第 {n} 次应当是普通的认证失败，不是连接错误：{e}"),
+            }
         }
         let r = within("第四次", s.authenticate_password("zhang", "wrong")).await;
         assert!(
