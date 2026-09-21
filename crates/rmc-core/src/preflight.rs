@@ -687,10 +687,17 @@ mod tests {
     // 都抓不住"指纹校验被关掉"这类回归——如果 `wrap_tls` 的校验器被换成
     // 一个永远接受的实现，"指纹对"那条照样绿。
     //
-    // 改红：把 `PinnedServer::verify_server_cert`（`transport/tls.rs`）
-    // 里的 `!=` 改成 `==`——下面第一条（指纹对）会红（合法连接反而被
-    // 判定失配），第二条（指纹错）会变绿（错误的指纹反而被接受，
-    // 也就是这条测试想抓的那类回归本身）。
+    // 改红（**实测过**，见 `transport/tls.rs` 里同一处「改红」注释的
+    // 订正，这里同步改一遍——不能一处订正、另一处留着旧的错预测）：
+    // 把 `PinnedServer::verify_server_cert`（`transport/tls.rs`）里的
+    // `!=` 改成 `==`——**两条都会红，不是"这条红、下一条变绿"**：下面
+    // 第一条（指纹对）红是因为合法连接反而被判定失配，`assert!(r.passed()
+    // , ...)` 直接 panic；第二条（指纹错）**也红**，因为错误的指纹反而
+    // 握成了功，那条测试断言"第四步必须是 Fail 且 class == Fatal"的
+    // `match` 落到 `other` 分支上 panic（实测：`Pass { detail: "TLS
+    // 1.3 · 指纹与连接码一致" }`）——"握成"这个事实本身没错，但它让
+    // **断言**失败，不是让测试**通过**。两条同时红，指向同一处：判等
+    // 条件被翻转。
 
     #[tokio::test]
     async fn all_four_steps_pass_when_the_fingerprint_matches() {

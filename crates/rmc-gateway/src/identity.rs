@@ -340,16 +340,78 @@ mod tests {
     /// 不经过 rustls 的客户端 API，工作区里没有任何人再需要 `tls12`
     /// 这个 feature，`tls12_is_not_compiled_in` 的保证对整个工作区都
     /// 成立，不只是对 `rmc-core` 单独编译时成立。
+    ///
+    /// R——修复轮 1/5（评审 Critical）：第一版这里的扩展区是空的
+    /// （extensions 长度 0）。评审实测：rustls 0.23.45
+    /// 在**任何版本协商发生之前**就无条件要求 `signature_algorithms`
+    /// 扩展存在（`server/hs.rs:769-777`），空扩展区会在这一步就被拒——
+    /// 拒绝原因是 `SignatureAlgorithmsExtensionRequired`，跟服务端支持
+    /// 哪些 TLS 版本完全无关。评审复现过：同一份握手打给"只开 1.3"与
+    /// "1.2+1.3 都开"两种服务端配置，报错**一模一样**，那条测试测不出
+    /// "只开 1.3"这件事本身——把 `with_protocol_versions(&[&TLS13])`
+    /// 整个删掉（等于把 1.2 加回来），旧版测试依然通过。
+    ///
+    /// 这一版补上三个扩展（`signature_algorithms`/`supported_groups`/
+    /// `ec_point_formats`），并用一个 rustls **真正实现**的 TLS 1.2
+    /// 套件（`0xc02b`，`TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`）——
+    /// **仍然不放 `supported_versions` 扩展**，这才是这条测试的关键：
+    /// 不声明支持 1.3，逼服务端按 `legacy_version` 走版本协商。
+    /// `signature_algorithms`/`supported_groups`/`ec_point_formats`
+    /// 三个扩展只是让握手**走过**"必需扩展"这一关，不代表握手会真的
+    /// 完整走完（本 crate 的身份用 Ed25519 证书，跟 `0xc02b` 要求的
+    /// ECDSA 证书本来就不匹配，1.2/1.3 都开的服务端会在版本协商之后的
+    /// 套件选择这一步另外报错，两种配置因此仍然都以 `Err` 收尾，但
+    /// **拒绝的原因不同**——见下面 `tls_config_is_13_only` 上贴出的
+    /// 实测输出）。
     fn legacy_hello_without_supported_versions() -> Vec<u8> {
+        /// 编码一个 TLS 扩展：`type`(2) + `length`(2) + `body`。
+        fn extension(ty: u16, body: &[u8]) -> Vec<u8> {
+            let mut out = ty.to_be_bytes().to_vec();
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            out.extend_from_slice(body);
+            out
+        }
+
+        // signature_algorithms（0x000d）：一份 rustls 会认的算法列表，
+        // 不含 ed25519 也不含 RSA——只是要让"必需扩展存在"这一关过去，
+        // 具体这份列表跟证书类型配不配不重要（配不配是套件选择那一步
+        // 才会看的事，见上面的文档）。
+        let sig_algs: &[u16] = &[
+            0x0403, // ecdsa_secp256r1_sha256
+            0x0503, // ecdsa_secp384r1_sha384
+            0x0804, // rsa_pss_rsae_sha256
+            0x0401, // rsa_pkcs1_sha256
+        ];
+        let mut sig_algs_body = (sig_algs.len() as u16 * 2).to_be_bytes().to_vec();
+        for a in sig_algs {
+            sig_algs_body.extend_from_slice(&a.to_be_bytes());
+        }
+
+        // supported_groups（0x000a）：secp256r1、x25519。
+        let groups: &[u16] = &[0x0017, 0x001d];
+        let mut groups_body = (groups.len() as u16 * 2).to_be_bytes().to_vec();
+        for g in groups {
+            groups_body.extend_from_slice(&g.to_be_bytes());
+        }
+
+        // ec_point_formats（0x000b）：uncompressed。
+        let point_formats_body = vec![0x01u8, 0x00];
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&extension(0x000d, &sig_algs_body));
+        extensions.extend_from_slice(&extension(0x000a, &groups_body));
+        extensions.extend_from_slice(&extension(0x000b, &point_formats_body));
+
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // legacy_version = TLS 1.2
         body.extend_from_slice(&[0u8; 32]); // random
         body.push(0x00); // session_id 长度 0
         body.extend_from_slice(&[0x00, 0x02]); // cipher_suites 长度 2
-        body.extend_from_slice(&[0x00, 0x2f]); // TLS_RSA_WITH_AES_128_CBC_SHA
+        body.extend_from_slice(&[0xc0, 0x2b]); // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
         body.push(0x01); // compression_methods 长度 1
         body.push(0x00); // null 压缩
-        body.extend_from_slice(&[0x00, 0x00]); // extensions 长度 0——刻意不放 supported_versions
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions); // 刻意不放 supported_versions
 
         let mut handshake = vec![0x01]; // ClientHello
         let len = body.len() as u32;
@@ -362,20 +424,11 @@ mod tests {
         record
     }
 
-    /// TLS 配置只开 1.3。改红：`with_protocol_versions` 里加上 `TLS12`
-    /// ——但这一行本身已经编不出来了（`rustls::version::TLS12` 需要
-    /// `tls12` feature，本 crate 与 rmc-core 都没开），得先把 `Cargo.
-    /// toml` 里 `rustls` 的 `features` 加回 `"tls12"` 才谈得上改这一行；
-    /// 真正等价的改红是把 `with_protocol_versions(&[&rustls::version::
-    /// TLS13])` 换成 `rustls::ServerConfig::builder()`（默认支持
-    /// 1.2/1.3 两个版本）——本地验证过：改完这条测试会因为服务端接受了
-    /// 这份只到 1.2 的 ClientHello 而在 `assert!` 上失败。
-    #[tokio::test]
-    async fn tls_config_is_13_only() {
+    /// 让一份手写 ClientHello 打给给定的 `rustls::ServerConfig`，返回
+    /// `accept()` 的错误文本（这条测试只关心拒绝的**原因**，不关心
+    /// 握手能不能走完，所以只取 `Display`）。
+    async fn hello_against(cfg: std::sync::Arc<rustls::ServerConfig>) -> String {
         use tokio::io::AsyncWriteExt;
-
-        let id = Identity::generate();
-        let cfg = id.tls_server_config().unwrap();
         let (mut c, s) = tokio::io::duplex(64 * 1024);
         let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
         let srv = tokio::spawn(async move { acceptor.accept(s).await.map(|_| ()) });
@@ -383,11 +436,62 @@ mod tests {
             .await
             .unwrap();
         drop(c);
-        let r = srv.await.unwrap();
+        match srv.await.unwrap() {
+            Ok(()) => panic!("握手不该在这份手写 ClientHello 上完整走完"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// TLS 配置只开 1.3：一份不声明支持 1.3（没有 `supported_versions`
+    /// 扩展）、`legacy_version` 只到 1.2 的 ClientHello，必须在**版本
+    /// 协商**这一步被拒——不是在"必需扩展缺失"这种跟版本无关的地方被拒
+    /// （修复轮 1/5 订正的那个假绿），也不是随便哪种畸形握手都会撞上的
+    /// 拒绝。
+    ///
+    /// **实测过**（下面两条互为参照，同一份 ClientHello 字节，只换服务端
+    /// 配置；(b) 那一档因为需要真的构造一个 TLS 1.2 也开的
+    /// `rustls::ServerConfig`，本工作区已经不带 `tls12` feature，编不出
+    /// 来——是在一次临时实验里量出来的：把 `crates/rmc-gateway/Cargo.
+    /// toml` 里 `rustls` 的 `features` 临时加回 `"tls12"`，另起一个
+    /// `rustls::ServerConfig::builder().with_no_client_auth().
+    /// with_single_cert(...)`（不显式限定版本，默认 1.2/1.3 都收），打
+    /// 同一份手写 ClientHello，量完立刻把 `Cargo.toml` 与代码改动整个
+    /// 还原，`diff` 核对与备份逐字节一致）：
+    ///
+    /// ```text
+    /// (a) 只开 1.3（本 crate 实际产出的配置）：
+    ///     peer is incompatible: SupportedVersionsExtensionRequired
+    /// (b) 1.2 与 1.3 都开（临时实验用的配置，本工作区实际编不出来）：
+    ///     unexpected error: incompatible signing key
+    /// ```
+    ///
+    /// 两条文案不同，证明 (a) 那条拒绝确实发生在**版本协商**这一步，不是
+    /// 随便什么理由都能撞上的通用失败——(b) 的具体文案会随 rustls 版本/
+    /// 证书类型变化（这里的身份是 Ed25519 证书，跟手写 ClientHello 里
+    /// `0xc02b` 要求的 ECDSA 套件本来就不匹配，1.2/1.3 都开的服务端在
+    /// 版本协商**通过之后**的签名密钥匹配这一步另外报错），所以下面的
+    /// 断言只锁 (a) 那条文案，不去锁 (b)——(b) 本身也无法在本工作区的
+    /// 正常构建里被断言到，它只用来在这条文档里留一份"确实测过、两者不
+    /// 同"的证据。
+    ///
+    /// 改红（**真打过**，用的是上面同一次临时实验：`tls12` feature 临时
+    /// 加回、同时把 `tls_server_config()` 里
+    /// `.with_protocol_versions(&[&rustls::version::TLS13])` 改成
+    /// `.with_protocol_versions(&[&rustls::version::TLS12,
+    /// &rustls::version::TLS13])`）：这条测试当场 panic，`assert!` 的
+    /// 失败消息里"实际却是"后面跟着的正是 (b) 那条文案
+    /// （`unexpected error: incompatible signing key`）——证明这条测试
+    /// 真的会在"服务端不再只开 1.3"时红，而不是对什么配置都视而不见。
+    #[tokio::test]
+    async fn tls_config_is_13_only() {
+        let id = Identity::generate();
+        let tls13_only = id.tls_server_config().unwrap();
+        let err_tls13_only = hello_against(tls13_only).await;
         assert!(
-            r.is_err(),
-            "只开 1.3 的服务端不该接受一个没有 supported_versions 扩展、\
-             legacy_version 只到 1.2 的 ClientHello"
+            err_tls13_only.contains("SupportedVersionsExtensionRequired"),
+            "只开 1.3 的服务端拒绝一份没有 supported_versions 扩展、\
+             legacy_version 只到 1.2 的 ClientHello，理由应该是版本协商，\
+             实际却是：{err_tls13_only}"
         );
     }
 }
