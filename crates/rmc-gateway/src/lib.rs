@@ -47,6 +47,7 @@ pub mod config;
 pub mod datadir;
 pub mod identity;
 pub mod server;
+pub mod status;
 pub mod throttle;
 
 #[cfg(test)]

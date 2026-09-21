@@ -94,22 +94,22 @@ pub struct ServerConfig {
 }
 
 /// 一条隧道在服务端这一侧的全部状态。Task 6 的吊销扫描与 Task 7 的
-/// `status.json` 都读这张表（经 `Running::tunnels_snapshot`），本任务只写。
+/// `status.json` 都读这张表（经 `Running::tunnels_snapshot`）。
 ///
-/// **偏离 brief 字面 Step 3**：brief 的伪代码里还有一个 `since:
-/// SystemTime` 字段。本任务的 `tunnels_snapshot` 契约元组
-/// `(AccountName, u16, SocketAddr, usize)`（brief 自己「Produces」那节给的
-/// 签名）里没有它的位置，本任务也没有别的读者——加上就是又一个「只写不读
-/// 的字段」，`clippy -D warnings` 的 `dead_code` 当场红（这正是 Task 4
-/// 那条「`account` 字段只写不读」踩过的坑，也是这份 GLOBAL.md 里反复强调
-/// 的原则）。等 Task 6/7 真要展示隧道存活时长时再加，到时候顺带扩一下
-/// `tunnels_snapshot` 的元组形状（或另开一个访问器），「字段有读者」这个
-/// 前提自然就满足了。
+/// **`since` 字段：Task 5/6 当时没加，Task 7 把它加回来**——Task 5 的
+/// 判断是对的（那时 `tunnels_snapshot` 的元组里没它的位置、加了就是只写
+/// 不读，会被 `dead_code` 打红），但那条「以后加回来是一行的事」的说法
+/// 被评审订正过：现在 `status.json` 的 `TunnelStatus.since`
+/// 真的要读这个字段，所以这里连同 `tunnels_snapshot` 的元组签名
+/// 一起扩（追加在末尾，不打乱既有的 `.1`/`.3` 索引），不是只加这一个字段。
 pub(crate) struct TunnelInfo {
     pub port: u16,
     pub peer: SocketAddr,
     pub engineers: Arc<AtomicUsize>,
     pub stop: watch::Sender<bool>,
+    /// 这条隧道建立的时间点（`tcpip_forward` 成功那一刻），给
+    /// `status.json` 的 `TunnelStatus.since` 用。
+    pub since: std::time::SystemTime,
     /// 这条隧道所属会话的 `Handle`，给吊销扫描（`revocation_sweep`）用。
     ///
     /// **选择存这里，而不是去 `Shared.connections`（按来源地址索引）里查**：
@@ -164,6 +164,7 @@ impl Drop for TunnelGuard {
                 port: info.port,
                 reason: "会话结束".to_string(),
             });
+            self.shared.publish_status();
         }
     }
 }
@@ -192,6 +193,10 @@ pub(crate) struct Shared {
     pub ssh: Arc<russh::server::Config>,
     pub accounts: AccountReader,
     pub timings: Timings,
+    /// 数据目录与真实监听地址：`publish_status` 写 status.json 用。
+    pub data: DataDir,
+    pub listen: SocketAddr,
+    pub fingerprint: ServerFingerprint,
     /// 反向端口绑在哪个地址上（生产 0.0.0.0，测试 127.0.0.1）。
     pub reverse_bind: IpAddr,
     pub engineer_allow: Vec<Cidr>,
@@ -234,6 +239,38 @@ pub(crate) struct Shared {
     pub audit: AuditLog,
 }
 
+impl Shared {
+    /// 把当前隧道表快照原子写进 status.json；调用点三处：
+    /// `tcpip_forward` 成功建隧道后、`TunnelGuard::drop`（隧道落幕）里、
+    /// `revocation_sweep` 每个 tick（哪怕这一轮没有吊销发生，也要刷新
+    /// `updated_unix`——这正是 `status::is_live` 那条 30 秒判据得以
+    /// 成立的前提：没有这一刷，一台正常运行但恰好没有隧道起落的服务端
+    /// 会在 30 秒后被 `status` 误判成「没在跑」）。写失败只记日志，不
+    /// 影响服务本身——status.json 是自省用的旁路，不是关键路径。
+    pub(crate) fn publish_status(&self) {
+        let tunnels = lock(&self.tunnels)
+            .iter()
+            .map(|(name, info)| crate::status::TunnelStatus {
+                account: name.to_string(),
+                port: info.port,
+                peer: info.peer.to_string(),
+                since: crate::status::since_text(info.since),
+                engineers: info.engineers.load(Ordering::SeqCst),
+            })
+            .collect();
+        let st = crate::status::Status {
+            pid: std::process::id(),
+            updated_unix: crate::status::now_unix(),
+            listen: self.listen.to_string(),
+            fingerprint: self.fingerprint.to_string(),
+            tunnels,
+        };
+        if let Err(e) = crate::status::write(&self.data, &st) {
+            tracing::warn!(error = %e, "写 status.json 失败");
+        }
+    }
+}
+
 pub struct Server;
 
 pub struct Running {
@@ -251,8 +288,8 @@ impl Running {
     pub fn fingerprint(&self) -> ServerFingerprint {
         self.fingerprint
     }
-    /// 测试与（Task 7）status 用：当前每条隧道的账号名、端口、来源地址、
-    /// 在线工程师连接数。
+    /// 测试与 status 用：当前每条隧道的账号名、端口、来源地址、
+    /// 在线工程师连接数、建立时间。
     ///
     /// **偏离 brief 字面**：brief 的接口表把这个方法写成不带可见性限定
     /// （在 gateway 自己的模块体系里那就是 `pub(crate)`）。本任务实测发现
@@ -264,7 +301,14 @@ impl Running {
     /// `pub`——它们本来就是给外部消费者（未来的 `cli.rs`/`status.rs`，
     /// 乃至这个 crate 之外的调用方）看服务器状态的自省接口，这个方法性质
     /// 一样。
-    pub fn tunnels_snapshot(&self) -> Vec<(AccountName, u16, SocketAddr, usize)> {
+    ///
+    /// **元组签名在 Task 7 扩了一格**：追加 `SystemTime`（建立时间）在
+    /// 末尾，不打乱既有的 `.1`（端口）/`.3`（工程师数）索引——`server.rs`
+    /// 自己 `mod tests` 里已有的那几处 `tunnels_snapshot()[0].1` 等写法
+    /// 不用跟着改。新读者（`Shared::publish_status`）用 `.4`。
+    pub fn tunnels_snapshot(
+        &self,
+    ) -> Vec<(AccountName, u16, SocketAddr, usize, std::time::SystemTime)> {
         lock(&self.shared.tunnels)
             .iter()
             .map(|(name, info)| {
@@ -273,6 +317,7 @@ impl Running {
                     info.port,
                     info.peer,
                     info.engineers.load(Ordering::SeqCst),
+                    info.since,
                 )
             })
             .collect()
@@ -314,6 +359,9 @@ impl Running {
         let _ = self.stop.send(true);
         self.accept_task.abort();
         let _ = self.accept_task.await;
+        // 干净退出：删掉 status.json，`status` 子命令不用等满 30 秒的
+        // `STALE_AFTER_SECS` 才能如实说「没有在跑」。
+        let _ = std::fs::remove_file(self.shared.data.status());
     }
 }
 
@@ -333,8 +381,16 @@ impl Server {
             nodelay: true,
             ..Default::default()
         });
+        let listener = tokio::net::TcpListener::bind(cfg.listen)
+            .await
+            .map_err(|e| Error::Listen(format!("{}：{e}", cfg.listen)))?;
+        // `Shared.listen` 要存**真实**的监听地址（`cfg.listen` 可能是
+        // `:0`，交给操作系统挑一个空闲端口），`status.json` 里的 `listen`
+        // 字段才对得上运维实际连过去要用的地址——所以 bind 要排在建
+        // `Shared` 之前。
+        let local_addr = listener.local_addr()?;
         // 建好之后立刻 clone 进 accept 任务，不要整个 move：`Running` 也存了
-        // 一份（`tunnels_snapshot`），Task 6/7 的吊销扫描与发布状态都从
+        // 一份（`tunnels_snapshot`），吊销扫描与发布状态都从
         // `Running.shared` 再拿一份。
         let audit = AuditLog::open(&cfg.data)?;
         let shared = Arc::new(Shared {
@@ -342,6 +398,9 @@ impl Server {
             ssh,
             accounts: AccountReader::new(&cfg.data),
             timings: cfg.timings.clone(),
+            data: cfg.data.clone(),
+            listen: local_addr,
+            fingerprint,
             reverse_bind: cfg.reverse_bind,
             engineer_allow: cfg.engineer_allow.clone(),
             tunnels: Mutex::new(HashMap::new()),
@@ -349,13 +408,12 @@ impl Server {
             throttle: Throttle::new(cfg.limits.clone()),
             audit,
         });
-        let listener = tokio::net::TcpListener::bind(cfg.listen)
-            .await
-            .map_err(|e| Error::Listen(format!("{}：{e}", cfg.listen)))?;
-        let local_addr = listener.local_addr()?;
         shared.audit.record(AuditEvent::ServerStart {
             listen: local_addr.to_string(),
         });
+        // 立刻写一次 status.json（空表）：`serve` 起来那一刻，`status`
+        // 就能看到「运行中」，不用等第一次隧道起落或第一个扫描周期。
+        shared.publish_status();
         let (stop, mut stop_rx) = watch::channel(false);
         let accept_shared = shared.clone();
         let accept_task = tokio::spawn(async move {
@@ -400,6 +458,19 @@ impl Server {
     }
 }
 
+/// `serve` 子命令的骨架：绑定、跑到 `stop` 完成、干净收尾。`serve` 用
+/// `tokio::signal::ctrl_c()` 当 `stop`；测试用 `oneshot::Receiver`。
+pub async fn serve_until(
+    cfg: ServerConfig,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let running = Server::bind(cfg).await?;
+    tracing::info!(listen = %running.local_addr(), fingerprint = %running.fingerprint(), "运维服务器已启动");
+    stop.await;
+    running.shutdown().await;
+    Ok(())
+}
+
 /// 每个扫描周期检查一次：账号已被吊销（`accounts.toml` 里 `enabled =
 /// false`）但隧道表里还有它的条目，就发 `disconnect` 让对应会话自己收尾
 /// （摘表、释放端口由 `TunnelGuard::drop` 完成，这里不重复做）。同一个
@@ -422,6 +493,7 @@ async fn revocation_sweep(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) 
                         .await;
                 }
                 shared.audit.prune(crate::audit::RETENTION_DAYS);
+                shared.publish_status();
             }
         }
     }
@@ -748,6 +820,7 @@ impl russh::server::Handler for ConnHandler {
                     peer: self.peer,
                     engineers: Arc::new(AtomicUsize::new(0)),
                     stop,
+                    since: std::time::SystemTime::now(),
                     handle: session.handle(),
                 },
             );
@@ -806,6 +879,7 @@ impl russh::server::Handler for ConnHandler {
             shared: self.shared.clone(),
             account,
         });
+        self.shared.publish_status();
         Ok(true)
     }
 
@@ -1366,6 +1440,39 @@ mod tests {
         assert_eq!(got as u16, expected);
         assert_eq!(engineer_roundtrip(expected, b"hello").await, b"echo:hello");
         srv.shutdown().await;
+    }
+
+    /// `status.json` 跟着隧道表起落，服务端干净退出后删掉它。
+    ///
+    /// 改红：把 `tcpip_forward` 成功后那句 `self.shared.publish_status();`
+    /// 删掉——建隧道之后 `status::read` 读到的 `tunnels.len()` 仍然是 0，
+    /// 断在 `assert_eq!(st.tunnels.len(), 1)` 那一句。
+    #[tokio::test]
+    async fn status_json_follows_the_tunnel_table() {
+        let (srv, pw, tmp) = server_with_account("zhang").await;
+        let d = DataDir::at(tmp.path().to_path_buf());
+        assert_eq!(crate::status::read(&d).unwrap().unwrap().tunnels.len(), 0);
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = s.tcpip_forward("", 0).await.unwrap() as u16;
+        let st = crate::status::read(&d).unwrap().unwrap();
+        assert_eq!(st.tunnels.len(), 1);
+        assert_eq!(st.tunnels[0].port, port);
+        assert_eq!(st.tunnels[0].account, "zhang");
+        s.disconnect(russh::Disconnect::ByApplication, "", "")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(crate::status::read(&d).unwrap().unwrap().tunnels.len(), 0);
+        srv.shutdown().await;
+        assert!(
+            crate::status::read(&d).unwrap().is_none(),
+            "干净退出后不留 status.json"
+        );
     }
 
     #[tokio::test]

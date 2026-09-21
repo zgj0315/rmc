@@ -15,18 +15,32 @@ pub const USAGE: &str = "\
   account passwd <名字>                          重置口令，打印一次性新口令
   account revoke <名字>                          吊销账号（端口保留，不给别人复用）
   account list                                   列出所有账号与各自的连接码
+  serve [--listen IP:端口] [--engineer-allow CIDR]... [--allow-root]
+                                  启动运维服务器，直到 Ctrl+C
+  status                          查询本机运维服务器是否在运行、有哪些在线隧道
+  service print [--listen …] [--engineer-allow …]...
+                                  打印一份 systemd 单元文本到标准输出（只打印，不装）
 
 通用选项：
   --data-dir <目录>              数据目录（默认 $RMC_GATEWAY_DATA，否则 ~/.rmc-gateway）
-  --listen <IP:端口>              监听地址（默认端口 22000；只用来算「监听端口不能分给账号」）
+  --listen <IP:端口>              监听地址（默认端口 22000；serve 用它真的绑；其余子命令只用来算
+                                  「监听端口不能分给账号」）
+  --engineer-allow <CIDR>        反向端口只放行这些网段的工程师来源；可重复给多次；不给则不过滤
+  --allow-root                   serve 允许以 root 运行（默认拒绝；容器里只有 root 才需要）
 ";
+
+/// 无值开关（布尔选项）：出现即真，不吃下一个参数。跟 `--k v` 那种「有值」
+/// 选项的解析规则不一样，`parse` 要单独查这张表才知道该不该吃值——否则
+/// `serve --allow-root` 会把下一个参数错当成 `--allow-root` 的值吞掉。
+const FLAGS: &[&str] = &["allow-root"];
 
 pub(crate) struct Parsed {
     pub cmd: Vec<String>,
     pub opts: Vec<(String, String)>,
 }
 
-/// `--k v` 与 `--k=v` 两种写法；不带 `--` 的按顺序进 cmd。
+/// `--k v` 与 `--k=v` 两种写法；`FLAGS` 里的无值开关只认「出现」，值固定为
+/// `"true"`，不吃下一个参数；不带 `--` 的按顺序进 cmd。
 pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut cmd = Vec::new();
     let mut opts = Vec::new();
@@ -36,6 +50,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         if let Some(k) = a.strip_prefix("--") {
             if let Some((k, v)) = k.split_once('=') {
                 opts.push((k.to_string(), v.to_string()));
+            } else if FLAGS.contains(&k) {
+                opts.push((k.to_string(), "true".to_string()));
             } else {
                 let v = args.get(i + 1).ok_or_else(|| format!("--{k} 缺少值"))?;
                 opts.push((k.to_string(), v.clone()));
@@ -86,6 +102,9 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         ["account", "passwd", name] => cmd_account_passwd(&p, name, out, err),
         ["account", "revoke", name] => cmd_account_revoke(&p, name, out, err),
         ["account", "list"] => cmd_account_list(&p, out, err),
+        ["serve"] => cmd_serve(&p, out, err),
+        ["status"] => cmd_status(&p, out, err),
+        ["service", "print"] => cmd_service_print(&p, out, err),
         _ => {
             let _ = write!(err, "{USAGE}");
             2
@@ -226,6 +245,7 @@ fn cmd_account_add(p: &Parsed, name: &str, out: &mut dyn Write, err: &mut dyn Wr
     let store = crate::accounts::AccountStore::open(&l.dir, &l.cfg, listen_port(p));
     match store.add(&name, port, p.opt("note").unwrap_or("")) {
         Ok((a, pw)) => {
+            record_account_changed(&l.dir, name.as_str(), "add");
             let _ = writeln!(out, "账号 {} 已开通，端口 {}。", a.name, a.port);
             let _ = writeln!(out, "连接码：  {}", code_for(&l, &a));
             let _ = writeln!(out, "初始口令：{}      （只显示这一次）", pw.as_str());
@@ -256,6 +276,7 @@ fn cmd_account_passwd(p: &Parsed, name: &str, out: &mut dyn Write, err: &mut dyn
     let store = crate::accounts::AccountStore::open(&l.dir, &l.cfg, listen_port(p));
     match store.reset_password(&name) {
         Ok(pw) => {
+            record_account_changed(&l.dir, name.as_str(), "passwd");
             let _ = writeln!(
                 out,
                 "账号 {name} 新口令：{}      （只显示这一次）",
@@ -282,6 +303,7 @@ fn cmd_account_revoke(p: &Parsed, name: &str, out: &mut dyn Write, err: &mut dyn
     let store = crate::accounts::AccountStore::open(&l.dir, &l.cfg, listen_port(p));
     match store.revoke(&name) {
         Ok(()) => {
+            record_account_changed(&l.dir, name.as_str(), "revoke");
             let port = store
                 .list()
                 .ok()
@@ -324,6 +346,221 @@ fn cmd_account_list(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32
             1
         }
     }
+}
+
+/// account 三个改写子命令成功后记一条 `AccountChanged` 审计事件。写审计
+/// 日志失败不影响 CLI 本身的成功——这是本来就该发生的事的旁路记录，不是
+/// 前提条件；`AuditLog::open` 失败（比如权限问题）只值得一条日志提示，
+/// 不该让整条命令的退出码从 0 变成非 0。
+fn record_account_changed(dir: &DataDir, account: &str, action: &str) {
+    match crate::audit::AuditLog::open(dir) {
+        Ok(log) => log.record(crate::audit::AuditEvent::AccountChanged {
+            account: account.to_string(),
+            action: action.to_string(),
+        }),
+        Err(e) => tracing::warn!(error = %e, "记 AccountChanged 审计事件失败"),
+    }
+}
+
+// ---------------------------------------------------------------- serve / status / service print
+
+/// `serve` 拒绝以 root 运行的判定：纯函数，不做任何 IO，方便单独测试。
+///
+/// **为什么拒绝，不只是「拒绝」**：本程序监听的默认端口是 22000、反向端口
+/// 22001-22999，都不是需要特权的端口（< 1024），没有任何理由需要 root——
+/// 唯一的效果是把这个进程一旦出现漏洞（不管是这个程序自己的，还是它依赖的
+/// 哪个包的）能造成的后果放大到整台机器。运维应该换一个普通用户来跑，
+/// `service print` 生成的 systemd 单元就是这么做的（`User=` 那一行）；
+/// 只有容器里确实只有 root 用户可用这一种场景，才该加 `--allow-root` 放行。
+pub fn refuse_root(is_root: bool, allow_root: bool) -> Option<String> {
+    if is_root && !allow_root {
+        Some(
+            "拒绝以 root 运行：本程序监听的不是特权端口（默认 22000，反向端口 \
+             22001-22999 都在 1024 以上），没有任何理由需要 root 权限——那只会把\
+             一旦出现漏洞能造成的后果放大到整台机器。请换一个普通用户运行（推荐用 \
+             `rmc-gateway service print` 生成的 systemd 单元，它就是这么做的）。\
+             只有容器里确实只有 root 用户可用时，才加 --allow-root 放行。"
+                .into(),
+        )
+    } else {
+        None
+    }
+}
+
+fn cmd_serve(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    if let Some(why) = refuse_root(
+        crate::datadir::running_as_root(),
+        p.opt("allow-root").is_some(),
+    ) {
+        let _ = writeln!(err, "{why}");
+        return 1;
+    }
+    let dir = p.data_dir();
+    match dir.owned_by_current_user() {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = writeln!(
+                err,
+                "数据目录 {} 的属主不是当前用户；serve 与 account 子命令要用同一个用户运行",
+                dir.root().display()
+            );
+            return 1;
+        }
+        Err(e) => {
+            let _ = writeln!(err, "检查数据目录失败：{e}");
+            return 1;
+        }
+    }
+    let listen: SocketAddr = match p.opt("listen").unwrap_or("0.0.0.0:22000").parse() {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = writeln!(err, "--listen 不是 IP:端口：{e}");
+            return 2;
+        }
+    };
+    let mut engineer_allow = Vec::new();
+    for (k, v) in &p.opts {
+        if k == "engineer-allow" {
+            match crate::cidr::Cidr::parse(v) {
+                Ok(c) => engineer_allow.push(c),
+                Err(e) => {
+                    let _ = writeln!(err, "--engineer-allow：{e}");
+                    return 2;
+                }
+            }
+        }
+    }
+    // 白名单在反向端口 accept 之后判断（见 `server.rs::reverse_accept_loop`），
+    // 不改绑定地址：`--engineer-allow` 收窄的是「谁能连反向端口」，不是
+    // 「反向端口绑在哪个地址上」——生产环境反向端口本来就要绑 0.0.0.0，
+    // 白名单只是在那之上再收窄一层来源判断。
+    let cfg = crate::server::ServerConfig {
+        listen,
+        data: dir.clone(),
+        reverse_bind: "0.0.0.0".parse().expect("字面量合法的 IP"),
+        engineer_allow,
+        timings: crate::server::Timings::default(),
+        limits: crate::throttle::Limits::default(),
+    };
+    let _ = writeln!(out, "数据目录 {}，监听 {listen}", dir.root().display());
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(err, "建不出运行时：{e}");
+            return 1;
+        }
+    };
+    match rt.block_on(crate::server::serve_until(cfg, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })) {
+        Ok(()) => 0,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            1
+        }
+    }
+}
+
+fn cmd_status(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let dir = p.data_dir();
+    match crate::status::read(&dir) {
+        Ok(Some(st)) if crate::status::is_live(&st, crate::status::now_unix()) => {
+            let _ = writeln!(
+                out,
+                "运行中（pid {}），监听 {}，指纹 {}",
+                st.pid, st.listen, st.fingerprint
+            );
+            if st.tunnels.is_empty() {
+                let _ = writeln!(out, "没有在线隧道");
+            }
+            for t in &st.tunnels {
+                let _ = writeln!(
+                    out,
+                    "{}  端口 {}  来自 {}  自 {}  工程师连接 {}",
+                    t.account, t.port, t.peer, t.since, t.engineers
+                );
+            }
+            0
+        }
+        // 有 status.json，但超过 `STALE_AFTER_SECS` 没更新——不能读成
+        // 「运行中」：进程可能已经崩了、被 kill -9 了，或者机器重启后
+        // 数据目录是从备份恢复的、pid 早就不指向这个进程了。
+        Ok(Some(st)) => {
+            let _ = writeln!(
+                out,
+                "没有在跑（最后一次状态更新 {}，pid {}）",
+                crate::clock::rfc3339(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(st.updated_unix)
+                ),
+                st.pid
+            );
+            3
+        }
+        Ok(None) => {
+            let _ = writeln!(
+                out,
+                "没有在跑（数据目录 {} 下没有状态文件）",
+                dir.root().display()
+            );
+            3
+        }
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            1
+        }
+    }
+}
+
+fn cmd_service_print(p: &Parsed, out: &mut dyn Write, _err: &mut dyn Write) -> i32 {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "rmc-gateway".into());
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/usr/local/bin/rmc-gateway".into());
+    let dir = p.data_dir();
+    let mut args = format!("serve --data-dir {}", dir.root().display());
+    if let Some(l) = p.opt("listen") {
+        args.push_str(&format!(" --listen {l}"));
+    }
+    for (k, v) in &p.opts {
+        if k == "engineer-allow" {
+            args.push_str(&format!(" --engineer-allow {v}"));
+        }
+    }
+    // **只打印文本，不动系统**：本程序自己不建用户、不写 /etc、不调
+    // systemctl。装不装这个单元、`useradd` 那个专用用户，都是管理员自己
+    // 决定与执行的事——这里的注释与下面 systemd 单元里的注释是给管理员
+    // 看的，不是给这个程序自己看的。
+    let _ = write!(
+        out,
+        "\
+# 安装：
+#   rmc-gateway service print > rmc-gateway.service
+#   sudo install -m 644 rmc-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now rmc-gateway
+# 本程序自己不做任何需要特权的事；装不装这个单元由管理员决定。
+[Unit]
+Description=Remote Maintenance Server (rmc-gateway)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={user}
+ExecStart={exe} {args}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={dir}
+
+[Install]
+WantedBy=multi-user.target
+",
+        dir = dir.root().display()
+    );
+    0
 }
 
 #[cfg(test)]
@@ -439,5 +676,136 @@ mod tests {
         let (code, _, err) = run_in(tmp.path(), &["account", "add", "zhang"]);
         assert_eq!(code, 1);
         assert!(err.contains("init"), "{err}");
+    }
+
+    #[test]
+    fn refuse_root_is_a_pure_rule() {
+        assert!(refuse_root(true, false).is_some());
+        assert!(refuse_root(true, true).is_none());
+        assert!(refuse_root(false, false).is_none());
+    }
+
+    /// 改红：把 `parse` 里 `FLAGS.contains(&k)` 那一支删掉（退回到
+    /// 「所有 `--k` 都吃下一个参数当值」）——`serve --allow-root` 会把
+    /// `--allow-root` 的值错吃成下一个参数，这条测试用 `account list`
+    /// 顶替 `serve` 的位置来验证同一件事：无值开关不该吃值。
+    #[test]
+    fn allow_root_is_a_value_less_flag_and_does_not_eat_the_next_argument() {
+        let p = parse(&[
+            "serve".to_string(),
+            "--allow-root".to_string(),
+            "--listen".to_string(),
+            "0.0.0.0:22000".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(p.opt("allow-root"), Some("true"));
+        assert_eq!(p.opt("listen"), Some("0.0.0.0:22000"));
+    }
+
+    #[test]
+    fn status_before_serve_says_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (code, out, _) = run_in(tmp.path(), &["status"]);
+        assert_eq!(code, 3);
+        assert!(out.contains("没有在跑"), "{out}");
+    }
+
+    #[test]
+    fn service_print_carries_the_data_dir_listen_and_allow_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (code, out, _) = run_in(
+            tmp.path(),
+            &[
+                "service",
+                "print",
+                "--listen",
+                "0.0.0.0:22000",
+                "--engineer-allow",
+                "10.0.0.0/8",
+            ],
+        );
+        assert_eq!(code, 0);
+        for needle in [
+            "[Service]",
+            "User=",
+            "ExecStart=",
+            "serve --data-dir",
+            "--listen 0.0.0.0:22000",
+            "--engineer-allow 10.0.0.0/8",
+            "NoNewPrivileges=yes",
+            "ReadWritePaths=",
+        ] {
+            assert!(out.contains(needle), "缺 {needle}：\n{out}");
+        }
+        assert!(out.contains(&tmp.path().display().to_string()));
+    }
+
+    /// serve 真的把服务端拉起来、写了 status.json、收到 stop 后干净退出。
+    ///
+    /// 改红：把 `Running::shutdown` 末尾那句
+    /// `std::fs::remove_file(self.shared.data.status())` 删掉——最后一句
+    /// `assert!(crate::status::read(&d).unwrap().is_none())` 红，
+    /// `serve_until` 收到 stop 之后 status.json 会留在原地，`status`
+    /// 子命令要等满 30 秒的 `STALE_AFTER_SECS` 才会说「没在跑」。
+    #[tokio::test]
+    async fn serve_until_runs_and_stops_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut a = vec![
+            "init".to_string(),
+            "--public-addr".into(),
+            "127.0.0.1:22000".into(),
+            "--data-dir".into(),
+            tmp.path().display().to_string(),
+        ];
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        assert_eq!(run(&a, &mut o, &mut e), 0);
+        a.clear();
+        let d = crate::datadir::DataDir::at(tmp.path().to_path_buf());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cfg = crate::server::ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data: d.clone(),
+            reverse_bind: "127.0.0.1".parse().unwrap(),
+            engineer_allow: vec![],
+            timings: crate::server::Timings::fast(),
+            limits: crate::throttle::Limits::default(),
+        };
+        let task = tokio::spawn(crate::server::serve_until(cfg, async {
+            let _ = rx.await;
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            crate::status::read(&d).unwrap().is_some(),
+            "serve 起来后要有 status.json"
+        );
+        tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(crate::status::read(&d).unwrap().is_none());
+    }
+
+    /// `account add/passwd/revoke` 各记一条 `AccountChanged` 审计事件，
+    /// `action` 字段跟子命令名对得上。
+    ///
+    /// 改红：把 `cmd_account_add` 里 `record_account_changed(&l.dir,
+    /// name.as_str(), "add")` 那一行删掉——`add` 这个动作在审计日志里
+    /// 消失，第一句 `assert_eq!(actions, vec!["add", "passwd", "revoke"])`
+    /// 红（实际只剩 `["passwd", "revoke"]`）。
+    #[test]
+    fn account_add_passwd_revoke_each_record_an_account_changed_audit_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_in(tmp.path(), &["init", "--public-addr", "203.0.113.10:22000"]);
+        run_in(tmp.path(), &["account", "add", "zhang"]);
+        run_in(tmp.path(), &["account", "passwd", "zhang"]);
+        run_in(tmp.path(), &["account", "revoke", "zhang"]);
+        let d = crate::datadir::DataDir::at(tmp.path().to_path_buf());
+        let log = crate::audit::AuditLog::open(&d).unwrap();
+        let text = std::fs::read_to_string(log.path_for(std::time::SystemTime::now())).unwrap();
+        let actions: Vec<String> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "account_changed")
+            .map(|v| v["action"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(actions, vec!["add", "passwd", "revoke"]);
     }
 }
