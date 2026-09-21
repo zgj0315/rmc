@@ -108,21 +108,50 @@ allow = [
 # `[bans]` 段。
 #
 # Task 3 引入 `toml`（经 `accounts.toml`/`config.toml` 的解析）之后新增的
-# 两组重复版本，同样归进「无害」这一类，理由是实查过的事实，不是猜测
-# （`cargo tree -i winnow` 实跑过）：
+# 两组重复版本，同样归进「无害」这一类，理由是实查过的事实，不是猜测。
+# `cargo deny` 默认检查所有目标（`deny.toml` 没有限定 `targets`），所以
+# `winnow 1.0.4` 实际有两条独立的引入路径，都要算数——
+# `cargo tree -i winnow@1.0.4 --workspace --target all` 实跑过，输出：
 #
-#   winnow v0.7.15  ← toml v0.9.12          ← rmc-gateway
-#   winnow v1.0.4   ← toml_parser v1.1.3    ← toml v0.9.12  ← rmc-gateway
+#   winnow v1.0.4
+#   └── toml_parser v1.1.3+spec-1.1.0
+#       └── toml v0.9.12+spec-1.1.0
+#           └── rmc-gateway
 #
-# 也就是说 `toml 0.9.12` 自己同时依赖 `winnow 0.7`（直接）与
-# `winnow 1.0`（经它自己的 `toml_parser`）——这是 `toml` crate 自身处在
-# 从 winnow 0.7 迁移到 1.0 的过渡期，不是我们选错了版本，也没有任何
-# 版本组合能让我们单方面消掉它（升级/降级 `toml` 的版本号不会改变
-# `toml_parser` 内部锁的 winnow 版本）。`toml_datetime`（0.7 与 1.1
-# 两个版本共存）是同一条过渡线上的另一个包，理由相同。两者都是纯解析器
-# ——不碰密码学、不处理网络上来的不可信输入——两个版本也不会同时链接进
-# 同一条调用路径，跟上面 `sha2`/`rand` 那种「两套密码学实现并存」性质
-# 完全不同，判为无害。
+#   winnow v1.0.4
+#   ├── toml_edit v0.25.15+spec-1.1.0
+#   │   └── proc-macro-crate v3.5.0
+#   │       └── num_enum_derive v0.7.6 (proc-macro)
+#   │           └── num_enum v0.7.6
+#   │               ├── android-activity v0.6.1        ← 只在 Android 目标成立
+#   │               │   └── winit → iced_winit → iced → rmc-app
+#   │               └── ndk v0.9.0
+#   │                   ├── android-activity（同上）
+#   │                   └── softbuffer → iced_tiny_skia → iced_renderer → iced/iced_test → rmc-app
+#   └── toml_parser v1.1.3+spec-1.1.0
+#       └── toml_edit v0.25.15+spec-1.1.0（同上）
+#
+# 第一条（`toml v0.9.12` 自己同时依赖 `winnow 0.7` 直接、`winnow 1.0` 经
+# 自己的 `toml_parser`）是 `toml` crate 自身处在从 winnow 0.7 迁移到 1.0
+# 的过渡期，不是我们选错了版本，也没有任何版本组合能让我们单方面消掉它
+# （升级/降级 `toml` 的版本号不会改变 `toml_parser` 内部锁的 winnow
+# 版本）。第二条只在 **Android 目标**下成立：`rmc-app` 依赖的 iced 经
+# `iced_winit` → `winit` 在 Android 后端拉 `android-activity`/`ndk`，
+# 它们经 `num_enum`（一个 proc-macro 派生宏的运行时支持库）拉 `toml_edit`
+# 给自己的 `Cargo.toml` 解析用（跟本仓库要不要用 `toml` 无关，是 winit
+# 生态自己的构建期依赖），`toml_edit` 同样处在往 `winnow 1.0` 迁移的
+# 过渡期。这条路径 iced/winit 才是决定用哪个 `winnow` 大版本的一方，我们
+# 调版本或者不用 Android 目标构建也消不掉它（只要 `Cargo.lock` 统一解析、
+# `cargo deny` 不限定 targets，它就会被算进依赖图）。`toml_datetime`
+# （0.7 与 1.1 两个版本共存）是同一条过渡线上的另一个包，理由相同。
+# 三者都是纯解析器/构建期工具链——不碰密码学、不处理网络上来的不可信
+# 输入——两个版本也不会同时链接进同一条调用路径，跟上面 `sha2`/`rand`
+# 那种「两套密码学实现并存」性质完全不同，判为无害。
+#
+# **记一条教训**：这条依赖路径曾被一次评审判定为「虚构」「四个关键词零
+# 命中」，理由是不带 `--target all` 跑 `cargo tree -i` 时只看宿主平台，
+# 看不到只在 Android 目标下才成立的边。跟本仓库记过的另一条教训是同一个
+# 形态——被窄化的搜索结果不能用来证否。
 multiple-versions = "warn"
 # 明确禁止把 OpenSSL 拖进来，TLS 只用 rustls。
 deny = [{ name = "openssl-sys" }, { name = "native-tls" }]

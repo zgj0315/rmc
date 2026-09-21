@@ -48,7 +48,24 @@ pub fn generate_password() -> Zeroizing<String> {
     use rand::RngCore;
     let mut bytes = Zeroizing::new([0u8; 18]);
     rand::rngs::OsRng.fill_bytes(&mut *bytes);
-    Zeroizing::new(base64::engine::general_purpose::STANDARD_NO_PAD.encode(*bytes))
+    Zeroizing::new(b64_encode_no_pad(bytes.as_slice()))
+}
+
+/// `base64::Engine::encode` 是 `encode<T: AsRef<[u8]>>(&self, input: T) -> String`
+/// ——**按值**收 `T`。`generate_password` 原来直接调
+/// `STANDARD_NO_PAD.encode(*bytes)`：`*bytes` 把 `Zeroizing<[u8; 18]>`
+/// 按值解引用出一份裸 `[u8; 18]`（`Copy`），这份 18 字节明文熵的拷贝落进
+/// `encode` 调用帧里的泛型参数，返回后不会被清零——是跟 `identity.rs`
+/// 返工过两轮的同一个模式：熵的裸拷贝一旦离开 `Zeroizing`，就再也回不去。
+///
+/// 这里换成一个**非泛型**的 `&[u8]` 参数把「按值传」这条路堵死：调用点
+/// 只能传引用（`bytes.as_slice()` 或 `&*bytes`），不能传 `*bytes`——
+/// `[u8; 18]` 不会自动转换成 `&[u8]`，改回 `b64_encode_no_pad(*bytes)`
+/// 类型不匹配，编译不过。这是编译期钉子，不是运行时断言：`encode` 本身是
+/// 泛型的，钉不住「传值还是传引用」这件事本身（`T: AsRef<[u8]>` 两种都
+/// 满足），所以钉子挪到这个非泛型的中间层。
+fn b64_encode_no_pad(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
 pub fn hash_password(pw: &str) -> String {
