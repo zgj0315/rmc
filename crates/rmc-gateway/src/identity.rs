@@ -99,11 +99,19 @@ impl Identity {
             .decode_vec(rest, &mut bytes)
             .map_err(|e| Error::Identity(format!("身份文件损坏：{e}")))?;
         require_zeroizing_bytes(&bytes);
-        let seed: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::Identity("身份文件损坏：长度不对".into()))?;
-        Ok(Self::from_seed(Zeroizing::new(seed)))
+        // R——复审 Critical 1 残留：原来这里先 `bytes.as_slice().try_into()`
+        // 把种子复制进一个裸 `[u8; 32]`，下一行才把它包进 `Zeroizing`——中间
+        // 那份栈上副本不会被清零，而且它不在 `require_zeroizing_bytes` 的覆盖
+        // 范围内（那个钉子只检查 `bytes` 自己，从没检查过 `seed`）。改成先建
+        // 好 `Zeroizing<[u8; 32]>`，用 `copy_from_slice` 直接拷进这个已经受
+        // 保护的缓冲区，种子的裸数组形态从未存在过。
+        if bytes.len() != 32 {
+            return Err(Error::Identity("身份文件损坏：长度不对".into()));
+        }
+        let mut seed = Zeroizing::new([0u8; 32]);
+        seed.copy_from_slice(&bytes);
+        require_zeroizing_seed(&seed);
+        Ok(Self::from_seed(seed))
     }
 
     pub fn fingerprint(&self) -> ServerFingerprint {
@@ -124,34 +132,47 @@ impl Identity {
 
     /// 每次调用现签一张证书——客户端只核对公钥，证书本身不需要稳定。
     ///
-    /// R——评审 Important 2：这个函数体里，种子至少还有两份不会被清零的裸拷贝，
-    /// 都绕不开，如实记录，不要让人以为「副本已经审计完了」：
+    /// R——复审 Important 2 定稿：第 1 轮那版注释说 `rcgen::KeyPair` 那份种子
+    /// 拷贝「没有任何清零钩子，只能 fork 或写 unsafe」，**这是事实错误**，
+    /// 复审核实并订正：
     ///
-    /// 1. `rcgen::KeyPair::try_from(pkcs8.as_slice())`——查过本机缓存的
-    ///    `rcgen 0.14.10` 源码，`TryFrom` 实现是
-    ///    `serialized_der: key.secret_der().into()`，`KeyPair` 结构体里的
-    ///    `serialized_der: Vec<u8>` 字段没有任何 `Drop`/`Zeroize`。`key`
-    ///    这个局部变量在本函数返回时超出作用域被释放，它持有的这份种子拷贝
-    ///    只是被 `free`，**不会被清零**——在被下一次分配复用之前，堆上那块
-    ///    内存原样留着这把身份密钥的种子。`rcgen 0.14` 没有给任何清零钩子，
-    ///    这份副本客观上绕不开（除非 fork `rcgen` 或者在 `#![forbid(unsafe_code)]`
-    ///    的这个 crate 里做不安全的手工擦写，两者都不在本任务范围内）。
-    /// 2. `PrivatePkcs8KeyDer::from(pkcs8.to_vec())`——这一份下面单独有注释：
-    ///    它是 `rustls` 内部长期持有的那一份，同样没有 `Zeroize`，但生命周期
-    ///    不同（活到 `ServerConfig` 被丢弃为止，不是函数一返回就该消失）。
-    ///
-    /// 两份性质不同，不要混为一谈：第 2 份是 TLS 私钥必然的形态（`rustls` 自己
-    /// 的类型决定的，长期存在是设计如此）；第 1 份是函数内部的临时值，本该
-    /// 一函数返回就从内存里消失却没有——这是 `rcgen` 这个版本的 API 限制，
-    /// 不是本函数可以绕开的实现选择。
+    /// 1. **`rcgen::KeyPair` 的清零钩子确实存在，只是没开**——
+    ///    `rcgen-0.14.10/Cargo.toml:144-146` 把 `zeroize` 列为
+    ///    `optional = true` 的依赖，`rcgen-0.14.10/src/lib.rs:862-867`：
+    ///    ```text
+    ///    #[cfg(feature = "zeroize")]
+    ///    impl zeroize::Zeroize for KeyPair {
+    ///        fn zeroize(&mut self) { self.serialized_der.zeroize(); }
+    ///    }
+    ///    ```
+    ///    本 crate 的 `Cargo.toml` 已经把 `rcgen` 的 `features` 加上
+    ///    `"zeroize"`（`zeroize 1.9` 本来就在锁里，是 workspace 依赖，没有
+    ///    新增包）。开了这个 feature 之后 `KeyPair: Zeroize`，下面把 `key`
+    ///    包进 `Zeroizing<KeyPair>`：函数返回前 `key` 出作用域被 drop，
+    ///    `Zeroizing` 的 `Drop` 实现会先调 `zeroize()` 再释放内存——种子的
+    ///    这份拷贝不再是「只是 free、内存原样留着」，是真的被清零了。
+    /// 2. **交给 rustls 的那份（`PrivatePkcs8KeyDer::from(pkcs8.to_vec())`）
+    ///    钩子也存在，但不受我们控制**——`rustls-pki-types-1.15.1/src/lib.rs`
+    ///    第 138 行与第 466 行：`impl zeroize::Zeroize for PrivateKeyDer<
+    ///    'static>` 与 `impl zeroize::Zeroize for PrivatePkcs8KeyDer<
+    ///    'static>` 都存在（本 crate 依赖的 `rustls-pki-types` 开了 `std`，
+    ///    隐含 `alloc`，这两个 impl 就在生效范围内）。但那是 `Zeroize`，**不是**
+    ///    `Drop`/`ZeroizeOnDrop`——要不要清零、什么时候清零，得靠持有者手动
+    ///    调 `.zeroize()`。这一份的所有权在 `Ok(...)` 那一行就交给了调用方
+    ///    （最终交给 `rustls::ServerConfig`），不再是我们能决定的事。准确的
+    ///    说法是「钩子存在，但所有权已交出、不由本函数控制」，不是「没有
+    ///    钩子」也不是「绕不开」。
     pub fn tls_cert_and_key(&self) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
         let pkcs8 = self.pkcs8();
-        let key = rcgen::KeyPair::try_from(pkcs8.as_slice())
-            .map_err(|e| Error::Tls(format!("身份密钥转 rcgen 失败：{e}")))?;
+        let key = Zeroizing::new(
+            rcgen::KeyPair::try_from(pkcs8.as_slice())
+                .map_err(|e| Error::Tls(format!("身份密钥转 rcgen 失败：{e}")))?,
+        );
+        require_zeroizing_keypair(&key);
         let params = rcgen::CertificateParams::new(vec!["rmc-gateway".to_string()])
             .map_err(|e| Error::Tls(format!("证书参数：{e}")))?;
         let cert = params
-            .self_signed(&key)
+            .self_signed(&*key)
             .map_err(|e| Error::Tls(format!("自签失败：{e}")))?;
         Ok((
             cert.der().clone(),
@@ -172,20 +193,29 @@ impl Identity {
     }
 }
 
-// `PrivatePkcs8KeyDer::from(pkcs8.to_vec())` 把种子复制进了一个不会被 zeroize
-// 的 `Vec`——rustls 内部会长期持有它（活到 ServerConfig 被丢弃为止），这是 TLS
-// 私钥必然的形态，绕不开。`tls_cert_and_key` 函数体上方的文档注释里记录了
-// **另一份**性质不同的裸拷贝（`rcgen::KeyPair` 内部的 `serialized_der`）——
-// 那一份是函数内部本该随返回就消失、但因为 rcgen 0.14 没给清零钩子而没有被擦掉
-// 的临时值，跟这里说的「TLS 私钥必然的形态」不是同一件事，不要读成只有一份。
+// `PrivatePkcs8KeyDer::from(pkcs8.to_vec())` 把种子复制进一份 `Vec`，交给
+// rustls 长期持有（活到 ServerConfig 被丢弃为止）。这份**有** `Zeroize` 钩子
+// （`rustls-pki-types-1.15.1/src/lib.rs:466`），但没有 `Drop`/`ZeroizeOnDrop`，
+// 且所有权在这里就交出去了，是否调用 `.zeroize()` 不由本函数决定——不是
+// 「没有钩子」，是「钩子存在但不受我们控制」。`tls_cert_and_key` 函数体上方
+// 的文档注释里记录了另一份性质不同的拷贝（`rcgen::KeyPair` 内部的
+// `serialized_der`）：那一份本 crate 自己开了 `zeroize` feature 并包进
+// `Zeroizing`，函数返回前就已经被清零，不是长期存在的东西，跟这里说的
+// 「TLS 私钥必然的形态、所有权已交出」不是同一件事。
 
 /// 编译期钉住：`create_in`/`load_from` 里承载种子（或种子的可逆编码）的绑定必须
-/// 是 `Zeroizing<_>`，不能是裸 `String`/`Vec<u8>`。这两个函数只做类型检查，没有
-/// 运行时行为——调用点如果把 `line`/`bytes` 的类型换成不带 `Zeroizing` 的裸类型，
-/// 这两行调用就对不上参数类型，`cargo build`/`cargo test` 直接编译失败，这就是
-/// 「改红」：不是跑起来断言失败，是编不过。
+/// 是 `Zeroizing<_>`，不能是裸 `String`/`Vec<u8>`/`[u8; 32]`。这几个函数只做
+/// 类型检查，没有运行时行为——调用点如果把 `line`/`bytes`/`seed`/`key` 的类型
+/// 换成不带 `Zeroizing` 的裸类型，对应那行调用就对不上参数类型，
+/// `cargo build`/`cargo test` 直接编译失败，这就是「改红」：不是跑起来断言
+/// 失败，是编不过。`require_zeroizing_seed` 是复审第 2 轮补的——第 1 轮的钉子
+/// 只覆盖了 `line`/`bytes`，没覆盖 `load_from` 里 `try_into()` 产出的裸
+/// `[u8; 32]`，那处回归连编译期都拦不住，这轮补上。
 fn require_zeroizing_string(_: &Zeroizing<String>) {}
 fn require_zeroizing_bytes(_: &Zeroizing<Vec<u8>>) {}
+fn require_zeroizing_seed(_: &Zeroizing<[u8; 32]>) {}
+/// 同上，钉住 `tls_cert_and_key` 里 rcgen 密钥对必须包在 `Zeroizing` 里。
+fn require_zeroizing_keypair(_: &Zeroizing<rcgen::KeyPair>) {}
 
 #[cfg(test)]
 mod tests {

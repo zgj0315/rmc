@@ -214,11 +214,15 @@ mod tests {
         let (code, _, err) = run_in(tmp.path(), &["init", "--public-addr", "1.2.3.4:0"]);
         assert_eq!(code, 2, "{err}");
         assert!(err.contains("不合法"), "{err}");
-        assert!(
-            !tmp.path().join("identity.key").exists(),
-            "不该先把身份写出去"
-        );
-        assert!(!tmp.path().join("config.toml").exists());
+        // R——复审顺手补的一条：原来只具名核对 identity.key/config.toml 两个
+        // 文件不存在；换成核对整个目录一个文件都没有，断言力度跟测试名字里
+        // 「writes_nothing」对得上——万一以后哪个实现改动往目录里写了别的
+        // 文件（不是这两个名字），具名检查看不出来，`read_dir` 能。
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(names.is_empty(), "不该写任何文件：{names:?}");
     }
 
     #[test]

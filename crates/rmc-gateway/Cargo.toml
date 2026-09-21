@@ -19,8 +19,12 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 # SSH 服务端那一半；client 那一半 rmc-core 已在用，同一个包
 russh = { version = "0.63", default-features = false, features = ["ring"] }
-# 自签证书。**新增包**：rcgen + yasna（派发前用仓库的 deny.toml 验过）
-rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+# 自签证书。**新增包**：rcgen + yasna（派发前用仓库的 deny.toml 验过）。
+# `zeroize` feature（不新增包——zeroize 1.9 本来就在锁里，是 workspace 依赖）：
+# 开了之后 `rcgen::KeyPair: zeroize::Zeroize`
+# （rcgen-0.14.10/src/lib.rs:862-867），`identity.rs::tls_cert_and_key` 靠它把
+# 签证书用到的那份临时密钥包进 `Zeroizing` 清零，见该函数上的文档注释。
+rcgen = { version = "0.14", default-features = false, features = ["ring", "zeroize"] }
 # 口令哈希。argon2 / password-hash 本来就在锁里（russh 的依赖）
 argon2 = "0.6"
 sha2 = "0.10"
