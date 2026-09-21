@@ -4,6 +4,7 @@
 pub mod addr;
 pub mod audit;
 pub mod backoff;
+pub mod code;
 pub mod config;
 pub mod diagnostic;
 pub mod error;
@@ -18,6 +19,7 @@ pub mod tunnel;
 pub mod wording;
 
 pub use addr::HostPort;
+pub use code::{AccountName, CodeError, ConnectionCode, ServerFingerprint};
 pub use error::{Error, ErrorClass, Result};
 pub use state::{Command, State, TunnelEvent};
 
