@@ -97,10 +97,12 @@ pub(crate) struct TunnelInfo {
     pub stop: watch::Sender<bool>,
 }
 
-/// 挂在 `ConnHandler` 上；`ConnHandler`（连同它）随会话一起被丢弃时
-/// （会话正常结束、心跳失联、认证超时、或 Task 6 从外面 `Handle::disconnect`
-/// 断开——都是同一条路：`handle_connection` 返回，`ConnHandler` 被丢弃），
-/// 这里把隧道从表里摘掉并停掉反向监听任务。这是「摘表 + 停监听」唯一的出口。
+/// 挂在 `ConnHandler` 上；`ConnHandler`（连同它）随会话真正结束时被丢弃
+/// （会话正常收尾、心跳失联、或有人主动发了 `Handle::disconnect`——认证
+/// 超时与 `Running::shutdown()` 现在都是走后面这条路，见 `Shared.connections`
+/// 上的注释：光靠 `handle_connection` 自己的 `select!` 提前返回摸不到
+/// 真正持有 `ConnHandler` 的那个内部任务），这里把隧道从表里摘掉并停掉
+/// 反向监听任务。这是「摘表 + 停监听」唯一的出口。
 pub(crate) struct TunnelGuard {
     shared: Arc<Shared>,
     account: AccountName,
@@ -118,6 +120,21 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 挂在 `handle_connection` 的会话主循环期间：SSH 握手成功、拿到
+/// `RunningSession::handle()` 之后创建，离开作用域（会话正常结束、认证
+/// 超时、未来任何新增的提前返回——任何一条路）都会把这条连接从
+/// `Shared.connections` 里摘掉，防止那张表随着连接来去无限增长。
+struct ConnHandleGuard {
+    shared: Arc<Shared>,
+    peer: SocketAddr,
+}
+
+impl Drop for ConnHandleGuard {
+    fn drop(&mut self) {
+        lock(&self.shared.connections).remove(&self.peer);
+    }
+}
+
 pub(crate) struct Shared {
     pub tls: tokio_rustls::TlsAcceptor,
     pub ssh: Arc<russh::server::Config>,
@@ -127,6 +144,38 @@ pub(crate) struct Shared {
     pub reverse_bind: IpAddr,
     pub engineer_allow: Vec<Cidr>,
     pub tunnels: Mutex<HashMap<AccountName, TunnelInfo>>,
+    /// 每条已完成 SSH 握手（`run_stream` 已经返回）的连接的 `Handle`，
+    /// 键是它的来源地址。
+    ///
+    /// **这张表存在的原因（评审第 1 轮挖出来的缺口）**：`russh::server::
+    /// run_stream` 内部用 `russh_util::runtime::spawn`（本质就是裸
+    /// `tokio::spawn`）另起一个任务去跑真正的消息循环
+    /// （`Session::run`），那个任务才是真正持有 `ConnHandler`（连同它的
+    /// `TunnelGuard`）的地方。它返回的 `RunningSession::join` 是
+    /// `russh_util` 自己的 `JoinHandle`——内部只是一个
+    /// `tokio::sync::oneshot::Receiver`，**没有 `abort()`**
+    /// （`russh-util-0.52.0/src/runtime.rs:16-20`）。`handle_connection`
+    /// 自己这层 wrapper 被摘掉（不管是 `accept_task.abort()` 级联把
+    /// `JoinSet` 一起丢掉，还是这层函数自己的 `select!` 因为认证超时提前
+    /// 返回）都摸不到那个内部任务——它会继续裸跑，`ConnHandler`/
+    /// `TunnelGuard` 不会被丢弃，隧道端口不会被释放，未认证连接名额也
+    /// 不会被真正腾出来。唯一能让它自己走完退出的路是给它发一条
+    /// `Handle::disconnect(...)`：这条消息进了它自己的 mpsc，
+    /// `dispatch_msg` 处理后把 `common.disconnected` 设成 `true`，它的
+    /// 消息循环下一轮检查这个标志位（`server/session.rs` 里
+    /// `while !self.common.disconnected`）就会自然退出。所以要留一份
+    /// 每条连接的 `Handle`，好在 `Running::shutdown()` 与认证超时那两处
+    /// 主动发这条消息。
+    ///
+    /// **跟 Task 6 吊销扫描的关系**：这张表按来源地址（`peer`）索引，
+    /// 粒度是"连接"，不是"隧道"；`tunnels` 那张表才是按账号索引的隧道
+    /// 状态。Task 6 如果要按账号找到对应连接的 `Handle` 去吊销，可以
+    /// 直接复用这张表（拿 `TunnelInfo.peer` 去查）,也可以在 `TunnelInfo`
+    /// 里再存一份 `Handle`（跟 `stop` 字段类似，反正 `Handle: Clone`
+    /// 很便宜）——这里不预先做归并，留给 Task 6 的实现者按它吊销扫描的
+    /// 实际查找模式决定，但基础设施（"发 disconnect 能让内部任务自己
+    /// 退出"这条路）已经在这里立住了，不需要 Task 6 重新发现。
+    pub connections: Mutex<HashMap<SocketAddr, russh::server::Handle>>,
 }
 
 pub struct Server;
@@ -172,7 +221,36 @@ impl Running {
             })
             .collect()
     }
+    /// 测试用：当前注册表里还有几条"已完成 SSH 握手"的连接。见
+    /// `Shared.connections` 上的长注释——这个数字从非零变成零，是"这条
+    /// 连接真的被服务端关掉了（内部消息循环任务真的退出、`ConnHandler`
+    /// 真的被丢弃）"唯一可观察、不依赖 `is_closed()`（客户端自己怎么看
+    /// 这条连接）的服务端侧判据。跟 `tunnels_snapshot` 同理开成 `pub`：
+    /// 唯一调用者目前是测试，`pub(crate)` 会在不带 `--cfg test` 的普通
+    /// lib 编译单元上被 `dead_code` 打红。
+    pub fn connections_count(&self) -> usize {
+        lock(&self.shared.connections).len()
+    }
+    /// **评审第 1 轮挖出来的缺口，已修**：光靠 `accept_task.abort()`
+    /// 关不掉已经建立的会话——那只摘掉 `handle_connection` 这层 wrapper
+    /// 和 accept 循环，真正跑消息循环、持有 `ConnHandler`/`TunnelGuard`
+    /// 的内部任务是 russh 自己另起的，摸不到（见 `Shared.connections`
+    /// 上的长注释）。这里先挨个给已注册的连接发 `disconnect`，让它们自己
+    /// 走「`dispatch_msg` → `disconnected = true` → 消息循环退出」这条
+    /// 路真正收尾（`ConnHandler` 被丢弃、`TunnelGuard` 跟着把隧道端口
+    /// 释放掉），再摘 accept 循环。
     pub async fn shutdown(self) {
+        let handles: Vec<russh::server::Handle> =
+            lock(&self.shared.connections).values().cloned().collect();
+        for h in handles {
+            let _ = h
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    String::new(),
+                    String::new(),
+                )
+                .await;
+        }
         let _ = self.stop.send(true);
         self.accept_task.abort();
         let _ = self.accept_task.await;
@@ -206,6 +284,7 @@ impl Server {
             reverse_bind: cfg.reverse_bind,
             engineer_allow: cfg.engineer_allow.clone(),
             tunnels: Mutex::new(HashMap::new()),
+            connections: Mutex::new(HashMap::new()),
         });
         let listener = tokio::net::TcpListener::bind(cfg.listen)
             .await
@@ -266,6 +345,21 @@ async fn handle_connection(shared: Arc<Shared>, sock: tokio::net::TcpStream, pee
         },
         _ = &mut deadline => { tracing::info!(%peer, "SSH 握手超时"); return; }
     };
+    // **评审第 1 轮挖出来的缺口，已修**：`running`（`RunningSession`）只是
+    // 一个薄包装，`Future::poll` 转发给内部 `join`（`russh_util` 自己的
+    // `JoinHandle`，本质是 `oneshot::Receiver`，见 `Shared.connections`
+    // 上的长注释）。真正持有 `ConnHandler` 的任务是 russh 内部用
+    // `russh_util::runtime::spawn`（裸 `tokio::spawn`）另起的，跟这层
+    // `handle_connection` 的生死没有关系——这层函数无论从哪条路返回都
+    // 摸不到它，除非主动发 `disconnect`。所以先把这条连接的 `Handle`
+    // 注册进 `shared.connections`（`ConnHandleGuard` 保证离开这个函数时
+    // 一定会被摘掉），后面认证超时那一支才有东西可以发。
+    let handle = running.handle();
+    lock(&shared.connections).insert(peer, handle.clone());
+    let _conn_guard = ConnHandleGuard {
+        shared: shared.clone(),
+        peer,
+    };
     tokio::pin!(running);
     // **偏离 brief 字面 Step 2**：brief 的伪代码在这里外面包了一层
     // `loop { tokio::select! {...} }`。`cargo clippy -D warnings` 的
@@ -284,6 +378,16 @@ async fn handle_connection(shared: Arc<Shared>, sock: tokio::net::TcpStream, pee
         }
         _ = &mut deadline, if !authed.load(Ordering::SeqCst) => {
             tracing::info!(%peer, "认证超时，断开");
+            // 这个分支只是让 `handle_connection` 自己的 `select!` 提前
+            // 返回——真正跑消息循环的内部任务不受这层 `select!` 影响，
+            // 还在裸跑。必须主动发 `disconnect` 让它自己走
+            // `dispatch_msg` → `disconnected = true` → 循环退出这条路，
+            // 否则这条连接根本没有真的关闭：Task 6「全局最多 64 条、
+            // 每 IP 最多 8 条未认证连接」那个上限就是靠这份名额算的，
+            // 名额被这个函数返回而释放、连接却没死，上限就是错的。
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, String::new(), String::new())
+                .await;
         }
     }
 }
@@ -740,6 +844,22 @@ mod tests {
     /// 这条测试专门验证握手超时，所以**自己构造**一个 500ms 的
     /// `handshake`（不用 `Timings::fast()` 默认的 10 秒——那是为了不跟
     /// `three_failures_end_the_connection` 的 3 秒认证窗口打架，见 R4）。
+    ///
+    /// **这条测试到底在验什么（修复轮 1/5，评审要求核实，已核实）**：
+    /// 客户端只连了裸 TCP，从没发过 TLS ClientHello，所以服务端这边卡在
+    /// `handle_connection` 的**第一个** `select!`（`shared.tls.accept(sock)`
+    /// 对 `deadline`），根本没走到 `russh::server::run_stream(...)`——也
+    /// 就是说这个场景下**从来没有那个被 `russh_util::runtime::spawn`
+    /// detach 出去的内部任务**（那个任务要等 SSH 版本号交换完、
+    /// `run_stream` 已经在往回走的路上才会被 spawn 出来）。`deadline` 赢
+    /// 了之后，被丢弃的是 `shared.tls.accept(sock)` 这个 future 本身，
+    /// 它内部持有的 `TcpStream` 随之被真的 drop、真的关闭——客户端读到
+    /// 的 EOF 是这次真实关闭的结果，不是别的机制顶上来的假象。跟下面
+    /// `tls_ok_but_no_auth_is_also_closed_at_the_deadline` 不一样：那条
+    /// 测试的 TLS 握手是真的完成了的，服务端已经跑过第一个 `select!`、
+    /// 进了第二个（`running` 对 `deadline`），这时候内部任务确实已经被
+    /// spawn 出来、脱离了这层 `select!` 的管辖——才需要修复轮 1/5 里那个
+    /// 主动发 `disconnect` 的补丁。这条测试没有这个问题，不用改。
     #[tokio::test]
     async fn an_idle_unauthenticated_connection_is_closed_at_the_deadline() {
         use tokio::io::AsyncReadExt;
@@ -766,9 +886,31 @@ mod tests {
     /// TLS 握手成功但 SSH 认证迟迟不来：同样到期关掉（同一个 deadline 管
     /// 两段）。同上，自己构造 500ms 的 `handshake`。
     ///
-    /// **防 flake 提醒（控制者订正）**：`is_closed()` 变成 true 依赖服务端
-    /// 断开后客户端会话循环结束、handle 的通道关闭，中间有调度延迟；500ms
-    /// 的 deadline + 900ms 的等待留了 400ms 余量。万一 flake，加长等待，
+    /// **修复轮 1/5，评审挖出来的假绿，已实测确认并修**：这条测试原来只
+    /// 断言 `s.is_closed()`（客户端自己怎么看这条连接），用的 keepalive
+    /// 是 `Timings::fast()` 默认的 200ms/最多 3 次——到 600~800ms 服务端
+    /// 自己的心跳机制就会把这条空闲连接顺手踢掉，跟"认证超时那条 deadline
+    /// 分支到底做没做事"完全无关。**实测确认过这个假绿是真的**：把
+    /// `handle_connection` 认证超时那一支还原成"只打日志、不发
+    /// disconnect"（也就是评审指出的那个原始 bug），配合把 keepalive 调成
+    /// 1 小时（让心跳兜底不了），900ms 后 `is_closed()` 仍然是 `false`——
+    /// 说明原来那条 `assert!(s.is_closed())` 之所以能过，靠的是
+    /// `Timings::fast()` 的心跳，不是 deadline 逻辑本身。
+    ///
+    /// 修完之后这条测试做了两处强化：① keepalive 故意设得极长
+    /// （1 小时/最多 1000 次），堵死心跳兜底这条路，保证 900ms 内只有
+    /// `handle_connection` 里的 deadline 分支能关掉这条连接；②
+    /// 除了客户端侧的 `is_closed()`，再加一句服务端侧的判据
+    /// `srv.connections_count() == 0`——见 `Running::connections_count`
+    /// 与 `Shared.connections` 上的注释：这张表的条目只有在真正持有
+    /// `ConnHandler` 的内部任务退出（`ConnHandleGuard::drop` 触发）时才会
+    /// 被摘掉，所以"这个数字变成 0"直接证明"服务端那一侧真的把这条连接
+    /// 收尾了"，不只是"客户端自己觉得断了"。
+    ///
+    /// **防 flake 提醒（控制者订正，仍然适用）**：`is_closed()`/
+    /// `connections_count()` 变成预期值依赖服务端发出 `disconnect` 之后
+    /// 内部任务被调度到、真正走完退出逻辑，中间有调度延迟；500ms 的
+    /// deadline + 900ms 的等待留了 400ms 余量。万一 flake，加长等待，
     /// 不要缩短 deadline——deadline 是被测对象，等待只是观测手段。
     #[tokio::test]
     async fn tls_ok_but_no_auth_is_also_closed_at_the_deadline() {
@@ -776,6 +918,9 @@ mod tests {
             "zhang",
             Timings {
                 handshake: Duration::from_millis(500),
+                // 见上面的函数级注释：故意堵死心跳兜底这条路。
+                keepalive: Duration::from_secs(3600),
+                keepalive_max: 1000,
                 ..Timings::fast()
             },
         )
@@ -783,6 +928,11 @@ mod tests {
         let s = within("connect", ssh_connect(srv.local_addr())).await;
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(s.is_closed(), "500ms 没认证，服务端该断开");
+        assert_eq!(
+            srv.connections_count(),
+            0,
+            "服务端这一侧也要真的把这条连接收尾掉，不能只是客户端自己看到断线"
+        );
         srv.shutdown().await;
     }
 
@@ -986,6 +1136,43 @@ mod tests {
         // 还能再申请一次
         assert_eq!(s.tcpip_forward("", 0).await.unwrap() as u16, port);
         srv.shutdown().await;
+    }
+
+    /// **修复轮 1/5，评审复现的 Critical，已实测确认并修**：建隧道、
+    /// **不断开客户端**、直接 `srv.shutdown()`——评审的复现步骤原样照抄。
+    ///
+    /// 根因：`russh::server::run_stream` 内部用
+    /// `russh_util::runtime::spawn`（裸 `tokio::spawn`）另起一个任务去跑
+    /// 真正的消息循环，那个任务才持有 `ConnHandler`/`TunnelGuard`；它的
+    /// `RunningSession::join` 是 `russh_util` 自己的 `JoinHandle`——内部
+    /// 只是一个 `oneshot::Receiver`，**没有 `abort()`**。旧的
+    /// `Running::shutdown()` 只 `abort()` 了 accept 循环这层 wrapper，
+    /// 摸不到那个内部任务：客户端不主动断开，服务端这边就永远不会真的
+    /// 关闭这条会话，隧道端口永远不会被释放。
+    ///
+    /// 见 `Running::shutdown()` 与 `Shared.connections` 上的长注释——修法
+    /// 是维护一张"连接 → Handle"的注册表，`shutdown()` 先挨个发
+    /// `disconnect`，让内部任务自己走`dispatch_msg` → `disconnected =
+    /// true` → 循环退出这条路收尾，再摘 accept 循环。
+    ///
+    /// 改红：把 `Running::shutdown()` 里"挨个发 disconnect"那段循环删掉
+    /// ——这条测试在 bind 那一步红（端口还被占着）。
+    #[tokio::test]
+    async fn shutdown_disconnects_live_sessions_and_frees_tunnel_ports() {
+        let (srv, pw, _tmp) = server_with_account("zhang").await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = s.tcpip_forward("", 0).await.unwrap() as u16;
+        // 注意：不调用 s.disconnect(...)——评审复现的正是"客户端不主动
+        // 断开"这条路。
+        srv.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
+        assert!(l.is_ok(), "shutdown 之后端口应当被释放：{:?}", l.err());
     }
 
     /// 来源白名单：不在名单里的工程师连接被直接关掉，客户端根本收不到通道。
