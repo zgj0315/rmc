@@ -99,6 +99,17 @@ fn cmd_init(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return 2;
         }
     };
+    // R——评审 Important 4：原来先 `dir.create()` + `Identity::create_in()`
+    // 落盘、最后才在 `GatewayConfig::save` 里 `validate()` 检查端口是不是 0。
+    // `init --public-addr 1.2.3.4:0` 能解析成合法的 `SocketAddr`，会先把身份
+    // 密钥写出去、config.toml 才因为端口 0 保存失败——用户改成合法端口重跑，
+    // 会被身份文件「已存在，拒绝覆盖」挡回，只能手工删 `identity.key`。一次
+    // 打错端口不该付这个恢复成本，所以校验要挪到**任何文件系统副作用之前**。
+    let cfg = GatewayConfig::new(addr);
+    if let Err(e) = cfg.validate() {
+        let _ = writeln!(err, "--public-addr 不合法：{e}");
+        return 2;
+    }
     let dir = p.data_dir();
     if let Err(e) = dir.create() {
         let _ = writeln!(err, "建不了数据目录 {}：{e}", dir.root().display());
@@ -111,7 +122,7 @@ fn cmd_init(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = GatewayConfig::new(addr).save(&dir) {
+    if let Err(e) = cfg.save(&dir) {
         let _ = writeln!(err, "{e}");
         return 1;
     }
@@ -188,6 +199,26 @@ mod tests {
         let (code, _, err) = run_in(tmp.path(), &["init"]);
         assert_eq!(code, 2);
         assert!(err.contains("public-addr"), "{err}");
+    }
+
+    /// R——评审 Important 4：端口 0 在 `SocketAddr::parse` 那一步是合法的，
+    /// 真正的校验在 `GatewayConfig::validate`；这条测试盯的是"校验必须挪到任何
+    /// 文件系统副作用之前"——不只是最终退出码对，身份密钥与 config.toml 都不能
+    /// 落地，否则用户改对端口重跑会被"已存在，拒绝覆盖"挡住。
+    /// 改红：把 `cmd_init` 里 `cfg.validate()` 那次前置检查删掉（退回到只在
+    /// `cfg.save` 内部才校验）——`identity.key` 会先被写出来，
+    /// `!... .exists()` 那句红。
+    #[test]
+    fn init_with_port_zero_is_a_usage_error_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (code, _, err) = run_in(tmp.path(), &["init", "--public-addr", "1.2.3.4:0"]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("不合法"), "{err}");
+        assert!(
+            !tmp.path().join("identity.key").exists(),
+            "不该先把身份写出去"
+        );
+        assert!(!tmp.path().join("config.toml").exists());
     }
 
     #[test]

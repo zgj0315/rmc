@@ -83,22 +83,51 @@ impl DataDir {
 }
 
 /// 写临时文件 → 0600 → rename 覆盖。中途失败不留下半截文件。
+///
+/// 目标已存在时**静默覆盖**——`config.toml`/`accounts.toml`/`status.json` 都要能
+/// 覆盖写，这是本函数的既定语义，不要为了某一个调用点（比如身份文件）改掉它；
+/// 需要「目标已存在就拒绝」的场景用下面的 `write_private_atomic_noclobber`。
 pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = new_private_tmp(path)?;
+    use std::io::Write;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// 跟 `write_private_atomic` 一样原子写、0600，但目标已存在时**失败、不覆盖**
+/// （`io::ErrorKind::AlreadyExists`）。
+///
+/// R——评审 Important 3：身份文件的「拒绝覆盖」原来是 `path.exists()` 检查之后
+/// 才落盘，检查与落盘之间有间隙（TOCTOU）——两个 `init` 同时指向同一个数据目录，
+/// 都能通过前面的 `exists()` 检查，最后落地的那个会静默覆盖另一个；而换身份密钥
+/// 等于所有连接码作废，这是 brief 里唯一被强调「必须」的不变式，不能靠一次
+/// check-then-act 来守。这里把「已存在就拒绝」下沉到文件系统的原子操作本身
+/// （`persist_noclobber`，底层走 `link`+`unlink` 或平台原生的 no-replace
+/// rename），检查与落盘之间不再有间隙。
+pub fn write_private_atomic_noclobber(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = new_private_tmp(path)?;
+    use std::io::Write;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist_noclobber(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// 两个 `write_private_atomic*` 共用的准备步骤：目标目录下建临时文件，权限收到 0600。
+fn new_private_tmp(path: &Path) -> io::Result<tempfile::NamedTempFile> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "路径没有父目录"))?;
-    let mut tmp = tempfile::Builder::new().prefix(".tmp-").tempfile_in(dir)?;
+    let tmp = tempfile::Builder::new().prefix(".tmp-").tempfile_in(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    use std::io::Write;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    Ok(tmp)
 }
 
 /// 当前进程是不是 root。同样不需要 libc：临时文件的属主 uid 为 0 即 root。
@@ -169,6 +198,32 @@ mod tests {
         // 覆盖写也走同一条路
         write_private_atomic(&p, b"again").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"again");
+    }
+
+    /// `write_private_atomic_noclobber`：目标不存在时正常落盘；目标已存在时
+    /// 拒绝，且原文件一字节不变——这条测试盯的是 Important 3 那类
+    /// check-then-act 竞态：`persist_noclobber` 必须让「目标是否已存在」这件事
+    /// 在文件系统的一次原子操作里完成判断，不能靠调用方先 `exists()` 再落盘。
+    /// 改红：**实测过**——把函数体里的 `tmp.persist_noclobber(path)` 换成
+    /// `tmp.persist(path)`（即退化成会覆盖的那一个），红的落点比字面猜测更早：
+    /// 第二次 `write_private_atomic_noclobber(&p, b"second")` 不再返回
+    /// `Err`，`.unwrap_err()` 本身直接 panic（"called `Result::unwrap_err()`
+    /// on an `Ok` value"），根本走不到后面比较文件内容那句 `assert_eq!`。
+    /// 两种红都是「这条测试确实在防这个回归」的证据，只是命中的断言点不同，
+    /// 如实记录。
+    #[test]
+    fn noclobber_write_refuses_an_existing_target_and_leaves_it_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f");
+        write_private_atomic_noclobber(&p, b"first").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"first");
+        let err = write_private_atomic_noclobber(&p, b"second").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"first",
+            "拒绝覆盖必须做到原文件字节不变"
+        );
     }
 
     #[cfg(unix)]
