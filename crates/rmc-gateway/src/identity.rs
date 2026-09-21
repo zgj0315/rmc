@@ -442,27 +442,19 @@ mod tests {
         }
     }
 
-    /// TLS 配置只开 1.3：一份不声明支持 1.3（没有 `supported_versions`
-    /// 扩展）、`legacy_version` 只到 1.2 的 ClientHello，必须在**版本
-    /// 协商**这一步被拒——不是在"必需扩展缺失"这种跟版本无关的地方被拒
-    /// （修复轮 1/5 订正的那个假绿），也不是随便哪种畸形握手都会撞上的
-    /// 拒绝。
+    /// 一正一反成对，下面这条是「正」：TLS 配置只开 1.3 时，一份不声明
+    /// 支持 1.3（没有 `supported_versions` 扩展）、`legacy_version` 只到
+    /// 1.2 的 ClientHello，必须在**版本协商**这一步被拒——不是在"必需
+    /// 扩展缺失"这种跟版本无关的地方被拒（修复轮 1/5 订正的那个假绿），
+    /// 也不是随便哪种畸形握手都会撞上的拒绝。「反」在下面
+    /// [`a_server_that_also_allows_tls12_is_not_rejected_at_version_negotiation`]。
     ///
     /// **实测过**（下面两条互为参照，同一份 ClientHello 字节，只换服务端
-    /// 配置；(b) 那一档因为需要真的构造一个 TLS 1.2 也开的
-    /// `rustls::ServerConfig`，本工作区已经不带 `tls12` feature，编不出
-    /// 来——是在一次临时实验里量出来的：把 `crates/rmc-gateway/Cargo.
-    /// toml` 里 `rustls` 的 `features` 临时加回 `"tls12"`，另起一个
-    /// `rustls::ServerConfig::builder().with_no_client_auth().
-    /// with_single_cert(...)`（不显式限定版本，默认 1.2/1.3 都收），打
-    /// 同一份手写 ClientHello，量完立刻把 `Cargo.toml` 与代码改动整个
-    /// 还原，`diff` 核对与备份逐字节一致）：
+    /// 配置）：
     ///
     /// ```text
-    /// (a) 只开 1.3（本 crate 实际产出的配置）：
-    ///     peer is incompatible: SupportedVersionsExtensionRequired
-    /// (b) 1.2 与 1.3 都开（临时实验用的配置，本工作区实际编不出来）：
-    ///     unexpected error: incompatible signing key
+    /// (a) 只开 1.3：peer is incompatible: SupportedVersionsExtensionRequired
+    /// (b) 1.2+1.3 ：unexpected error: incompatible signing key
     /// ```
     ///
     /// 两条文案不同，证明 (a) 那条拒绝确实发生在**版本协商**这一步，不是
@@ -470,18 +462,15 @@ mod tests {
     /// 证书类型变化（这里的身份是 Ed25519 证书，跟手写 ClientHello 里
     /// `0xc02b` 要求的 ECDSA 套件本来就不匹配，1.2/1.3 都开的服务端在
     /// 版本协商**通过之后**的签名密钥匹配这一步另外报错），所以下面的
-    /// 断言只锁 (a) 那条文案，不去锁 (b)——(b) 本身也无法在本工作区的
-    /// 正常构建里被断言到，它只用来在这条文档里留一份"确实测过、两者不
-    /// 同"的证据。
+    /// 断言只锁 (a) 那条文案，不去锁 (b)——「反」那条测试同理，只断言
+    /// "不是 (a) 那条错误"，不锁 (b) 具体是哪句，避免两条测试一起绑死在
+    /// rustls 的内部实现细节上。
     ///
-    /// 改红（**真打过**，用的是上面同一次临时实验：`tls12` feature 临时
-    /// 加回、同时把 `tls_server_config()` 里
-    /// `.with_protocol_versions(&[&rustls::version::TLS13])` 改成
-    /// `.with_protocol_versions(&[&rustls::version::TLS12,
-    /// &rustls::version::TLS13])`）：这条测试当场 panic，`assert!` 的
-    /// 失败消息里"实际却是"后面跟着的正是 (b) 那条文案
-    /// （`unexpected error: incompatible signing key`）——证明这条测试
-    /// 真的会在"服务端不再只开 1.3"时红，而不是对什么配置都视而不见。
+    /// 改红（**真打过**，见 task-9-report.md「修复轮 1/5」）：把
+    /// `tls_server_config()` 里 `.with_protocol_versions(&[&rustls::
+    /// version::TLS13])` 改成同时收 1.2 与 1.3——这条测试的
+    /// `assert!` 当场 panic，`err_tls13_only` 变成 (b) 那条文案
+    /// （`unexpected error: incompatible signing key`）。
     #[tokio::test]
     async fn tls_config_is_13_only() {
         let id = Identity::generate();
@@ -492,6 +481,63 @@ mod tests {
             "只开 1.3 的服务端拒绝一份没有 supported_versions 扩展、\
              legacy_version 只到 1.2 的 ClientHello，理由应该是版本协商，\
              实际却是：{err_tls13_only}"
+        );
+    }
+
+    /// 一正一反成对的「反」：同一份手写 ClientHello，打给一个**也**接受
+    /// TLS 1.2 的服务端，不应该在版本协商这一步被拒——证明上面那条
+    /// `tls_config_is_13_only` 锁的确实是"只开 1.3"这件事本身，不是随便
+    /// 一份畸形 ClientHello 打给任何 rustls 服务端都会撞上的通用失败。
+    ///
+    /// R——修复轮 2/5（评审指出"反"那一档不是编不出来，只是这个 crate的
+    /// `[dependencies]` 没开 `tls12`）：这条测试要用的
+    /// `rustls::version::TLS12` 需要 `tls12` feature，而
+    /// `crates/rmc-gateway/Cargo.toml` 的 `[dependencies]`
+    /// 故意没开它（生产的 TLS 服务端只信 1.3，见 `tls_server_config`）。
+    /// Cargo 按依赖种类（normal/build/dev）分别统一 feature：
+    /// `[dev-dependencies]` 里单独给 `rustls` 追加一份带 `tls12` 的声明，
+    /// 只点亮**本 crate 自己的测试编译单元**——
+    ///
+    /// - **不会**传染给 `rmc-core` 或工作区里别的成员：`rmc-core` 那条
+    ///   `tls12_is_not_compiled_in`（`transport/tls.rs`）只扫
+    ///   `rmc-core/Cargo.toml` 自己的文本，这份声明躺在 `rmc-gateway`
+    ///   的 `Cargo.toml` 里，够不到；
+    /// - **不会**进 `cargo build --release -p rmc-gateway`：release 构建
+    ///   走的是 `[dependencies]`，压根不链接 `[dev-dependencies]`（已经
+    ///   实测确认，见 task-9-report.md「修复轮 2/5」）；
+    /// - 也不会让 `cargo test -p rmc-core`/`cargo clippy --workspace
+    ///   --all-targets` 这类命令里 `rmc-core` 的编译单元被点亮：那份
+    ///   `tls12` 只在解析"`rmc-gateway` 的 dev 依赖图"这条边上出现，
+    ///   `rmc-core` 不经过这条边。
+    ///
+    /// 上一轮说这一档"本工作区永久编不出来"是**错的**，评审用一个最小
+    /// 二 crate workspace 实测推翻了它——已按事实订正这段文档，不是
+    /// 因为"评审说了就照做"，是因为**亲自验证过**（见 task-9-report.md
+    /// 「修复轮 2/5」贴出的实际命令与输出）。
+    ///
+    /// 改红（**真打过**）：把 `crates/rmc-gateway/Cargo.toml` 里
+    /// `[dev-dependencies]` 那份 `rustls` 声明上的 `"tls12"` 去掉——这条
+    /// 测试引用的 `rustls::version::TLS12` 直接编译不过（不是运行时断言
+    /// 失败，是 `cargo test` 在编译阶段就报错），实际输出见
+    /// task-9-report.md。
+    #[tokio::test]
+    async fn a_server_that_also_allows_tls12_is_not_rejected_at_version_negotiation() {
+        let id = Identity::generate();
+        let (cert, key) = id.tls_cert_and_key().unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = std::sync::Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap(),
+        );
+        let err = hello_against(cfg).await;
+        assert!(
+            !err.contains("SupportedVersionsExtensionRequired"),
+            "服务端也接受 1.2 时，同一份 ClientHello 不该在版本协商这一步\
+             被拒，实际却是：{err}"
         );
     }
 }

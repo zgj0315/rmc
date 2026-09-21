@@ -52,6 +52,15 @@ testing = []
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+# 修复轮 2/5：只给本 crate 自己的测试编译单元多开一个 `tls12`——Cargo
+# 按依赖种类（normal/build/dev）分别统一 feature，同一个包在
+# `[dependencies]`（生产路径）与 `[dev-dependencies]`（只有本 crate的
+# 测试二进制会用到）各声明一份，互不传染：不会点亮 `rmc-core` 或别的
+# workspace 成员，也不会进 `cargo build --release`（那条路径根本不链
+# dev-dependencies）。存在的理由见 `identity.rs` 里
+# `identity::tests::a_server_that_also_allows_tls12_is_not_rejected_
+# at_version_negotiation` 上的文档。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [lib]
 name = "rmc_gateway"
