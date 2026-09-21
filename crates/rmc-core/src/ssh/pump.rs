@@ -217,6 +217,7 @@ mod tests {
             reverse_port: 22001,
             gateway: test_gateway_hostport(),
             appliance,
+            fingerprint: crate::code::ServerFingerprint::of_ed25519_public(&[9u8; 32]),
         }
     }
 

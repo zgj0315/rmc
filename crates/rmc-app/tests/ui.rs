@@ -193,12 +193,31 @@ fn switching_tabs_changes_what_is_actually_drawn() {
 // ===================================================================
 
 use rmc_app::diag::{ConnectOutcome, ProxyAuthSummary, ProxyStatus, PROXY_AUTH_ROW};
-use rmc_app::form::Form;
+use rmc_app::form::{Field, Form};
 use rmc_app::model::{Action, Model};
 use rmc_app::view::{diagnostics, maintain};
+use rmc_core::code::{AccountName, ConnectionCode, ServerFingerprint};
 use rmc_core::state::{RemoteSessionInfo, State};
 use std::time::SystemTime;
 use zeroize::Zeroizing;
+
+/// 一条能通过全部校验的连接码，账号 `tunnel-zhang`、地址
+/// `203.0.113.10:22000`。**现生成，不手写常量**——手写的校验位会算错。
+fn good_code() -> String {
+    ConnectionCode::new(
+        AccountName::parse("tunnel-zhang").unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        22000,
+        ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+    )
+    .expect("夹具必须合法")
+    .to_string()
+}
+
+/// 连接码解析成功之后，运维服务器组那一行只读小字的逐字内容。
+fn parsed_line() -> &'static str {
+    "地址 203.0.113.10:22000 · 账号 tunnel-zhang"
+}
 
 /// 整棵树里第一个禁用词命中，没有就是 `None`。
 ///
@@ -246,9 +265,7 @@ fn filled() -> Form {
     Form {
         appliance_host: "192.168.100.10".into(),
         appliance_port: "61001".into(),
-        gateway_host: "ops.example.com".into(),
-        gateway_port: "443".into(),
-        username: "tunnel-zhang".into(),
+        code: good_code(),
         password: Zeroizing::new("canary-7f3a9e-must-never-be-printed".into()),
         remember: false,
         detected_proxy: Some("proxy.company.com:8080".into()),
@@ -282,10 +299,9 @@ fn the_idle_maintain_page_draws_both_groups() {
         "维护目标",
         "运维服务器",
         "一体机",
-        "地址",
+        "连接码",
         "出网",
         "自动检测",
-        "账号",
         "密码",
         "记住密码",
         "默认不保存，勾选后加密落盘",
@@ -300,14 +316,14 @@ fn the_idle_maintain_page_draws_both_groups() {
         "出网那行没有画出检测到的代理"
     );
 
-    // 五个输入框都在，而且里面装的是表单里的值——不是标签文字。
-    for value in [
-        "192.168.100.10",
-        "61001",
-        "ops.example.com",
-        "443",
-        "tunnel-zhang",
-    ] {
+    // 连接码解析成功时，地址与账号的只读小字要画出来。
+    assert!(
+        ui.find(parsed_line()).is_ok(),
+        "连接码解析成功却没有画出地址与账号"
+    );
+
+    // 三个输入框都在，而且里面装的是表单里的值——不是标签文字。
+    for value in ["192.168.100.10", "61001", good_code().as_str()] {
         assert!(has_input(&mut ui, value), "没有一个输入框装着「{value}」");
     }
 }
@@ -327,9 +343,8 @@ fn connecting_hides_the_credential_rows_and_keeps_the_addresses() {
     // 反向自证：未开启时这些东西确实在，下面的"不在"才有意义。
     let idle = model_in(State::Idle);
     let mut ui = simulator(maintain::view(&idle, &form, None, None));
-    assert!(ui.find("账号").is_ok());
     assert!(ui.find("记住密码").is_ok());
-    assert!(has_input(&mut ui, "tunnel-zhang"));
+    assert!(has_input(&mut ui, good_code().as_str()));
 
     for state in [
         State::Preflight,
@@ -341,12 +356,13 @@ fn connecting_hides_the_credential_rows_and_keeps_the_addresses() {
         let model = model_in(state.clone());
         let mut ui = simulator(maintain::view(&model, &form, None, None));
         assert!(ui.find("记住密码").is_err(), "{state:?} 还画着「记住密码」");
+        // 连接码与一体机地址两行**仍然**画着：现场人员得看得见自己连的
+        // 是哪台运维服务器、哪台一体机，而且这是「地址框真的锁了」唯一
+        // 可观测的前提。
         assert!(
-            !has_input(&mut ui, "tunnel-zhang"),
-            "{state:?} 还画着账号输入框"
+            has_input(&mut ui, good_code().as_str()),
+            "{state:?} 把连接码整个藏了，锁没锁就没法验了"
         );
-        // 地址两行**仍然**画着：现场人员得看得见自己连的是哪台一体机，
-        // 而且这是「地址框真的锁了」唯一可观测的前提。
         assert!(
             has_input(&mut ui, "192.168.100.10"),
             "{state:?} 把一体机地址整个藏了，锁没锁就没法验了"
@@ -523,6 +539,42 @@ fn error_hints_name_the_field_that_is_wrong() {
     assert!(ui.find("维护目标").is_ok());
 }
 
+/// Task 8：粘一条好连接码，页面上出现解析出来的地址与账号；粘坏的，
+/// 连接码这一行出现红字（而不是别的框）。
+///
+/// 改红：把 `view/maintain.rs` 里 `parsed_line` 换成恒返回空字符串——
+/// 第一组断言当场红；或者把 `Field::Code` 传的 `on_input` 换成
+/// `Field::ApplianceHost`——第二组断言里红字挂错框，`is_marked` 判断落空。
+#[test]
+fn pasting_a_good_code_shows_the_parsed_account_and_a_bad_one_is_marked() {
+    let idle = model_in(State::Idle);
+
+    let mut good = filled();
+    good.code = good_code();
+    let mut ui = simulator(maintain::view(&idle, &good, None, None));
+    assert!(
+        ui.find(parsed_line()).is_ok(),
+        "粘对了却没有画出「{}」",
+        parsed_line()
+    );
+
+    let mut bad = filled();
+    bad.code = "rmc1:nonsense".into();
+    let errs = bad.visible_errors();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert_eq!(errs[0].field, Field::Code, "红字挂错了框：{errs:?}");
+    let mut ui = simulator(maintain::view(&idle, &bad, None, None));
+    assert!(
+        ui.find(errs[0].message().as_str()).is_ok(),
+        "连接码格式错却没有画出红字"
+    );
+    // 反向自证：粘坏的连接码不该还画着「地址 · 账号」那行。
+    assert!(
+        ui.find(parsed_line()).is_err(),
+        "格式错的连接码居然还解析出了地址与账号"
+    );
+}
+
 /// 整棵维护页树的禁用词扫描，八条显示分支各走一遍。
 #[test]
 fn nothing_the_maintain_page_draws_is_banned() {
@@ -556,9 +608,9 @@ fn nothing_the_maintain_page_draws_is_banned() {
         );
         // 反向自证之二：`Candidate::TextInput` 这一支真的也走到了。
         // 少了它，扫描器漏掉全部输入框而这条测试照样全绿——占位符里写进
-        // 一个域名就谁也看不见了。
+        // 一个含禁用词的值就谁也看不见了。
         assert!(
-            has_input(&mut ui, "ops.example.com"),
+            has_input(&mut ui, good_code().as_str()),
             "{state:?}：输入框那一支没有被遍历到"
         );
 
@@ -588,8 +640,10 @@ fn nothing_the_maintain_page_draws_is_banned() {
     );
 
     // 反向自证之三：扫描器本身真的会对违规发火。喂一棵故意违规的树。
+    // 连接码框只是把 `form.code` 原样画出来，不要求它先解析合法——
+    // 一个含禁用词的任意字符串照样能敲进去、照样会被画出来。
     let mut bad = filled();
-    bad.gateway_host = "gateway.company.com".into();
+    bad.code = "gateway.company.com".into();
     let model = model_in(State::Idle);
     let mut ui = simulator(maintain::view(&model, &bad, None, None));
     assert!(

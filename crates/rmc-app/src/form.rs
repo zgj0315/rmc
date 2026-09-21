@@ -1,7 +1,24 @@
 //! 维护页的表单状态与校验。
 //!
-//! 按两段连接分组：维护目标只放一体机，运维服务器组含地址、出网、账号、
-//! 口令。这里**只有判断，没有控件**——见 `lib.rs` 顶部的 crate 级约定。
+//! 按两段连接分组：维护目标只放一体机，运维服务器组只有一行——连接码
+//! （地址、账号、指纹都从它解析，界面上没有分开的框）。这里**只有判断，
+//! 没有控件**——见 `lib.rs` 顶部的 crate 级约定。
+//!
+//! # Task 8：连接码进表单
+//!
+//! 原来这里是四个分开的框（`gateway_host`/`gateway_port`/`username` 拼出
+//! 运维服务器与账号，`appliance_host`/`appliance_port` 是一体机），运维
+//! 人员现场对着一份纸条把地址、端口、账号分别抄进三个框，抄错一处就连不
+//! 上却查不出哪里错。方案改成：运维服务器那三格合并成一条「连接码」，
+//! 由运维一次性生成、工程师原样粘贴；地址、账号、指纹都从这一条字符串里
+//! 解析出来，格式错了（粘漏、粘串）rmc-core 的校验位会当场发现，不需要
+//! 工程师自己核对三个字段有没有抄对。
+//!
+//! 这一步（Task 8）只接线：连接码解析出来的指纹已经流到
+//! `rmc_core::tunnel::TunnelParams`，但**还没有任何人核对它**——TLS 仍然
+//! 只走公共 CA、SSH 仍然只走 known_hosts，指纹比对是 Task 9 的事，端口
+//! 仍然是 `Config::reverse_port`（Task 10 换）。中间态在功能上自相矛盾
+//! 是刻意的，只存在于这条 feature 分支。
 //!
 //! # W139：校验的出口带字段身份，不是一串裸字符串
 //!
@@ -16,26 +33,20 @@
 //! 出口**，这次也一样：[`FieldError`] 带 [`Field`]（哪个框）与
 //! [`Reason`]（为什么）。
 //!
-//! 成功一侧同样收紧了：返回的不是一对裸 [`HostPort`]，而是
-//! [`ValidatedAddresses`]——rmc-core 那个「拿到值本身就是校验通过的证据」
-//! 的类型。Task 10 的 Supervisor 需要的正是它，中间不再有一个「拿着两个
-//! 裸地址、还能绕开校验」的形态。
+//! 成功一侧同样收紧了：返回的不是一对裸地址，而是 [`Validated`]——携带
+//! 解析好的 [`ConnectionCode`] 与校验过关系的一体机地址。`rmc-core` 那个
+//! 「拿到值本身就是校验通过的证据」的思路在这里体现为：`Validated` 的
+//! 唯一生产入口就是 `validate()` 本身。
 //!
 //! # W140：语义校验只有一份，在 rmc-core
 //!
-//! brief 让这里自己重写「一体机不能指向本机」。那会造出第二份真相：
-//!
-//! - 规则会漂移。rmc-core 的 [`ValidatedAddresses::validate`] 其实有**两**
-//!   条规则（还有「一体机不能与运维服务器同地址」），brief 只抄了一条。
-//! - **重写就会把刚被 W125 清掉的那个词写回来**：rmc-core 现在的原话是
-//!   「一体机地址不能与运维服务器地址相同」，照着 brief 的思路重写一份，
-//!   十有八九写成带 Gateway 的版本。
-//!
-//! 所以这里只做**格式解析**（字符串 → [`HostPort`]），语义校验一律
-//! **调用** rmc-core，错误文案**原样**带回来挂到字段上
-//! （[`Reason::Rejected`]）。
+//! 一体机地址是否合法（不能等于运维服务器、不能指向本机）一律**调用**
+//! `rmc_core::config::ValidatedAddresses::validate`，错误文案**原样**带
+//! 回来挂到字段上（[`Reason::Rejected`]）。这里不重写语义规则，只做
+//! **格式解析**（字符串 → 类型）。
 
 use rmc_core::addr::HostPort;
+use rmc_core::code::ConnectionCode;
 use rmc_core::config::ValidatedAddresses;
 use zeroize::Zeroizing;
 
@@ -44,23 +55,18 @@ use zeroize::Zeroizing;
 pub enum Field {
     ApplianceHost,
     AppliancePort,
-    /// 运维服务器地址。**标识符沿用 rmc-core 的 `gateway`**（`Config::gateway`、
-    /// `ValidatedAddresses::gateway()`），需求禁的是**界面上的字**，见
-    /// [`Field::label`]。
-    GatewayHost,
-    GatewayPort,
-    Username,
+    /// 连接码。地址、账号、指纹都从它解析——运维服务器组现在只有这一行
+    /// 输入框，见模块顶部「Task 8」一节。
+    Code,
     Password,
 }
 
 impl Field {
-    /// 六个字段，声明顺序即界面从上到下的顺序。
-    pub const ALL: [Field; 6] = [
+    /// 四个字段，声明顺序即界面从上到下的顺序。
+    pub const ALL: [Field; 4] = [
         Field::ApplianceHost,
         Field::AppliancePort,
-        Field::GatewayHost,
-        Field::GatewayPort,
-        Field::Username,
+        Field::Code,
         Field::Password,
     ];
 
@@ -70,9 +76,7 @@ impl Field {
         match self {
             Field::ApplianceHost => "一体机地址",
             Field::AppliancePort => "一体机端口",
-            Field::GatewayHost => "运维服务器地址",
-            Field::GatewayPort => "运维服务器端口",
-            Field::Username => "账号",
+            Field::Code => "连接码",
             Field::Password => "密码",
         }
     }
@@ -87,7 +91,9 @@ pub enum Reason {
     NotAPort,
     /// 主机名/IP 本身不合法，见 `rmc_core::addr` 的 `valid_host`。
     BadHost,
-    /// rmc-core 的 [`ValidatedAddresses::validate`] 拒绝了这对地址。
+    /// rmc-core 拒绝了这个值——可能是 `ConnectionCode::parse`（连接码
+    /// 格式、校验位、域名）或者 [`ValidatedAddresses::validate`]（地址
+    /// 关系）。
     ///
     /// 文案**原样**来自 rmc-core，界面这边一个字都不重写（W140）。
     Rejected(String),
@@ -110,8 +116,8 @@ impl FieldError {
             Reason::Empty => format!("{}不能为空", self.field.label()),
             Reason::NotAPort => format!("{}必须是 1-65535 的整数", self.field.label()),
             Reason::BadHost => format!("{}不是合法的主机名或 IP", self.field.label()),
-            // rmc-core 的原话里已经点了名（「一体机地址不能……」），
-            // 再前缀一遍字段名会变成「一体机地址配置错误：一体机地址……」。
+            // rmc-core 的原话里已经点了名，再前缀一遍字段名会变成
+            // 「一体机地址配置错误：一体机地址……」。
             Reason::Rejected(m) => m.clone(),
         }
     }
@@ -126,9 +132,8 @@ impl FieldError {
 pub struct Form {
     pub appliance_host: String,
     pub appliance_port: String,
-    pub gateway_host: String,
-    pub gateway_port: String,
-    pub username: String,
+    /// 连接码原文。地址、账号、指纹都从它解析，界面上没有分开的框。
+    pub code: String,
     pub password: Zeroizing<String>,
     pub remember: bool,
     /// 自动检测的出网代理，None 表示直连。不是输入项。
@@ -141,7 +146,8 @@ pub struct Form {
 /// `#[derive(Debug, Default, Eq, PartialEq)] #[repr(transparent)]
 /// pub struct Zeroizing<Z>(Z)`。也就是说 `#[derive(Debug)]` 在 `Form` 上会
 /// 把口令**原样打全**，而口令是这个产品唯一真正敏感的东西，这一页是它
-/// 唯一的入口。
+/// 唯一的入口。`code` 不是秘密（连接码本身没有秘密，见
+/// `rmc_core::code` 模块文档），照常打印。
 ///
 /// 改红：把这个 impl 删掉换成 `#[derive(Debug)]`，
 /// `debug_output_redacts_the_password` 与
@@ -151,9 +157,7 @@ impl std::fmt::Debug for Form {
         f.debug_struct("Form")
             .field("appliance_host", &self.appliance_host)
             .field("appliance_port", &self.appliance_port)
-            .field("gateway_host", &self.gateway_host)
-            .field("gateway_port", &self.gateway_port)
-            .field("username", &self.username)
+            .field("code", &self.code)
             .field("password", &Redacted(self.password.len()))
             .field("remember", &self.remember)
             .field("detected_proxy", &self.detected_proxy)
@@ -171,14 +175,34 @@ impl std::fmt::Debug for Redacted {
     }
 }
 
+/// [`Form::validate`] 成功时给出的值：解析好的连接码 + 校验过关系的
+/// 一体机地址。这是拨号（Task 10 的 `Command::Start`）真正需要的一对
+/// 输入——字段私有由 [`ConnectionCode`] 自己的构造函数负责，这里不再
+/// 重复；把两者装进一个结构体只是为了让 `validate()` 的成功一侧带类型,
+/// 不是又一层校验。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Validated {
+    pub code: ConnectionCode,
+    pub appliance: HostPort,
+}
+
 impl Form {
-    /// 格式解析 + 语义校验。成功时给出 rmc-core 的
-    /// [`ValidatedAddresses`]，失败时给出**每个出错字段各一条**。
+    /// 连接码解析成功时给出 [`ConnectionCode`]，供界面画只读的「地址 ·
+    /// 账号」小字（[`crate::view::maintain`]）。跟 [`validate`]
+    /// (Self::validate) 不同：这里不做「一体机不能等于运维服务器」那道
+    /// 关系校验，只看连接码这一个字段自己合不合法——用户还没填一体机
+    /// 地址时也该能看见「地址 · 账号」这行只读文字。
+    pub fn parsed_code(&self) -> Option<ConnectionCode> {
+        ConnectionCode::parse(self.code.trim()).ok()
+    }
+
+    /// 格式解析 + 语义校验。成功时给出 [`Validated`]，失败时给出**每个
+    /// 出错字段各一条**。
     ///
-    /// 错误顺序是固定的（一体机地址、一体机端口、运维服务器地址、
-    /// 运维服务器端口、账号、密码、最后是 rmc-core 的语义拒绝），
-    /// 测试因此可以整份比对，而不是只数个数（W142）。
-    pub fn validate(&self) -> Result<ValidatedAddresses, Vec<FieldError>> {
+    /// 错误顺序是固定的（一体机地址、一体机端口、连接码、密码、最后是
+    /// rmc-core 的语义拒绝），测试因此可以整份比对，而不是只数个数
+    /// （W142）。
+    pub fn validate(&self) -> Result<Validated, Vec<FieldError>> {
         let mut errs = Vec::new();
 
         let appliance = parse_addr(
@@ -188,20 +212,26 @@ impl Form {
             Field::AppliancePort,
             &mut errs,
         );
-        let gateway = parse_addr(
-            &self.gateway_host,
-            &self.gateway_port,
-            Field::GatewayHost,
-            Field::GatewayPort,
-            &mut errs,
-        );
 
-        if self.username.trim().is_empty() {
+        let code = if self.code.trim().is_empty() {
             errs.push(FieldError {
-                field: Field::Username,
+                field: Field::Code,
                 reason: Reason::Empty,
             });
-        }
+            None
+        } else {
+            match ConnectionCode::parse(self.code.trim()) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    errs.push(FieldError {
+                        field: Field::Code,
+                        reason: Reason::Rejected(e.to_string()),
+                    });
+                    None
+                }
+            }
+        };
+
         if self.password.is_empty() {
             errs.push(FieldError {
                 field: Field::Password,
@@ -209,14 +239,18 @@ impl Form {
             });
         }
 
-        // W140：语义校验不在这里重写一份，调 rmc-core。两条规则
-        // （一体机不能等于运维服务器、一体机不能指向本机）都在那边，
-        // 文案也在那边。
-        let validated = match (appliance, gateway) {
-            (Some(a), Some(g)) => match ValidatedAddresses::validate(g, a) {
-                Ok(v) => Some(v),
+        // W140：语义校验不在这里重写一份,调 rmc-core。两条规则
+        // （一体机不能等于运维服务器、一体机不能指向本机）都在那边,
+        // 文案也在那边。这道校验以前靠 gateway_host,现在靠连接码里
+        // 解析出来的 IP（`code.server()`）。
+        let validated = match (appliance, code) {
+            (Some(a), Some(c)) => match ValidatedAddresses::validate(c.server(), a.clone()) {
+                Ok(_) => Some(Validated {
+                    code: c,
+                    appliance: a,
+                }),
                 Err(e) => {
-                    // 两条规则说的都是「一体机这个地址不该是这个值」，
+                    // 两条规则说的都是「一体机这个地址不该是这个值」,
                     // 所以标红的是一体机地址那个框。
                     errs.push(FieldError {
                         field: Field::ApplianceHost,
@@ -240,11 +274,11 @@ impl Form {
 
     /// 该**画到界面上**的错误：空字段不报。
     ///
-    /// 空框自己看得见是空的，首次打开就糊六行红字只会挡住真正的问题；
+    /// 空框自己看得见是空的，首次打开就糊几行红字只会挡住真正的问题；
     /// 而「开启远程维护」同时是灰的，已经说明了「还不能开始」。
     ///
     /// 这**不是第二份校验**——它是 [`validate`](Self::validate) 结果上的
-    /// 一次过滤，规则只有一份。`can_start` 走的仍然是完整的 `validate`，
+    /// 一次过滤，规则只有一份。`can_start` 走的仍然是完整的 `validate`,
     /// 两者不会分叉。
     pub fn visible_errors(&self) -> Vec<FieldError> {
         self.validate()
@@ -332,19 +366,28 @@ fn parse_addr(
 mod tests {
     use super::*;
     use rmc_core::banned_word_in;
+    use rmc_core::code::{AccountName, ServerFingerprint};
+
+    /// 一条能通过全部校验的连接码，账号 `tunnel-zhang`、地址
+    /// `203.0.113.10:22000`。**现生成，不手写常量**——手写的校验位会算
+    /// 错，而且一改格式就全废（见控制者补充）。
+    fn good_code() -> String {
+        ConnectionCode::new(
+            AccountName::parse("tunnel-zhang").unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            22000,
+            ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+        )
+        .expect("夹具必须合法")
+        .to_string()
+    }
 
     /// 一个能通过全部校验的表单。
-    ///
-    /// 地址刻意不用画板里那个 `gateway.company.com`：它含禁用词，
-    /// rmc-core 为它开了一条明确的豁免（那是**数据**，是方案设计.md
-    /// §3.10 的示意域名），但没有理由把这个豁免再复制到界面 crate 来。
     fn good() -> Form {
         Form {
-            appliance_host: "192.168.100.10".into(),
+            appliance_host: "192.168.1.1".into(),
             appliance_port: "61001".into(),
-            gateway_host: "ops.example.com".into(),
-            gateway_port: "443".into(),
-            username: "tunnel-zhang".into(),
+            code: good_code(),
             password: Zeroizing::new(CANARY.into()),
             remember: false,
             detected_proxy: None,
@@ -366,37 +409,23 @@ mod tests {
     #[test]
     fn valid_form_yields_the_validated_pair() {
         let v = good().validate().expect("这个表单本该通过");
-        assert_eq!(v.appliance().to_string(), "192.168.100.10:61001");
-        assert_eq!(v.gateway().to_string(), "ops.example.com:443");
+        assert_eq!(v.appliance.to_string(), "192.168.1.1:61001");
+        assert_eq!(v.code.server().to_string(), "203.0.113.10:22000");
+        assert_eq!(v.code.account().as_str(), "tunnel-zhang");
         assert!(good().can_start());
         assert!(good().visible_errors().is_empty());
     }
 
-    /// 首尾空白要在解析前吃掉——现场是从邮件里粘贴地址的。
+    /// 首尾空白要在解析前吃掉——现场是从邮件/聊天工具里粘贴连接码的。
     #[test]
     fn surrounding_whitespace_is_trimmed_before_parsing() {
         let mut f = good();
-        f.appliance_host = "  192.168.100.10  ".into();
+        f.appliance_host = "  192.168.1.1  ".into();
         f.appliance_port = " 61001 ".into();
+        let code = good_code();
+        f.code = format!("  {code}  ");
         let v = f.validate().expect("带空白的粘贴应当被接受");
-        assert_eq!(v.appliance().to_string(), "192.168.100.10:61001");
-    }
-
-    #[test]
-    fn empty_username_blocks_start_and_names_the_field() {
-        let mut f = good();
-        f.username.clear();
-        assert!(!f.can_start());
-        assert_eq!(
-            err_of(&f),
-            vec![FieldError {
-                field: Field::Username,
-                reason: Reason::Empty
-            }]
-        );
-        // 只填空格也算空。
-        f.username = "   ".into();
-        assert!(!f.can_start());
+        assert_eq!(v.appliance.to_string(), "192.168.1.1:61001");
     }
 
     #[test]
@@ -436,43 +465,24 @@ mod tests {
     #[test]
     fn a_port_of_zero_is_not_a_port() {
         let mut f = good();
-        f.gateway_port = "0".into();
+        f.appliance_port = "0".into();
         assert_eq!(
             err_of(&f),
             vec![FieldError {
-                field: Field::GatewayPort,
+                field: Field::AppliancePort,
                 reason: Reason::NotAPort
             }]
         );
         // 65536 越界，`parse::<u16>()` 自己会拒。
         let mut f = good();
-        f.gateway_port = "65536".into();
-        assert_eq!(err_of(&f)[0].field, Field::GatewayPort);
+        f.appliance_port = "65536".into();
+        assert_eq!(err_of(&f)[0].field, Field::AppliancePort);
         // 边界两端都要能过。
         let mut f = good();
-        f.gateway_port = "65535".into();
+        f.appliance_port = "65535".into();
         assert!(f.can_start());
-        f.gateway_port = "1".into();
+        f.appliance_port = "1".into();
         assert!(f.can_start());
-    }
-
-    /// W138：brief 原稿这条断言的是 `e.contains("Gateway 地址")`——
-    /// 一条**会上屏**的用户可见字符串，里面是需求明令禁止的词。
-    #[test]
-    fn bad_server_host_is_reported_on_that_field_without_the_banned_word() {
-        let mut f = good();
-        f.gateway_host = "gate way".into();
-        let errs = err_of(&f);
-        assert_eq!(
-            errs,
-            vec![FieldError {
-                field: Field::GatewayHost,
-                reason: Reason::BadHost
-            }],
-            "{errs:?}"
-        );
-        assert_eq!(errs[0].message(), "运维服务器地址不是合法的主机名或 IP");
-        assert_eq!(banned_word_in(&errs[0].message()), None);
     }
 
     /// 主机名坏了 + 端口也坏了，两个框各报各的，不许互相掩盖。
@@ -496,6 +506,75 @@ mod tests {
         );
     }
 
+    /// 连接码格式错，红字指向连接码这一框，而且是 rmc-core 给的那句话。
+    ///
+    /// 改红：`validate` 里把 `CodeError` 的文案换成一句固定的话——比如
+    /// 把 `Reason::Rejected(e.to_string())` 换成
+    /// `Reason::Rejected("坏了".into())`。
+    #[test]
+    fn a_bad_code_marks_the_code_field_with_the_parser_message() {
+        let mut f = good();
+        f.code = "rmc1:nonsense".into();
+        let errs = f.visible_errors();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, Field::Code);
+        match &errs[0].reason {
+            Reason::Rejected(msg) => {
+                assert!(msg.contains("格式不对"), "{msg}");
+                assert_eq!(banned_word_in(msg), None, "{msg}");
+            }
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn a_domain_in_the_code_is_refused_with_the_dedicated_text() {
+        let mut f = good();
+        // 校验位随之失效——先撞 Checksum，也是 Rejected，但仍然标在
+        // 连接码这一框上，且不含禁用词。
+        f.code = good_code().replace("203.0.113.10", "ops.example.com");
+        assert!(f.is_marked(Field::Code));
+        let errs = err_of(&f);
+        match &errs
+            .iter()
+            .find(|e| e.field == Field::Code)
+            .expect("连接码框该标红")
+            .reason
+        {
+            Reason::Rejected(msg) => assert_eq!(banned_word_in(msg), None, "{msg}"),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_code_blocks_start_silently_like_the_other_empty_fields() {
+        let mut f = good();
+        f.code.clear();
+        assert!(!f.can_start());
+        assert!(f.visible_errors().is_empty(), "空着不标红");
+    }
+
+    /// 一体机地址不能等于运维服务器地址——这条校验以前靠 gateway_host,
+    /// 现在靠连接码里的 IP。
+    #[test]
+    fn appliance_equal_to_the_server_in_the_code_is_rejected() {
+        let mut f = good();
+        f.appliance_host = "203.0.113.10".into();
+        f.appliance_port = "22000".into();
+        assert!(f.is_marked(Field::ApplianceHost));
+    }
+
+    #[test]
+    fn parsed_code_exposes_address_and_account_for_the_read_only_line() {
+        let f = good();
+        let c = f.parsed_code().expect("好的连接码");
+        assert_eq!(c.account().as_str(), "tunnel-zhang");
+        assert_eq!(c.server().to_string(), "203.0.113.10:22000");
+        let mut bad = f.clone();
+        bad.code = "x".into();
+        assert!(bad.parsed_code().is_none());
+    }
+
     /// W140：语义校验只有一份，在 rmc-core。
     ///
     /// 断言的是**文案逐字等于 rmc-core 的原话**，不是「包含某几个字」——
@@ -507,7 +586,7 @@ mod tests {
         let errs = err_of(&f);
 
         let from_core = ValidatedAddresses::validate(
-            "ops.example.com:443".parse().unwrap(),
+            "203.0.113.10:22000".parse().unwrap(),
             "127.0.0.1:61001".parse().unwrap(),
         )
         .expect_err("rmc-core 本该拒绝回环一体机")
@@ -524,20 +603,20 @@ mod tests {
         assert_eq!(banned_word_in(&from_core), None);
     }
 
-    /// W140 的另一半：brief 根本没抄的那条规则。
+    /// W140 的另一半：容易漏掉的第二条规则。
     ///
     /// 自己重写一份校验最会漏的就是它——而它正是「运维服务器」这个词在
     /// rmc-core 里的落点（`一体机地址不能与运维服务器地址相同`）。
     #[test]
     fn an_appliance_equal_to_the_server_is_rejected_by_rmc_core_verbatim() {
         let mut f = good();
-        f.appliance_host = "ops.example.com".into();
-        f.appliance_port = "443".into();
+        f.appliance_host = "203.0.113.10".into();
+        f.appliance_port = "22000".into();
         let errs = err_of(&f);
 
         let from_core = ValidatedAddresses::validate(
-            "ops.example.com:443".parse().unwrap(),
-            "ops.example.com:443".parse().unwrap(),
+            "203.0.113.10:22000".parse().unwrap(),
+            "203.0.113.10:22000".parse().unwrap(),
         )
         .expect_err("rmc-core 本该拒绝一体机与运维服务器同地址")
         .to_string();
@@ -558,9 +637,9 @@ mod tests {
     #[test]
     fn all_errors_are_reported_at_once() {
         let mut f = good();
-        f.username.clear();
         f.appliance_port = "0".into();
-        f.gateway_host = "bad host".into();
+        f.code = "rmc1:nonsense".into();
+        f.password = Zeroizing::new(String::new());
         assert_eq!(
             err_of(&f),
             vec![
@@ -569,11 +648,15 @@ mod tests {
                     reason: Reason::NotAPort
                 },
                 FieldError {
-                    field: Field::GatewayHost,
-                    reason: Reason::BadHost
+                    field: Field::Code,
+                    reason: Reason::Rejected(
+                        ConnectionCode::parse("rmc1:nonsense")
+                            .unwrap_err()
+                            .to_string()
+                    )
                 },
                 FieldError {
-                    field: Field::Username,
+                    field: Field::Password,
                     reason: Reason::Empty
                 },
             ]
@@ -584,11 +667,11 @@ mod tests {
     fn clear_password_empties_it_and_keeps_everything_else() {
         let mut f = good();
         f.remember = true;
+        let code_before = f.code.clone();
         f.clear_password();
         assert!(f.password.is_empty());
-        assert_eq!(f.username, "tunnel-zhang");
-        assert_eq!(f.appliance_host, "192.168.100.10");
-        assert_eq!(f.gateway_host, "ops.example.com");
+        assert_eq!(f.code, code_before);
+        assert_eq!(f.appliance_host, "192.168.1.1");
         assert!(f.remember, "「记住密码」这个勾不该被一起清掉");
         assert!(!f.can_start(), "口令清了就不该还能开始");
     }
@@ -619,7 +702,7 @@ mod tests {
         // 少了这一步，一个 `write!(f, "")` 的空实现也能让下面全绿。
         assert!(dumped.contains("Form"), "{dumped}");
         assert!(dumped.contains("tunnel-zhang"), "{dumped}");
-        assert!(dumped.contains("192.168.100.10"), "{dumped}");
+        assert!(dumped.contains("192.168.1.1"), "{dumped}");
         assert!(
             dumped.contains("password"),
             "口令字段本身得在，只是内容要遮住"
@@ -645,22 +728,20 @@ mod tests {
         assert_eq!(*f.password, CANARY, "内容本身得原样克隆过来");
     }
 
-    /// 六个字段一个槽位。**穷尽 match**：往 `Field` 加变体时这里直接
-    /// 编译不过；补一个 `=> 6` 又会让 `[false; 6]` 越界。
+    /// 四个字段一个槽位。**穷尽 match**：往 `Field` 加变体时这里直接
+    /// 编译不过；补一个 `=> 4` 又会让 `[false; 4]` 越界。
     fn field_index(f: Field) -> usize {
         match f {
             Field::ApplianceHost => 0,
             Field::AppliancePort => 1,
-            Field::GatewayHost => 2,
-            Field::GatewayPort => 3,
-            Field::Username => 4,
-            Field::Password => 5,
+            Field::Code => 2,
+            Field::Password => 3,
         }
     }
 
     #[test]
     fn field_all_lists_every_variant_exactly_once() {
-        let mut seen = [false; 6];
+        let mut seen = [false; 4];
         for f in Field::ALL {
             let i = field_index(f);
             assert!(!seen[i], "第 {i} 个字段在 ALL 里出现了两次");
@@ -679,7 +760,7 @@ mod tests {
         assert_eq!(banned_word_in("Gateway 地址"), Some("Gateway"));
 
         let rejected = ValidatedAddresses::validate(
-            "ops.example.com:443".parse().unwrap(),
+            "203.0.113.10:22000".parse().unwrap(),
             "127.0.0.1:61001".parse().unwrap(),
         )
         .expect_err("本该被拒")
@@ -723,7 +804,7 @@ mod tests {
         // 一个空框 + 一个填错的框：只画填错的那条，但两条都拦着开始。
         let mut f = good();
         f.appliance_port = "abc".into();
-        f.username.clear();
+        f.password = Zeroizing::new(String::new());
         assert_eq!(f.validate().unwrap_err().len(), 2);
         assert_eq!(f.visible_errors().len(), 1);
         assert_eq!(f.visible_errors()[0].field, Field::AppliancePort);
@@ -736,9 +817,9 @@ mod tests {
         let mutations: [fn(&mut Form); 5] = [
             |f| f.password = Zeroizing::new(String::new()),
             |f| f.appliance_port = "0".into(),
-            |f| f.gateway_host = "bad host".into(),
+            |f| f.code = "rmc1:nonsense".into(),
             |f| f.appliance_host = "127.0.0.1".into(),
-            |f| f.username.clear(),
+            |f| f.code.clear(),
         ];
         let mut cases = vec![Form::default(), good()];
         for mutate in mutations {

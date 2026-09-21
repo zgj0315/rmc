@@ -312,6 +312,7 @@
 
 use crate::audit::{Audit, Level};
 use crate::backoff::{Backoff, Jitter};
+use crate::code::ConnectionCode;
 use crate::config::{Config, ValidatedAddresses};
 use crate::error::{Error, ErrorClass};
 use crate::platform::{SystemEvent, SystemEvents};
@@ -358,8 +359,17 @@ pub struct Deps {
 /// 依赖着裸 `HostPort` 的字段类型，改了会让那个外部 crate 编译不过（见
 /// `tunnel.rs` 顶部 R20/R48 的详细权衡）。这里没有类似的外部依赖，直接
 /// 把"这对地址已经校验过"这件事在类型上多留一层证据。
+///
+/// Task 8：`username: String` 换成 `code: ConnectionCode`——账号仍然
+/// 是从这里派生（`code.account()`），换成携带整条连接码是因为拨号还
+/// 需要它的指纹（`code.fingerprint()`），而指纹现在只跟着连接码走，
+/// 没有第二个字段单独存它的必要。`addrs`（`ValidatedAddresses`）不变：
+/// 它是 `ValidatedAddresses::validate(code.server(), appliance)` 的
+/// 校验结果，`code.server()` 参与了这次校验，但校验完之后拨号读的仍是
+/// `addrs.gateway()`——两者此刻取值相同，只是出处不同，跟 R96 的道理
+/// 一致（拨号只认一个真相来源，不认第二份"应该跟它一样"的拷贝）。
 struct Credentials {
-    username: String,
+    code: ConnectionCode,
     password: Zeroizing<String>,
     addrs: ValidatedAddresses,
 }
@@ -373,13 +383,18 @@ impl Credentials {
     ///
     /// 会让 `start_passes_the_commanded_gateway_all_the_way_to_the_
     /// factory` 变红的实现改法：把下面这一行换成任何别的地址。
+    ///
+    /// Task 8：`fingerprint` 是新加的一段——连接码里的指纹现在跟着
+    /// 传到这里，但还没有任何人核对它（见 `tunnel::TunnelParams` 上
+    /// 关于这个字段的说明），这是刻意的中间态。
     fn params(&self, reverse_port: u16) -> TunnelParams {
         TunnelParams {
-            username: self.username.clone(),
+            username: self.code.account().to_string(),
             password: self.password.clone(),
             reverse_port,
             gateway: self.addrs.gateway().clone(),
             appliance: self.addrs.appliance().clone(),
+            fingerprint: *self.code.fingerprint(),
         }
     }
 }
@@ -411,13 +426,13 @@ impl Supervisor {
     pub(crate) fn spawn_with_validated_start(
         cfg: Config,
         deps: Deps,
-        username: String,
+        code: ConnectionCode,
         password: Zeroizing<String>,
         addrs: ValidatedAddresses,
     ) -> (mpsc::Sender<Command>, broadcast::Receiver<TunnelEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (ev_tx, ev_rx) = broadcast::channel(EVENT_CAPACITY);
-        let initial = Some((username, password, addrs));
+        let initial = Some((code, password, addrs));
         tokio::spawn(run(cfg, deps, cmd_rx, ev_tx, initial));
         (cmd_tx, ev_rx)
     }
@@ -848,7 +863,7 @@ async fn stop_everything(
 /// 接，不额外 `unwrap`，不假设这个内部实现细节永远不变。
 fn begin(
     ctx: &mut Ctx,
-    username: String,
+    code: ConnectionCode,
     password: Zeroizing<String>,
     addrs: ValidatedAddresses,
 ) -> Option<(
@@ -858,18 +873,19 @@ fn begin(
 )> {
     // 审计：谁、连到了哪台一体机——这是"事后追责"四个问题里另外两个,
     // `set_state` 记的通用状态迁移行看不出来（`State` 不携带账号/地址）。
-    // 只记账号与地址，不记口令；`username` 在这里只是被 `format!` 借用,
+    // 只记账号与地址，不记口令；`code` 在这里只是被 `format!` 借用,
     // 随后仍然原样移进下面的 `Credentials`。
     ctx.audit.record(
         Level::Info,
         &format!(
-            "开始连接：账号 {username}，运维服务器 {}，一体机 {}",
+            "开始连接：账号 {}，运维服务器 {}，一体机 {}",
+            code.account(),
             addrs.gateway(),
             addrs.appliance()
         ),
     );
     ctx.creds = Some(Credentials {
-        username,
+        code,
         password,
         addrs,
     });
@@ -884,7 +900,7 @@ async fn run(
     deps: Deps,
     mut cmd_rx: mpsc::Receiver<Command>,
     ev: broadcast::Sender<TunnelEvent>,
-    initial: Option<(String, Zeroizing<String>, ValidatedAddresses)>,
+    initial: Option<(ConnectionCode, Zeroizing<String>, ValidatedAddresses)>,
 ) {
     let mut sys = deps.events.subscribe();
     // W82/W94：事件源关掉之后就不要再 poll 它了，见下面 `sys.recv()`
@@ -951,9 +967,9 @@ async fn run(
     // connected` 断言 `seen[0]` 是 `Preflight` 时失败——实际
     // `seen[0]` 会是这条多余的 `Idle`。只在状态真的发生变化时才广播。
 
-    if let Some((username, password, addrs)) = initial {
+    if let Some((code, password, addrs)) = initial {
         if let Some((new_msg_rx, new_connect_rx, new_pending_handle)) =
-            begin(&mut ctx, username, password, addrs)
+            begin(&mut ctx, code, password, addrs)
         {
             msg_rx = new_msg_rx;
             connect_rx = new_connect_rx;
@@ -990,17 +1006,17 @@ async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { ctx.teardown(&mut connect_rx, &pending_handle).await; return };
                 match cmd {
-                    Command::Start { username, password, gateway, appliance } => {
+                    Command::Start { code, password, appliance } => {
                         // R71：不看 `ctx.state`——背靠背发 `Start` 后
                         // 立刻又发一条命令，中间没有任何 `.await`，
                         // `ctx.state` 这时可能还没来得及离开 `Idle`。
                         if connecting_or_connected(&ctx) || in_backoff(&ctx) {
                             continue;
                         }
-                        match ValidatedAddresses::validate(gateway, appliance) {
+                        match ValidatedAddresses::validate(code.server(), appliance) {
                             Ok(addrs) => {
                                 probe_at = None;
-                                if let Some((new_msg_rx, new_connect_rx, new_pending_handle)) = begin(&mut ctx, username, password, addrs) {
+                                if let Some((new_msg_rx, new_connect_rx, new_pending_handle)) = begin(&mut ctx, code, password, addrs) {
                                     msg_rx = new_msg_rx;
                                     connect_rx = new_connect_rx;
                                     pending_handle = new_pending_handle;
@@ -1825,9 +1841,8 @@ mod tests {
 
     fn start() -> Command {
         Command::Start {
-            username: "tunnel-zhang".into(),
+            code: crate::state::test_code(),
             password: Zeroizing::new("pw".into()),
-            gateway: "gateway.company.com:443".parse().unwrap(),
             appliance: "192.168.100.10:22".parse().unwrap(),
         }
     }
@@ -2447,7 +2462,7 @@ mod tests {
             let (_tx, mut rx) = Supervisor::spawn_with_validated_start(
                 config(),
                 deps(factory, Arc::new(NoSystemEvents::default())),
-                "tunnel-zhang".into(),
+                crate::state::test_code(),
                 Zeroizing::new("pw".into()),
                 ValidatedAddresses::for_test(gateway, appliance),
             );
@@ -2560,7 +2575,7 @@ mod tests {
             let (_tx, mut rx) = Supervisor::spawn_with_validated_start(
                 config(),
                 deps(factory, Arc::new(NoSystemEvents::default())),
-                "tunnel-zhang".into(),
+                crate::state::test_code(),
                 Zeroizing::new("pw".into()),
                 ValidatedAddresses::for_test(gateway, appliance),
             );
@@ -2925,9 +2940,8 @@ mod tests {
             let (tx, mut rx) =
                 Supervisor::spawn(cfg, deps(factory, Arc::new(NoSystemEvents::default())));
             tx.send(Command::Start {
-                username: "tunnel-zhang".into(),
+                code: crate::state::test_code(),
                 password: Zeroizing::new("PLAINTEXT-SECRET-9f2a".into()),
-                gateway: "gateway.company.com:443".parse().unwrap(),
                 appliance: "192.168.100.10:22".parse().unwrap(),
             })
             .await
@@ -3381,10 +3395,11 @@ mod tests {
     }
 
     // 会让这条测试变红的实现改法：把 `Command::Start` 处理里的
-    // `ValidatedAddresses::validate(gateway, appliance)` 删掉，直接用
-    // 命令携带的裸 `gateway`/`appliance` 构造 `Credentials`——那样
-    // 预检会照常通过（`AlwaysPassPreflight` 不检查地址），后台连接任务
-    // 会调用 `PanicsIfEstablishIsCalled::establish`，测试 panic。
+    // `ValidatedAddresses::validate(code.server(), appliance)` 删掉，
+    // 直接用命令携带的 `code.server()`/裸 `appliance` 构造
+    // `Credentials`——那样预检会照常通过（`AlwaysPassPreflight` 不检查
+    // 地址），后台连接任务会调用 `PanicsIfEstablishIsCalled::establish`，
+    // 测试 panic。
     #[tokio::test(start_paused = true)]
     async fn start_rejects_appliance_equal_to_gateway_before_touching_the_factory() {
         guard(async {
@@ -3395,12 +3410,12 @@ mod tests {
                     Arc::new(NoSystemEvents::default()),
                 ),
             );
-            let gw: HostPort = "gateway.company.com:443".parse().unwrap();
+            let code = crate::state::test_code();
+            let same_as_server = code.server();
             tx.send(Command::Start {
-                username: "tunnel-zhang".into(),
+                code,
                 password: Zeroizing::new("pw".into()),
-                gateway: gw.clone(),
-                appliance: gw,
+                appliance: same_as_server,
             })
             .await
             .unwrap();
@@ -3434,9 +3449,8 @@ mod tests {
                 ),
             );
             tx.send(Command::Start {
-                username: "tunnel-zhang".into(),
+                code: crate::state::test_code(),
                 password: Zeroizing::new("pw".into()),
-                gateway: "gateway.company.com:443".parse().unwrap(),
                 appliance: "127.0.0.1:22".parse().unwrap(),
             })
             .await
@@ -3506,9 +3520,18 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn start_passes_the_commanded_gateway_all_the_way_to_the_factory() {
         guard(async {
-            // 跟 `config().gateway`（gateway.company.com:443）不同的
-            // 一台——"现场工程师把地址改成客户现场那一台"。
-            let onsite: HostPort = "onsite-gw.customer.example:8443".parse().unwrap();
+            // 跟 `crate::state::test_code()` 里那台（也是 `start()`/
+            // 其它夹具默认用的那一台）不同的一台——"现场工程师把连接码
+            // 换成客户现场那一台"。连接码只接受 IP，不接受域名，所以
+            // 这里不能沿用旧版那个域名字面量。
+            let onsite_code = ConnectionCode::new(
+                crate::code::AccountName::parse("tunnel-zhang").unwrap(),
+                "198.51.100.7".parse().unwrap(),
+                8443,
+                crate::code::ServerFingerprint::of_ed25519_public(&[3u8; 32]),
+            )
+            .expect("测试夹具必须合法");
+            let onsite = onsite_code.server();
             let appliance: HostPort = "192.168.100.10:22".parse().unwrap();
 
             let (factory, calls) = Scripted::new(vec![Outcome::Ok(vec![
@@ -3524,9 +3547,8 @@ mod tests {
 
             let (tx, mut rx) = Supervisor::spawn(config(), deps);
             tx.send(Command::Start {
-                username: "tunnel-zhang".into(),
+                code: onsite_code,
                 password: Zeroizing::new("pw".into()),
-                gateway: onsite.clone(),
                 appliance: appliance.clone(),
             })
             .await
@@ -3591,12 +3613,12 @@ mod tests {
             // 换一组非法地址（一体机等于 Gateway）——校验会失败，
             // `ctx.state` 停在 Failed 允许再发 Start，这条命令能被
             // 处理到。
-            let gw: HostPort = "gateway.company.com:443".parse().unwrap();
+            let code = crate::state::test_code();
+            let same_as_server = code.server();
             tx.send(Command::Start {
-                username: "tunnel-zhang".into(),
+                code,
                 password: Zeroizing::new("pw".into()),
-                gateway: gw.clone(),
-                appliance: gw,
+                appliance: same_as_server,
             })
             .await
             .unwrap();
@@ -3636,10 +3658,10 @@ mod tests {
             ev,
             state: State::Connected { degraded: false },
             creds: Some(Credentials {
-                username: "tunnel-zhang".into(),
+                code: crate::state::test_code(),
                 password: Zeroizing::new("pw".into()),
                 addrs: ValidatedAddresses::validate(
-                    "gateway.company.com:443".parse().unwrap(),
+                    crate::state::test_code().server(),
                     "192.168.100.10:22".parse().unwrap(),
                 )
                 .unwrap(),
@@ -4316,10 +4338,14 @@ mod tests {
                 config(),
                 deps(factory.clone(), Arc::new(NoSystemEvents::default())),
             );
+            // `test_code()` 的账号必须跟假 SSH 服务端接受的账号
+            // (`TEST_USER`) 一致——两者碰巧都是 "tunnel-zhang"，这里断言
+            // 一下，免得日后某一边改了字面量而这条测试悄悄失去意义。
+            let code = crate::state::test_code();
+            assert_eq!(code.account().as_str(), TEST_USER);
             tx.send(Command::Start {
-                username: TEST_USER.into(),
+                code,
                 password: Zeroizing::new(TEST_PASSWORD.into()),
-                gateway: "gateway.company.com:443".parse().unwrap(),
                 appliance: "192.168.100.10:61001".parse().unwrap(),
             })
             .await

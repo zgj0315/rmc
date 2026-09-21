@@ -158,29 +158,24 @@ fn server_card<'a>(
     ]);
 
     let mut content = column![
-        addr_row(
-            "地址",
-            form,
-            (&form.gateway_host, &form.gateway_port),
-            (Field::GatewayHost, Field::GatewayPort),
-            (Message::GatewayHostChanged, Message::GatewayPortChanged),
-            editable,
-        ),
+        line(row![
+            row_label("连接码"),
+            input(
+                &form.code,
+                "粘贴运维发来的连接码",
+                form.is_marked(Field::Code),
+                editable,
+                Message::CodeChanged,
+            )
+            .width(Length::Fill),
+        ]),
+        // 解析成功：「地址 203.0.113.10:22000 · 账号 tunnel-zhang」
+        // （小字）；失败：空行占位，不挤动下面几行的位置。
+        parsed_line(form),
         egress,
     ];
 
     if credentials {
-        content = content.push(line(row![
-            row_label("账号"),
-            input(
-                &form.username,
-                "账号",
-                form.is_marked(Field::Username),
-                editable,
-                Message::UsernameChanged,
-            )
-            .width(Length::Fill),
-        ]));
         content = content.push(line(row![
             row_label("密码"),
             input(
@@ -220,6 +215,19 @@ fn server_card<'a>(
     }
 
     card(content.into())
+}
+
+/// 连接码解析成功时画的只读小字：地址与账号。**不是输入项**，界面上
+/// 没有分开的地址/账号框——见 `form::Form` 上「Task 8」一节。
+///
+/// 解析失败（还没填、格式不对）时画一个空行占位，不让下面几行随着
+/// 这一行有没有字而上下窜动。
+fn parsed_line<'a>(form: &Form) -> Element<'a, Message> {
+    let t = match form.parsed_code() {
+        Some(c) => format!("地址 {} · 账号 {}", c.server(), c.account()),
+        None => String::new(),
+    };
+    line(row![row_label(""), text(t).size(12).color(color::TEXT_SUB),])
 }
 
 /// 填错的字段各一行红字。空字段不在里面，见 [`Form::visible_errors`]。
@@ -336,20 +344,29 @@ pub fn view<'a>(
 mod tests {
     use super::*;
     use crate::APP_THEME;
+    use rmc_core::code::{AccountName, ConnectionCode, ServerFingerprint};
     use rmc_core::state::State;
     use zeroize::Zeroizing;
 
-    /// 一份只改**运维服务器那一对地址**的表单。
+    /// 一份只改**运维服务器地址**（连接码里解析出来的那个 IP:端口）的
+    /// 表单。连接码只接受 IP，不接受域名，所以旧版那个
+    /// `"ops.example.com"` 字面量没法沿用。
     ///
     /// 一体机那两个框里的字（`192.168.100.10` / `61001`）在所有夹具里
     /// 逐字相同——这是下面那条测试成立的前提。
-    fn form_with_server(host: &str, port: &str) -> Form {
+    fn form_with_server(ip: &str, port: u16) -> Form {
+        let code = ConnectionCode::new(
+            AccountName::parse("tunnel-zhang").unwrap(),
+            ip.parse().unwrap(),
+            port,
+            ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+        )
+        .expect("夹具必须合法")
+        .to_string();
         Form {
             appliance_host: "192.168.100.10".into(),
             appliance_port: "61001".into(),
-            gateway_host: host.into(),
-            gateway_port: port.into(),
-            username: "tunnel-zhang".into(),
+            code,
             // 这一页别的测试用金丝雀守 `Debug`，这里不测 `Debug`，
             // 只需要一个非空口令让 `validate` 走得到语义校验那一步。
             password: Zeroizing::new("placeholder".into()),
@@ -431,12 +448,12 @@ mod tests {
         let baseline = dir.path().join("appliance-row");
 
         // 合法：一体机地址框不标红。
-        let clean = form_with_server("ops.example.com", "443");
+        let clean = form_with_server("203.0.113.10", 22000);
         assert!(clean.validate().is_ok(), "夹具 clean 本该通过校验");
         assert!(!clean.is_marked(Field::ApplianceHost));
 
         // 一体机 == 运维服务器：rmc-core 拒绝，错误挂在 ApplianceHost 上。
-        let marked = form_with_server("192.168.100.10", "61001");
+        let marked = form_with_server("192.168.100.10", 61001);
         assert!(
             marked.is_marked(Field::ApplianceHost),
             "夹具 marked 本该让一体机地址框标红：{:?}",
@@ -489,9 +506,9 @@ mod tests {
                 .expect("读写基线哈希")
         };
 
-        assert!(page(&form_with_server("ops.example.com", "443")));
+        assert!(page(&form_with_server("203.0.113.10", 22000)));
         assert!(
-            !page(&form_with_server("192.168.100.10", "61001")),
+            !page(&form_with_server("192.168.100.10", 61001)),
             "整页两帧居然相同"
         );
     }

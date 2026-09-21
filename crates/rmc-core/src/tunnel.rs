@@ -72,6 +72,7 @@
 //! 有了，所以类型约束也该跟上"这个直觉去拆一个还在用的外部测试文件。
 
 use crate::addr::HostPort;
+use crate::code::ServerFingerprint;
 use crate::error::Result;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -115,6 +116,13 @@ pub struct TunnelParams {
     /// 这条隧道实际要拨的 Gateway，也是 host key 要比对的那一台。
     pub gateway: HostPort,
     pub appliance: HostPort,
+    /// 连接码里带出来的运维服务器指纹。
+    ///
+    /// Task 8（本任务）只接线：这个字段已经从连接码一路传到这里，但
+    /// 还没有任何人核对它——TLS 仍然只走公共 CA、SSH 仍然只走
+    /// known_hosts，指纹比对是 Task 9 的事。中间态在功能上自相矛盾
+    /// （指纹传进去了却没人核对）是刻意的，只存在于这条 feature 分支。
+    pub fingerprint: ServerFingerprint,
 }
 
 impl std::fmt::Debug for TunnelParams {
@@ -125,6 +133,8 @@ impl std::fmt::Debug for TunnelParams {
             .field("reverse_port", &self.reverse_port)
             .field("gateway", &self.gateway)
             .field("appliance", &self.appliance)
+            // 指纹不是秘密——它跟账号名、地址一样是连接码里公开的一段。
+            .field("fingerprint", &self.fingerprint)
             .finish()
     }
 }
@@ -206,6 +216,7 @@ mod tests {
             reverse_port: 22001,
             gateway: HostPort::new("gateway.company.com", 443).unwrap(),
             appliance: HostPort::new("192.168.1.1", 61001).unwrap(),
+            fingerprint: ServerFingerprint::of_ed25519_public(&[9u8; 32]),
         };
         let printed = format!("{p:?}");
         assert!(!printed.contains("super-secret-pw"), "{printed}");

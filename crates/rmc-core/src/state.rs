@@ -5,6 +5,7 @@
 //! [`Command`]，不直接持有或修改 [`State`]。
 
 use crate::addr::HostPort;
+use crate::code::ConnectionCode;
 use crate::diagnostic::ProxyObservation;
 use crate::error::ErrorClass;
 use crate::preflight::PreflightReport;
@@ -24,20 +25,23 @@ pub enum State {
 
 /// 界面发给内核的命令。
 ///
-/// `Start` 携带的 `gateway`/`appliance` 是界面上直接输入的原始地址——
-/// Supervisor 处理这条命令时必须先用它们跑一遍
-/// `config::ValidatedAddresses::validate`，校验通过才能继续（见
-/// `supervisor.rs` 顶部的说明与 `config.rs` 上 `ValidatedAddresses` 的
-/// 文档）。这两条字段特意留成裸 `HostPort` 而不是 `ValidatedAddresses`——
-/// 后者的唯一生产构造入口就是 `validate` 本身，如果 `Command::Start`
-/// 直接收 `ValidatedAddresses`，调用方（界面）就得自己先调用一次
-/// `validate` 才能拼出这个命令，校验逻辑会被迫复制到 rmc-core 之外；
-/// 让 Supervisor 在处理命令时统一做这件事，校验规则只有一份。
+/// `Start` 携带一条已经解析好的 [`ConnectionCode`]（账号、运维服务器
+/// 地址、指纹都从它取）与界面上直接输入的一体机原始地址 `appliance`。
+/// `appliance` 特意留成裸 `HostPort` 而不是 `ValidatedAddresses`——
+/// 后者的唯一生产构造入口就是 `config::ValidatedAddresses::validate`
+/// 本身，如果 `Command::Start` 直接收 `ValidatedAddresses`，调用方
+/// （界面）就得自己先调用一次 `validate` 才能拼出这个命令，校验逻辑会
+/// 被迫复制到 rmc-core 之外；让 Supervisor 处理这条命令时统一调用
+/// `ValidatedAddresses::validate(code.server(), appliance)`，校验规则
+/// 只有一份（见 `supervisor.rs` 顶部的说明与 `config.rs` 上
+/// `ValidatedAddresses` 的文档）。
+///
+/// 本任务（Task 8）只接线：`code` 携带的指纹目前还没有任何人核对
+/// （TLS 仍走公共 CA、SSH 仍走 known_hosts），那是 Task 9 的事。
 pub enum Command {
     Start {
-        username: String,
+        code: ConnectionCode,
         password: Zeroizing<String>,
-        gateway: HostPort,
         appliance: HostPort,
     },
     /// 取消一次尚未连接成功的开启（Preflight/Connecting 阶段）。
@@ -58,15 +62,12 @@ impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Command::Start {
-                username,
-                gateway,
-                appliance,
-                ..
+                code, appliance, ..
             } => f
                 .debug_struct("Start")
-                .field("username", username)
+                .field("account", &code.account().as_str())
+                .field("server", &code.server())
                 .field("password", &"<redacted>")
-                .field("gateway", gateway)
                 .field("appliance", appliance)
                 .finish(),
             Command::Cancel => write!(f, "Cancel"),
@@ -107,6 +108,25 @@ pub enum TunnelEvent {
     Proxy(ProxyObservation),
 }
 
+/// 共用测试夹具：一条合法的连接码，账号 `tunnel-zhang`、地址
+/// `203.0.113.10:22000`。`rmc-core` 里凡是需要一条 `ConnectionCode`
+/// 夹具的测试模块（`supervisor.rs` 等）都走这一个，不各自手造——
+/// 手造的话，指纹用什么字节、账号是否合法这类细节会在多处重复决定。
+///
+/// `.expect(...)`：端口 22000 非 0，`new` 只会在端口为 0 时拒绝，这里
+/// 传的是编译期常量，不可能失败。
+#[cfg(test)]
+pub(crate) fn test_code() -> ConnectionCode {
+    use crate::code::{AccountName, ServerFingerprint};
+    ConnectionCode::new(
+        AccountName::parse("tunnel-zhang").unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        22000,
+        ServerFingerprint::of_ed25519_public(&[9u8; 32]),
+    )
+    .expect("测试夹具：端口非 0，构造必定成功")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,9 +136,8 @@ mod tests {
         // 与 tunnel::TunnelParams 上同名测试对称：Command::Start 是另一个
         // 携带口令的公开类型，容易在加字段时漏掉手写 Debug 的同步维护。
         let cmd = Command::Start {
-            username: "tunnel-zhang".into(),
+            code: test_code(),
             password: Zeroizing::new("super-secret-pw".to_string()),
-            gateway: HostPort::new("gateway.company.com", 443).unwrap(),
             appliance: HostPort::new("192.168.1.1", 61001).unwrap(),
         };
         let printed = format!("{cmd:?}");

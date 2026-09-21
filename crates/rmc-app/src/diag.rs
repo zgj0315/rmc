@@ -832,7 +832,14 @@ fn read_log_range(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
 /// 不可把凭据送出去。
 pub fn redaction_for(form: &crate::form::Form) -> Redaction {
     let mut r = Redaction::new();
-    r.hide(&form.password).hide(form.username.trim());
+    r.hide(&form.password);
+    // 账号名从连接码里解析——Task 8 把 `username` 单独一个框合并进了
+    // `code`（见 `form::Form` 上「Task 8」一节）。连接码解析不出来就
+    // 没有账号可登记，不是这个函数该处理的事（`validate()` 会在别处
+    // 挡住无效表单）。
+    if let Some(c) = form.parsed_code() {
+        r.hide(c.account().as_str());
+    }
     r
 }
 
@@ -1537,8 +1544,8 @@ mod tests {
     ///
     /// - 把 [`redaction_for`] 的函数体换成 `Redaction::new()`（"忘了
     ///   登记"）→ 主断言当场红；
-    /// - 只登记口令、漏掉账号（`.hide(form.username.trim())` 删掉）→
-    ///   账号那一半红；
+    /// - 只登记口令、漏掉账号（`r.hide(c.account().as_str())` 那一段
+    ///   删掉）→ 账号那一半红；
     /// - 让 [`export`] 绕开 `redaction_for` 自己 `Redaction::new()` →
     ///   同上。
     ///
@@ -1546,7 +1553,9 @@ mod tests {
     #[test]
     fn nothing_the_user_typed_into_the_form_reaches_the_diagnostics_zip() {
         const PASSWORD: &str = "canary-pw-4f81c2-must-never-leave-this-machine";
-        const ACCOUNT: &str = "canary-acct-9d3b07-must-never-leave-this-machine";
+        // 账号名要能装进一条连接码：`AccountName` 只认小写字母、数字、
+        // 连字符，最多 32 位——不能沿用旧版那个任意长字符串。
+        const ACCOUNT: &str = "canary9d3b07nomachine";
         const MARK: &str = "mark-e2e-b7c9";
 
         let dir = tempfile::tempdir().expect("建临时目录");
@@ -1572,13 +1581,20 @@ mod tests {
         };
         let environment = format!("{MARK} · 登录用户 {ACCOUNT}");
 
-        // **这就是用户敲进去的那份表单。**
+        // **这就是用户敲进去的那份表单。** 连接码现生成——手写的校验位
+        // 会算错。
+        let code = rmc_core::code::ConnectionCode::new(
+            rmc_core::code::AccountName::parse(ACCOUNT).unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            22000,
+            rmc_core::code::ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+        )
+        .expect("夹具必须合法")
+        .to_string();
         let form = crate::form::Form {
             appliance_host: "192.168.100.10".into(),
             appliance_port: "61001".into(),
-            gateway_host: "ops.example.com".into(),
-            gateway_port: "443".into(),
-            username: ACCOUNT.into(),
+            code,
             password: Zeroizing::new(PASSWORD.into()),
             remember: false,
             detected_proxy: None,
@@ -1641,7 +1657,7 @@ mod tests {
         .unwrap();
 
         let form = crate::form::Form::default();
-        assert!(form.password.is_empty() && form.username.is_empty());
+        assert!(form.password.is_empty() && form.code.is_empty());
 
         let zip = export(&form, None, "环境信息一行", &logs, dir.path()).expect("导出诊断包");
         let entries = entries_of(&zip);

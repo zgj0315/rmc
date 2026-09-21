@@ -54,6 +54,7 @@
 //!   一条秒级失败、说清楚在等什么的用例，不是又一次挂起。
 
 use crate::addr::HostPort;
+use crate::code::ServerFingerprint;
 use crate::error::Error;
 use crate::knownhosts::{fingerprint_of, Fingerprint, KnownHosts};
 use crate::platform::Io;
@@ -142,6 +143,7 @@ pub(crate) fn test_params_with_password(password: &str, reverse_port: u16) -> Tu
         reverse_port,
         gateway: test_gateway_hostport(),
         appliance: "192.168.100.10:61001".parse().unwrap(),
+        fingerprint: ServerFingerprint::of_ed25519_public(&[9u8; 32]),
     }
 }
 

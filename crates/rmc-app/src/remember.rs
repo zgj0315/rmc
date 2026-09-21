@@ -17,90 +17,93 @@
 //!    W21 当初要求带类型出口的全部意义（「换了 Windows 账号解不开」这句话
 //!    得有地方显示）。
 //!
-//! # 为什么还要多存一个 `last-account.txt`
+//! # 为什么还要多存一份 `connection-code.txt`
 //!
-//! key 是 `账号@运维服务器主机:端口`，而 [`Form::default`] 是**全空的**
+//! key 是 `账号@运维服务器 IP:端口`，而 [`Form::default`] 是**全空的**
 //! ——启动那一刻我们根本不知道 key 是什么，第 2 条于是无从谈起。
 //! [`FileSecretStore`](rmc_win::secret::FileSecretStore) 又把 key 哈希成
 //! 文件名，盘上也反查不回来。
 //!
-//! 所以存一份**不含任何秘密**的账号记录（账号名 + 运维服务器地址，三行
-//! 纯文本）在应用目录下。这三样本来就是用户下次还得再敲一遍的东西，
-//! 「记住密码」在用户心里本来也包含「记住我连的是哪台」。
+//! 所以存一份**不含任何秘密**的连接码（一行纯文本）在应用目录下。
+//! 用户下次还得再粘一遍，「记住密码」在用户心里本来也包含「记住我连的
+//! 是哪台」。
 //!
 //! **口令一个字节都不在这个文件里**，`account_file_never_carries_the_password`
 //! 守这条。
 //!
-//! # 口令全程只走 `Zeroizing<String>`
+//! # Task 8：`Account` 换成持有解析好的 [`ConnectionCode`]
 //!
-//! [`Recall::fill`] 消费 `self`（而不是借用）就是为了把
-//! [`LoadOutcome::Loaded`] 里那一份**移动**进 [`Form::password`]，中间
-//! 不产生第二份拷贝。
+//! 原来这里是 `Account { username, host, port }` 三个裸字符串，`key()`
+//! 直接拼 `format!("{username}@{host}:{port}")`。表单侧的三个框合并成
+//! 一条连接码之后（见 `form::Form` 上「Task 8」一节），`Account` 改成
+//! 持有一份 [`ConnectionCode`]——字段私有，构造入口只有 [`from_form`]
+//! 与 [`decode`]，两者都在构造那一刻拒绝了不合法的连接码，`key()`/
+//! `encode()` 因此**不可能失败**，不需要一个 `.expect(...)` 的炸点
+//! （见 rmc-core 里 `HostPort`、`ValidatedAddresses` 同族的做法）。
+//!
+//! **`key()` 产出的字符串形态跟今天完全一样**：`账号@IP:端口`——旧版
+//! 三段式的 `host` 字段以前也只接受 IP/主机名，连接码把它收紧成只接受
+//! IP，`key()` 拼字符串这一步没有变。这一点很要紧：升级前用旧版三段式
+//! 记住的密文，key 是按「账号@主机:端口」这个**字符串**定位的，只要
+//! 新版拼出的字符串跟旧版逐字一致，旧密文升级后照样能取回来；这条由
+//! [`the_key_is_the_account_at_the_server`] 与
+//! [`the_key_format_matches_the_old_three_part_shape_byte_for_byte`]
+//! 两条测试钉住。
 
 use crate::form::Form;
 use crate::wiring::AppPaths;
+use rmc_core::code::ConnectionCode;
 use rmc_win::secret::{LoadOutcome, SecretStore};
 
 /// 记住密码的那个账号。**不含口令。**
+///
+/// 字段私有：构造入口只有 [`Account::from_form`] 与 [`Account::decode`]，
+/// 两者都只在连接码合法时才产出一个值——不存在「拼出一个内容非法的
+/// `Account`」这条路，`key()`/`encode()` 因此不需要处理失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
-    pub username: String,
-    /// 运维服务器主机名或 IP。
-    pub host: String,
-    /// 运维服务器端口，原样保存用户敲的那个串。
-    pub port: String,
+    code: ConnectionCode,
 }
 
 impl Account {
-    /// 从表单上取。三样里有一样是空的就没有账号可记——**不拼一个半截
+    /// 从表单上取。连接码解析不出来就没有账号可记——**不拼一个半截
     /// 的 key**，那会让「记住」与「取回」用的 key 对不上。
     pub fn from_form(form: &Form) -> Option<Self> {
-        let username = form.username.trim();
-        let host = form.gateway_host.trim();
-        let port = form.gateway_port.trim();
-        if username.is_empty() || host.is_empty() || port.is_empty() {
-            return None;
-        }
         Some(Self {
-            username: username.to_string(),
-            host: host.to_string(),
-            port: port.to_string(),
+            code: form.parsed_code()?,
         })
     }
 
-    /// 存进 [`SecretStore`] 用的 key：`账号@运维服务器主机:端口`。
+    /// 存进 [`SecretStore`] 用的 key：`账号@运维服务器 IP:端口`。
     ///
-    /// 形状跟 Task 4 文档里写的那个例子一致
-    /// （`tunnel-zhang@…:443`）——换一台运维服务器、换一个账号就是另一份
-    /// 记录，互不覆盖。
+    /// 形状跟旧版三段式（`账号@主机:端口`）**逐字一致**——升级后用户
+    /// 已经记住的密文要按同一个字符串才能取回来，见模块文档「Task 8」
+    /// 一节。
     pub fn key(&self) -> String {
-        format!("{}@{}:{}", self.username, self.host, self.port)
+        format!(
+            "{}@{}:{}",
+            self.code.account(),
+            self.code.ip(),
+            self.code.port()
+        )
     }
 
-    /// 写进 `last-account.txt` 的内容：三行，一行一样。
-    ///
-    /// 不用 key 那个单行形式反过来解析：账号名里可以有 `@`，主机名里
-    /// 可以有 `:`（IPv6），反解析要么容易出错、要么得再定一套转义规则。
-    /// 三行纯文本没有这些问题。
+    /// 写进 `connection-code.txt` 的内容：连接码原样一行。
     pub fn encode(&self) -> String {
-        format!("{}\n{}\n{}\n", self.username, self.host, self.port)
+        format!("{}\n", self.code)
     }
 
-    /// 读回来。格式不对返回 `None`——**不猜**，猜出来的账号会去取一份
-    /// 不存在的密码，然后在密码框旁边写一句莫名其妙的话。
+    /// 读回来。第一行解析不出合法连接码就返回 `None`——**不猜**，猜出来
+    /// 的账号会去取一份不存在的密码，然后在密码框旁边写一句莫名其妙的
+    /// 话。
     pub fn decode(text: &str) -> Option<Self> {
-        let mut lines = text.lines();
-        let username = lines.next()?.trim().to_string();
-        let host = lines.next()?.trim().to_string();
-        let port = lines.next()?.trim().to_string();
-        if username.is_empty() || host.is_empty() || port.is_empty() {
-            return None;
-        }
-        Some(Self {
-            username,
-            host,
-            port,
-        })
+        let code = ConnectionCode::parse(text.lines().next()?.trim()).ok()?;
+        Some(Self { code })
+    }
+
+    /// 这个账号连接码里的账号名——`Recall::fill` 用它填回表单。
+    pub fn code(&self) -> &ConnectionCode {
+        &self.code
     }
 }
 
@@ -115,7 +118,7 @@ pub enum SaveOutcome {
     Saved { key: String },
     /// 用户没勾（或者取消了勾选）：密文与账号记录都清掉了。
     Cleared,
-    /// 表单上还拼不出 key（账号或运维服务器地址是空的），或者口令是空的。
+    /// 表单上还拼不出 key（连接码解析不出来），或者口令是空的。
     /// 什么都没做。
     Incomplete,
     /// 出错了。**不静默吞掉**——记住密码失败而用户以为记住了，下次启动
@@ -135,11 +138,12 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
 
     // # W202：上一次记的是谁，**必须在这里读**
     //
-    // `last-account.txt` 只记得住**一个**账号，所以任何一个不等于它的
-    // key 都是**谁也找不回来的孤儿**：`recall` 只会按记录里那一个去取。
+    // `connection-code.txt` 只记得住**一个**账号，所以任何一个不等于它
+    // 的 key 都是**谁也找不回来的孤儿**：`recall` 只会按记录里那一个去
+    // 取。
     //
     // 修的是这样一条真实路径（评审写了 PoC）：用户记住 `A@运维服务器`
-    // → 把账号改成 `B` → 取消勾选「记住密码」。上一版按**当前表单**
+    // → 把连接码换成 `B` → 取消勾选「记住密码」。上一版按**当前表单**
     // 拼出的 `B@运维服务器` 去清（本来就不存在），账号记录被删掉，而
     // `A@运维服务器` 的密文**永久留在盘上，而且再也没有任何路径指得到
     // 它**——用户明确说了「不再记住」。
@@ -192,7 +196,7 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
 
 /// 上一次记住的那个账号的 key。没有记录、或者记录坏了就是 `None`。
 fn previous_key(paths: &AppPaths) -> Option<String> {
-    let text = std::fs::read_to_string(paths.last_account()).ok()?;
+    let text = std::fs::read_to_string(paths.connection_code()).ok()?;
     Account::decode(&text).map(|a| a.key())
 }
 
@@ -212,7 +216,7 @@ fn clear(
     if let Some(old) = previous.filter(|p| *p != key) {
         result = result.and(store.clear(old));
     }
-    let account = match std::fs::remove_file(paths.last_account()) {
+    let account = match std::fs::remove_file(paths.connection_code()) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,
     };
@@ -221,7 +225,7 @@ fn clear(
 
 fn write_account(paths: &AppPaths, account: &Account) -> std::io::Result<()> {
     std::fs::create_dir_all(paths.root())?;
-    std::fs::write(paths.last_account(), account.encode())
+    std::fs::write(paths.connection_code(), account.encode())
 }
 
 /// 启动时取回的结局。
@@ -241,7 +245,7 @@ pub enum Recall {
 
 /// 启动时按上次记下的账号取回密码。
 pub fn recall(paths: &AppPaths, store: &dyn SecretStore) -> Recall {
-    let Ok(text) = std::fs::read_to_string(paths.last_account()) else {
+    let Ok(text) = std::fs::read_to_string(paths.connection_code()) else {
         return Recall::NoAccount;
     };
     let Some(account) = Account::decode(&text) else {
@@ -270,11 +274,9 @@ impl Recall {
         let Recall::Remembered { account, outcome } = self else {
             return None;
         };
-        // 账号与运维服务器地址无论口令取没取回来都填上——用户下次还得
-        // 敲它们，而且密码框旁边那句话说的正是「这台运维服务器」。
-        form.username = account.username;
-        form.gateway_host = account.host;
-        form.gateway_port = account.port;
+        // 连接码无论口令取没取回来都填上——用户下次还得粘它，而且密码
+        // 框旁边那句话说的正是「这台运维服务器」。
+        form.code = account.code().to_string();
         // 勾上：用户上次确实勾了。取回失败时也勾着，这样他重新输入之后
         // 连上，会按同一个 key 再记一次。
         form.remember = true;
@@ -290,6 +292,7 @@ impl Recall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmc_core::code::{AccountName, ServerFingerprint};
     use rmc_win::secret::{FileSecretStore, Sealer};
     use std::sync::Arc;
     use zeroize::Zeroizing;
@@ -297,6 +300,24 @@ mod tests {
     /// 口令的金丝雀。独特串，不是两个字符——本项目第 17 个假绿就是
     /// 「短金丝雀在长输出里碰巧被掩盖」。
     const CANARY: &str = "canary-9d41c7-remembered-password";
+
+    /// 一条合法的连接码，账号可选（不同账号用来演「换了账号」的场景），
+    /// 地址固定 `203.0.113.10:22000`。**现生成，不手写常量**——手写的
+    /// 校验位会算错。
+    fn code_for(account: &str) -> String {
+        ConnectionCode::new(
+            AccountName::parse(account).unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            22000,
+            ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+        )
+        .expect("夹具必须合法")
+        .to_string()
+    }
+
+    fn good_code() -> String {
+        code_for("tunnel-zhang")
+    }
 
     /// 可逆的假密封器（字节取反），验存储层逻辑用。
     struct FlipSealer;
@@ -330,9 +351,7 @@ mod tests {
         Form {
             appliance_host: "192.168.100.10".into(),
             appliance_port: "61001".into(),
-            gateway_host: "ops.example.com".into(),
-            gateway_port: "443".into(),
-            username: "tunnel-zhang".into(),
+            code: good_code(),
             password: Zeroizing::new(CANARY.into()),
             remember: true,
             detected_proxy: None,
@@ -341,25 +360,42 @@ mod tests {
 
     // ================= key 与账号记录 =================
 
-    /// key 就是 `账号@运维服务器主机:端口`。
+    /// key 就是 `账号@运维服务器 IP:端口`。
     ///
-    /// 改红：把 `key()` 里的 `@` 换成别的分隔符，或者把 host 与
-    /// username 对调——这条逐字比对，当场红。
+    /// 改红：把 `key()` 里的 `@` 换成别的分隔符，或者把 IP 与账号
+    /// 对调——这条逐字比对，当场红。
     #[test]
     fn the_key_is_the_account_at_the_server() {
         let a = Account::from_form(&filled_form()).expect("表单填满了，该有账号");
-        assert_eq!(a.key(), "tunnel-zhang@ops.example.com:443");
+        assert_eq!(a.key(), "tunnel-zhang@203.0.113.10:22000");
     }
 
-    /// 三样里缺一样就没有 key，**不拼半截的**。
+    /// **W200 定案的要害**：`key()` 产出的字符串形态要跟升级前的旧版
+    /// 三段式（`账号@主机:端口`）逐字一致——否则用户升级后取不回已经
+    /// 记住的密码，而且不会报错（`SecretStore::load_outcome` 找不到就
+    /// 是 `NotRemembered`，跟「从没记过」没有区别，用户会以为软件出了
+    /// 别的问题）。
+    ///
+    /// 这条不检查实现细节，只检查**产出的字符串**——即使有人把
+    /// `Account` 内部再重构一遍，只要这条字符串没变，旧密文就取得回来。
+    ///
+    /// 改红：把 `key()` 里 `self.code.ip()` 换成
+    /// `self.code.server()`（`HostPort` 的 `Display` 会连端口一起打出
+    /// 来，key 变成 `账号@IP:端口:端口`）——当场红。
+    #[test]
+    fn the_key_format_matches_the_old_three_part_shape_byte_for_byte() {
+        let old_style = format!("{}@{}:{}", "tunnel-zhang", "203.0.113.10", "22000");
+        let a = Account::from_form(&filled_form()).expect("表单填满了，该有账号");
+        assert_eq!(a.key(), old_style);
+    }
+
+    /// 连接码解析不出来就没有 key，**不拼半截的**。
     #[test]
     fn an_incomplete_form_has_no_account() {
         for wreck in [
-            |f: &mut Form| f.username.clear(),
-            |f: &mut Form| f.gateway_host.clear(),
-            |f: &mut Form| f.gateway_port.clear(),
-            // 只填空格也算空。
-            |f: &mut Form| f.username = "   ".into(),
+            |f: &mut Form| f.code.clear(),
+            |f: &mut Form| f.code = "   ".into(),
+            |f: &mut Form| f.code = "rmc1:nonsense".into(),
         ] {
             let mut f = filled_form();
             wreck(&mut f);
@@ -370,34 +406,23 @@ mod tests {
     }
 
     /// 写出去再读回来是同一个账号。
-    ///
-    /// 改红：把 `encode` 里三行的顺序换一下（比如 host 写在 username
-    /// 前面）——`decode` 读回来的 username 会是主机名，这条当场红。
     #[test]
     fn an_account_survives_a_round_trip() {
         let a = Account::from_form(&filled_form()).expect("有账号");
         let back = Account::decode(&a.encode()).expect("写出去的应当读得回来");
         assert_eq!(back, a);
-        assert_eq!(back.username, "tunnel-zhang");
-        assert_eq!(back.host, "ops.example.com");
-        assert_eq!(back.port, "443");
+        assert_eq!(back.code().account().as_str(), "tunnel-zhang");
+        assert_eq!(back.code().server().to_string(), "203.0.113.10:22000");
     }
 
     /// 格式不对就当没记过，**不猜**。
     #[test]
     fn a_broken_account_record_is_refused() {
         assert!(Account::decode("").is_none());
-        assert!(Account::decode("只有一行").is_none());
-        assert!(
-            Account::decode("zhang\nops.example.com").is_none(),
-            "少一行"
-        );
-        assert!(
-            Account::decode("zhang\n\n443").is_none(),
-            "中间那行是空的也不行"
-        );
-        // 反向自证：合法的那一份能过。
-        assert!(Account::decode("zhang\nops.example.com\n443\n").is_some());
+        assert!(Account::decode("这不是连接码").is_none());
+        assert!(Account::decode("rmc1:nonsense").is_none());
+        // 反向自证：合法的那一份能过，多一行尾随内容不影响——只看第一行。
+        assert!(Account::decode(&format!("{}\n额外的一行\n", good_code())).is_some());
     }
 
     // ================= 存 =================
@@ -419,20 +444,20 @@ mod tests {
 
         // 反向自证：存之前确实取不到。
         assert!(matches!(
-            store.load_outcome("tunnel-zhang@ops.example.com:443"),
+            store.load_outcome("tunnel-zhang@203.0.113.10:22000"),
             LoadOutcome::NotRemembered
         ));
 
         assert_eq!(
             save(&paths, store.as_ref(), &form),
             SaveOutcome::Saved {
-                key: "tunnel-zhang@ops.example.com:443".into()
+                key: "tunnel-zhang@203.0.113.10:22000".into()
             }
         );
 
         // 主断言：按同一个 key 取得回来，而且是同一个口令。
         let got = store
-            .load("tunnel-zhang@ops.example.com:443")
+            .load("tunnel-zhang@203.0.113.10:22000")
             .expect("存进去了却取不回来");
         assert_eq!(*got, CANARY);
 
@@ -456,10 +481,11 @@ mod tests {
         let store = store_at(&paths, FlipSealer);
         save(&paths, store.as_ref(), &filled_form());
 
-        let text = std::fs::read_to_string(paths.last_account()).expect("账号记录应当写出来了");
-        // 反向自证：文件确实有内容、确实是这个账号的。
+        let text = std::fs::read_to_string(paths.connection_code()).expect("账号记录应当写出来了");
+        // 反向自证：文件确实有内容、确实是这个账号的、确实只有一行。
         assert!(text.contains("tunnel-zhang"), "{text}");
-        assert!(text.contains("ops.example.com"), "{text}");
+        assert!(text.contains("203.0.113.10"), "{text}");
+        assert_eq!(text.lines().count(), 1, "{text}");
         assert!(!text.contains(CANARY), "账号记录里躺着明文口令：{text}");
         // 连片段都不许有。
         assert!(!text.contains("9d41c7"), "{text}");
@@ -477,18 +503,18 @@ mod tests {
 
         save(&paths, store.as_ref(), &filled_form());
         // 反向自证：确实记住过，下面那两条断言因此带载。
-        assert!(store.load("tunnel-zhang@ops.example.com:443").is_some());
-        assert!(paths.last_account().exists());
+        assert!(store.load("tunnel-zhang@203.0.113.10:22000").is_some());
+        assert!(paths.connection_code().exists());
 
         let mut f = filled_form();
         f.remember = false;
         assert_eq!(save(&paths, store.as_ref(), &f), SaveOutcome::Cleared);
 
         assert!(
-            store.load("tunnel-zhang@ops.example.com:443").is_none(),
+            store.load("tunnel-zhang@203.0.113.10:22000").is_none(),
             "取消勾选之后密文还在盘上"
         );
-        assert!(!paths.last_account().exists(), "账号记录还在");
+        assert!(!paths.connection_code().exists(), "账号记录还在");
         // 再清一次不出事。
         assert_eq!(save(&paths, store.as_ref(), &f), SaveOutcome::Cleared);
     }
@@ -497,8 +523,8 @@ mod tests {
     ///
     /// 评审的 PoC。上一版按**当前表单**拼出的 key 去清，于是：
     ///
-    /// 1. 记住 `tunnel-zhang@ops.example.com:443`；
-    /// 2. 把账号改成 `tunnel-li`；
+    /// 1. 记住 `tunnel-zhang@运维服务器`；
+    /// 2. 把连接码换成 `tunnel-li@同一台运维服务器`；
     /// 3. 取消勾选「记住密码」→ 清的是 `tunnel-li@...`（本来就不存在），
     ///    账号记录被删掉，而 `tunnel-zhang@...` 的密文**永久留在盘上，
     ///    而且再也没有任何路径指得到它**（下次启动 `recall` 直接
@@ -511,8 +537,8 @@ mod tests {
     /// （也就是退回只清当前 key），第二组断言当场红。
     #[test]
     fn changing_the_account_then_unchecking_leaves_no_orphan_ciphertext() {
-        const KEY_A: &str = "tunnel-zhang@ops.example.com:443";
-        const KEY_B: &str = "tunnel-li@ops.example.com:443";
+        const KEY_A: &str = "tunnel-zhang@203.0.113.10:22000";
+        const KEY_B: &str = "tunnel-li@203.0.113.10:22000";
 
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
@@ -526,9 +552,10 @@ mod tests {
         // 反向自证：A 的密文确实躺在盘上，下面那条断言因此带载。
         assert!(store.load(KEY_A).is_some());
 
-        // 2. 用户把账号改成 B，3. 取消勾选。
+        // 2. 用户把连接码换成 B（同一台运维服务器，账号不同），
+        // 3. 取消勾选。
         let mut f = filled_form();
-        f.username = "tunnel-li".into();
+        f.code = code_for("tunnel-li");
         f.remember = false;
         assert_eq!(save(&paths, store.as_ref(), &f), SaveOutcome::Cleared);
 
@@ -539,7 +566,7 @@ mod tests {
              而且再也没有任何路径指得到它"
         );
         assert!(store.load(KEY_B).is_none());
-        assert!(!paths.last_account().exists());
+        assert!(!paths.connection_code().exists());
         // 盘上真的一个密文文件都不剩。
         assert_eq!(
             sealed_files(&paths).len(),
@@ -551,14 +578,14 @@ mod tests {
 
     /// W202 的另一半：换一个账号继续记住，**上一份密文也不该留成孤儿**。
     ///
-    /// `last-account.txt` 只记得住一个账号，所以旧那份从此取不回来。
+    /// `connection-code.txt` 只记得住一个账号，所以旧那份从此取不回来。
     ///
     /// 改红：把 `save` 末尾那段 `if let Some(old) = previous.filter(..)`
     /// 整块删掉——盘上会攒下两份密文，而其中一份谁也够不着。
     #[test]
     fn remembering_a_second_account_does_not_orphan_the_first_one() {
-        const KEY_A: &str = "tunnel-zhang@ops.example.com:443";
-        const KEY_B: &str = "tunnel-li@ops.example.com:443";
+        const KEY_A: &str = "tunnel-zhang@203.0.113.10:22000";
+        const KEY_B: &str = "tunnel-li@203.0.113.10:22000";
 
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
@@ -568,7 +595,7 @@ mod tests {
         assert!(store.load(KEY_A).is_some(), "夹具本该先记住 A");
 
         let mut f = filled_form();
-        f.username = "tunnel-li".into();
+        f.code = code_for("tunnel-li");
         assert_eq!(
             save(&paths, store.as_ref(), &f),
             SaveOutcome::Saved { key: KEY_B.into() }
@@ -585,7 +612,7 @@ mod tests {
         // 而且下一次启动取回的是新那个账号。
         let mut form = Form::default();
         recall(&paths, store.as_ref()).fill(&mut form);
-        assert_eq!(form.username, "tunnel-li");
+        assert_eq!(form.code, code_for("tunnel-li"));
         assert_eq!(*form.password, CANARY);
     }
 
@@ -594,32 +621,25 @@ mod tests {
     /// `save` 里清旧 key 那一步**排在新的两样都写成之后**，注释写明了
     /// 理由：反过来的话新密文写失败时旧的那份已经被毁，用户两边都没了。
     ///
-    /// 复审实测：把顺序改成「先清旧、后写新」，**211 条全绿**——
-    /// 因为**从来没有任何测试让 `store.save` 在存在 `previous` 时失败过**，
-    /// 而那正是这个顺序唯一守的东西。这条就是补那一枪的。
-    ///
     /// 改红：把 `save` 里的 `store.clear(&old)` 挪到 `store.save(..)` 之前。
     #[test]
     fn a_failed_save_leaves_the_previous_secret_alone() {
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
-        // 上一次记的是 A，账号记录也指着它。
+        // 上一次记的是 A，账号记录也指着它。写的是原始连接码文本，不经
+        // `Account`——这条测试只关心磁盘上那份记录长什么样，不关心怎么
+        // 构造出来的。
         std::fs::create_dir_all(paths.root()).expect("建目录");
         std::fs::write(
-            paths.last_account(),
-            Account {
-                username: "tunnel-zhang".into(),
-                host: "ops.example.com".into(),
-                port: "443".into(),
-            }
-            .encode(),
+            paths.connection_code(),
+            format!("{}\n", code_for("tunnel-zhang")),
         )
         .expect("写账号记录");
 
         // 这一次换成别的账号，而存储写不进去。
         let store = RecordingStore::failing_to_save();
         let mut f = filled_form();
-        f.username = "tunnel-li".into();
+        f.code = code_for("tunnel-li");
         let outcome = save(&paths, &store, &f);
 
         assert!(
@@ -635,7 +655,7 @@ mod tests {
         // 反向自证：夹具真的走到了「有 previous」那条路——账号记录还在，
         // 也就是说 `previous_key` 读得出东西来。
         assert!(
-            paths.last_account().exists(),
+            paths.connection_code().exists(),
             "夹具没造出「上一次记过别的账号」这个前提"
         );
     }
@@ -645,24 +665,12 @@ mod tests {
     /// 这是生产里**最常走到**的一条路：用户勾着「记住密码」，每连成功
     /// 一次就走一遍 [`save`]，第二次起 `previous` 就等于当前 key。
     ///
-    /// # 这道筛与它守的危害面**都是本轮新引入的**，不是历史缺陷
-    ///
-    /// 复审核过 `git show 86c5cc9:…/remember.rs`：上一版的 `save` 里
-    /// **根本没有 `previous` 这个概念**，`clear` 也只有三个参数——
-    /// 每次连成功只是用同一个 key 覆盖写一遍，**不存在「把刚存的清掉」
-    /// 这条路**。所以「记住密码第二次连接就失效」这个 bug
-    /// **从来没有发生过**。
-    ///
-    /// 这道 `filter` 是修 W202（换账号留孤儿密文）时顺带开出来的新危害面，
-    /// 筛和这条测试是同一轮里配套加上的。上一版注释把它写成
-    /// 「上一轮那一枪全绿」，容易被读成「旧代码里一直有这个坑」——**不是**。
-    ///
     /// 改红：把 `save` 末尾 `previous.filter(|p| *p != key)` 里的
     /// `filter` 去掉——第二次「记住」会把自己刚存的密文清掉，下次启动
     /// 密码框是空的。
     #[test]
     fn remembering_the_same_account_twice_keeps_it() {
-        const KEY: &str = "tunnel-zhang@ops.example.com:443";
+        const KEY: &str = "tunnel-zhang@203.0.113.10:22000";
 
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
@@ -672,10 +680,10 @@ mod tests {
             save(&paths, store.as_ref(), &filled_form()),
             SaveOutcome::Saved { key: KEY.into() }
         );
-        // 反向自证：第一次之后 `last-account.txt` 确实在了，第二次的
+        // 反向自证：第一次之后 `connection-code.txt` 确实在了，第二次的
         // `previous` 因此**不是** `None`——少了这一步，下面那次调用走的
         // 是跟第一次一样的路，什么都证明不了。
-        assert!(paths.last_account().exists());
+        assert!(paths.connection_code().exists());
 
         assert_eq!(
             save(&paths, store.as_ref(), &filled_form()),
@@ -698,49 +706,27 @@ mod tests {
     /// 同 Task 4 的 `SecretStore::clear` 自己那条 W25：半路 `return` 会
     /// 把另外几样留在盘上，而用户点的是「不再记住密码」。
     ///
-    /// 上一轮的 F6 那一枪（把 `.and(..)` 换成 `?` 提前返回）**全绿**——
-    /// 没有任何测试让 `store.clear` 失败过。补上，用一个会在指定 key 上
-    /// 报错的假存储。
-    ///
     /// 改红：把 `clear` 里的 `let mut result = store.clear(key);` 换成
     /// `store.clear(key)?;`。
-    ///
-    /// # 这条注释上一版是假的，订正记在这里
-    ///
-    /// 上一版写的是「把 `result = result.and(store.clear(old));` 换成
-    /// `store.clear(old)?;`」——**复审按字面注入，实测 211 全绿**。
-    /// 原因看得很清楚：这条测试让**第一步**（当前 key）失败，而那个 `?`
-    /// 挂在**第二步**（旧 key，它是成功的）上，早返根本不触发。
-    ///
-    /// 所以这条测试守的是「**第一步**失败也要走完后面几步」，
-    /// 而 **`clear` 第二步的早返至今零覆盖**——真发生时会跳过删账号记录，
-    /// 用户点了「不再记住密码」而 `last-account.txt` 还在。
-    /// 要覆盖它只需把 `RecordingStore::failing_on` 的目标换成旧 key，
-    /// 按 W206 记账不修。
     #[test]
     fn clearing_finishes_every_step_even_after_the_first_one_fails() {
-        const KEY_A: &str = "tunnel-zhang@ops.example.com:443";
-        const KEY_B: &str = "tunnel-li@ops.example.com:443";
+        const KEY_A: &str = "tunnel-zhang@203.0.113.10:22000";
+        const KEY_B: &str = "tunnel-li@203.0.113.10:22000";
 
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
         // 上一次记的是 A。
         std::fs::create_dir_all(paths.root()).expect("建目录");
         std::fs::write(
-            paths.last_account(),
-            Account {
-                username: "tunnel-zhang".into(),
-                host: "ops.example.com".into(),
-                port: "443".into(),
-            }
-            .encode(),
+            paths.connection_code(),
+            format!("{}\n", code_for("tunnel-zhang")),
         )
         .expect("写账号记录");
 
         // 当前表单是 B，取消勾选；而清 B 这一步会失败。
         let store = RecordingStore::failing_on(KEY_B);
         let mut f = filled_form();
-        f.username = "tunnel-li".into();
+        f.code = code_for("tunnel-li");
         f.remember = false;
 
         let out = save(&paths, &store, &f);
@@ -757,7 +743,7 @@ mod tests {
             "第一步失败就不走了，上一个账号的密文留在了盘上：{cleared:?}"
         );
         // 第三步（账号记录）也走了。
-        assert!(!paths.last_account().exists(), "账号记录也没删掉");
+        assert!(!paths.connection_code().exists(), "账号记录也没删掉");
     }
 
     /// **W203：账号记录写不成时，已经写进去的密文要回滚。**
@@ -766,20 +752,20 @@ mod tests {
     /// 删掉、把失败分支改成返回 `Saved`，都没有任何测试变红）——它根本
     /// 进不去。它守的跟 W202 是同一个危害面：一份谁也找不回来的孤儿密文。
     ///
-    /// 夹具（评审给的造法）：把 `last-account.txt` 那个**路径先建成一个
-    /// 目录**，`std::fs::write` 必失败，于是 `save` 走进回滚支。
+    /// 夹具（评审给的造法）：把 `connection-code.txt` 那个**路径先建成
+    /// 一个目录**，`std::fs::write` 必失败，于是 `save` 走进回滚支。
     ///
     /// 改红：把那一支里的 `let _ = store.clear(&key);` 删掉，或者把
     /// `return SaveOutcome::Failed(..)` 改成 `SaveOutcome::Saved`。
     #[test]
     fn a_failed_account_record_rolls_the_ciphertext_back() {
-        const KEY: &str = "tunnel-zhang@ops.example.com:443";
+        const KEY: &str = "tunnel-zhang@203.0.113.10:22000";
 
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
         let store = store_at(&paths, FlipSealer);
         // 路径被一个**目录**占住：`fs::write` 必失败。
-        std::fs::create_dir_all(paths.last_account()).expect("建目录");
+        std::fs::create_dir_all(paths.connection_code()).expect("建目录");
 
         let out = save(&paths, store.as_ref(), &filled_form());
 
@@ -831,7 +817,7 @@ mod tests {
         let mut f = filled_form();
         f.password = Zeroizing::new(String::new());
         assert_eq!(save(&paths, store.as_ref(), &f), SaveOutcome::Incomplete);
-        assert!(!paths.last_account().exists(), "什么都不该落盘");
+        assert!(!paths.connection_code().exists(), "什么都不该落盘");
     }
 
     // ================= 取 =================
@@ -855,9 +841,7 @@ mod tests {
         let note = recall(&paths, store.as_ref()).fill(&mut form);
 
         assert_eq!(*form.password, CANARY, "密码框没有被填上");
-        assert_eq!(form.username, "tunnel-zhang");
-        assert_eq!(form.gateway_host, "ops.example.com");
-        assert_eq!(form.gateway_port, "443");
+        assert_eq!(form.code, good_code(), "连接码没有原样填回来");
         assert!(form.remember, "「记住密码」这个勾没有跟着回来");
         // 取回成功也说一句——它顺带告诉用户「还没经过运维服务器验证」。
         let note = note.expect("取回成功也该有一句说明");
@@ -882,7 +866,7 @@ mod tests {
         let mut form = Form::default();
         assert!(recall(&paths, store.as_ref()).fill(&mut form).is_none());
         assert!(form.password.is_empty());
-        assert!(form.username.is_empty());
+        assert!(form.code.is_empty());
         assert!(!form.remember);
     }
 
@@ -914,11 +898,7 @@ mod tests {
             let variant = outcome.variant_name();
             let loaded = matches!(outcome, LoadOutcome::Loaded(_));
             let recall = Recall::Remembered {
-                account: Account {
-                    username: "tunnel-zhang".into(),
-                    host: "ops.example.com".into(),
-                    port: "443".into(),
-                },
+                account: Account::decode(&good_code()).expect("夹具连接码必须合法"),
                 outcome,
             };
             let mut form = Form::default();
@@ -934,8 +914,8 @@ mod tests {
                 None,
                 "{variant} 的说明含禁用词：{note}"
             );
-            // 账号那三样无论成败都填上了。
-            assert_eq!(form.username, "tunnel-zhang");
+            // 连接码无论成败都填上了。
+            assert_eq!(form.code, good_code(), "{variant}：连接码没填回来");
             assert!(form.remember, "{variant}：勾没有跟着回来");
             // 只有 Loaded 那一格会填口令。
             assert_eq!(
@@ -973,8 +953,8 @@ mod tests {
             note.contains("换了账号或换了机器就解不开"),
             "解不开时说的不是那句话：{note}"
         );
-        // 账号还在，用户重新输入密码就能接着用。
-        assert_eq!(form.username, "tunnel-zhang");
+        // 连接码还在，用户重新输入密码就能接着用。
+        assert_eq!(form.code, good_code());
         assert!(form.remember);
     }
 

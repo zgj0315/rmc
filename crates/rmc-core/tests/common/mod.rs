@@ -23,6 +23,7 @@
 //! "对当前 crate（某个测试二进制）可达"，不会被判 dead_code。
 
 use rmc_core::addr::HostPort;
+use rmc_core::code::ServerFingerprint;
 use rmc_core::knownhosts::KnownHosts;
 use rmc_core::platform::{NoProxy, NoProxyAuth};
 use rmc_core::ssh::SshTunnelFactory;
@@ -110,6 +111,10 @@ pub fn params(password: &str, port: u16) -> TunnelParams {
         // `rmc_core::tunnel::TunnelParams` 上的说明。
         gateway: gateway(),
         appliance: appliance(),
+        // Task 8：指纹已经接线到 TunnelParams，但这一层集成测试跑的是
+        // Task 9 之前的中间态——TLS 仍然只走公共 CA，没有人核对这个值，
+        // 随便给一个固定的即可。
+        fingerprint: ServerFingerprint::of_ed25519_public(&[9u8; 32]),
     }
 }
 

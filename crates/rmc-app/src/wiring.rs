@@ -146,17 +146,23 @@ impl AppPaths {
         self.root.join("secrets")
     }
 
-    /// 上一次记住密码的那个账号（W200）。
+    /// 上一次记住密码的那条连接码（W200）。
     ///
-    /// **不含任何秘密**：账号名 + 运维服务器地址，三行纯文本。为什么需要
-    /// 它见 [`crate::remember`] 的模块文档——key 是「账号@运维服务器」，
-    /// 而启动那一刻表单是空的，不记下来就拼不出 key。
+    /// **不含任何秘密**：连接码本身没有秘密（账号、地址、指纹都是公开
+    /// 信息，见 `rmc_core::code` 模块文档），一行纯文本。为什么需要它见
+    /// [`crate::remember`] 的模块文档——key 是「账号@运维服务器」，而
+    /// 启动那一刻表单是空的，不记下来就拼不出 key。
+    ///
+    /// Task 8：文件名从 `last-account.txt` 改成 `connection-code.txt`，
+    /// 内容从「账号 + 主机 + 端口」三行纯文本改成一条连接码——两者都是
+    /// 「记住密码」的密文定位键（`remember::Account::key()`）的原始输入，
+    /// key 的形态本身没有变（见 `remember.rs` 上的说明）。
     ///
     /// 放根目录下，不放 `secrets/`：那个目录里只该有密文，混进一个明文
     /// 文件迟早让人看错。也不放 `logs/`：`diag::bundle` 会把 `log_dir`
     /// 下的东西整个收进诊断包。
-    pub fn last_account(&self) -> PathBuf {
-        self.root.join("last-account.txt")
+    pub fn connection_code(&self) -> PathBuf {
+        self.root.join("connection-code.txt")
     }
 
     /// 诊断包写到哪儿。放根目录下，不跟日志混在一起——包本身不是日志，
@@ -655,7 +661,7 @@ mod tests {
             p.log_dir(),
             p.known_hosts(),
             p.secrets_dir(),
-            p.last_account(),
+            p.connection_code(),
         ];
         for spot in &spots {
             assert!(
@@ -670,8 +676,8 @@ mod tests {
         }
         // 账号记录尤其不许落进日志目录（会被诊断包收走）或密文目录
         // （那里只该有密文）。
-        assert!(!p.last_account().starts_with(p.log_dir()));
-        assert!(!p.last_account().starts_with(p.secrets_dir()));
+        assert!(!p.connection_code().starts_with(p.log_dir()));
+        assert!(!p.connection_code().starts_with(p.secrets_dir()));
         // 配置真的用上了这两处，不是算出来放着不用。
         let cfg = p.config();
         assert_eq!(cfg.log_dir, p.log_dir());
@@ -1197,11 +1203,19 @@ mod tests {
         let core = spawn_core(paths.clone(), Platform::detect());
 
         let mut rx = core.subscribe();
+        // 连接码只接受 IP，不接受域名——旧版那个 `ops.example.com:443`
+        // 字面量没法沿用，现生成一条。
+        let code = rmc_core::code::ConnectionCode::new(
+            rmc_core::code::AccountName::parse("tunnel-zhang").unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            22000,
+            rmc_core::code::ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+        )
+        .expect("夹具必须合法");
         core.commands
             .send(Command::Start {
-                username: "tunnel-zhang".into(),
+                code,
                 password: zeroize::Zeroizing::new("pw".into()),
-                gateway: "ops.example.com:443".parse().unwrap(),
                 appliance: "192.168.100.10:61001".parse().unwrap(),
             })
             .await

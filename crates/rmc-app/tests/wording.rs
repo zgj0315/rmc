@@ -61,7 +61,10 @@ fn the_scan_really_reaches_this_crates_source() {
     for (file, text) in [
         ("lib.rs", "远程运维客户端"),
         ("theme.rs", "维护"),
-        ("form.rs", "运维服务器地址"),
+        // Task 8：运维服务器那三个框（地址/端口/账号）合并成一条连接码
+        // 之后，"运维服务器地址" 这句字面量已经从 form.rs 消失，换成
+        // 这个字面量当锚点——它就是 `Field::Code` 的界面标签。
+        ("form.rs", "连接码"),
         ("view/maintain.rs", "记住密码"),
         // Task 9 新增的两个文件也要真的被走到。
         ("diag.rs", "系统代理"),

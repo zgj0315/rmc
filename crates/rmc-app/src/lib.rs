@@ -268,9 +268,10 @@ pub enum Message {
     TabSelected(Tab),
     ApplianceHostChanged(String),
     AppliancePortChanged(String),
-    GatewayHostChanged(String),
-    GatewayPortChanged(String),
-    UsernameChanged(String),
+    /// 连接码整行改变——替掉原来的 `GatewayHostChanged`/
+    /// `GatewayPortChanged`/`UsernameChanged` 三条，见 `form::Form` 上
+    /// 「Task 8」一节。
+    CodeChanged(String),
     PasswordChanged(Zeroizing<String>),
     RememberToggled(bool),
     ActionPressed(model::Action),
@@ -305,9 +306,8 @@ impl std::fmt::Debug for Message {
             Message::TabSelected(v) => plain!(TabSelected, v),
             Message::ApplianceHostChanged(v) => plain!(ApplianceHostChanged, v),
             Message::AppliancePortChanged(v) => plain!(AppliancePortChanged, v),
-            Message::GatewayHostChanged(v) => plain!(GatewayHostChanged, v),
-            Message::GatewayPortChanged(v) => plain!(GatewayPortChanged, v),
-            Message::UsernameChanged(v) => plain!(UsernameChanged, v),
+            // `code` 不是秘密——连接码本身没有秘密，照常打印。
+            Message::CodeChanged(v) => plain!(CodeChanged, v),
             // 唯一一条被遮住的：口令。
             Message::PasswordChanged(v) => plain!(
                 PasswordChanged,
@@ -553,11 +553,10 @@ impl App {
     fn dispatch(&mut self, action: Action) {
         match action {
             Action::Start => match self.form.validate() {
-                Ok(addrs) => self.send(Command::Start {
-                    username: self.form.username.trim().to_string(),
+                Ok(v) => self.send(Command::Start {
+                    code: v.code,
                     password: self.form.password.clone(),
-                    gateway: addrs.gateway().clone(),
-                    appliance: addrs.appliance().clone(),
+                    appliance: v.appliance,
                 }),
                 // 按钮此时本来就该是灰的（`action_enabled`），走到这里
                 // 说明有人绕过了那道门。什么都不做，不发一条注定被
@@ -658,9 +657,7 @@ impl App {
             Message::TabSelected(t) => self.tab = t,
             Message::ApplianceHostChanged(v) => self.form.appliance_host = v,
             Message::AppliancePortChanged(v) => self.form.appliance_port = v,
-            Message::GatewayHostChanged(v) => self.form.gateway_host = v,
-            Message::GatewayPortChanged(v) => self.form.gateway_port = v,
-            Message::UsernameChanged(v) => self.form.username = v,
+            Message::CodeChanged(v) => self.form.code = v,
             Message::PasswordChanged(v) => {
                 self.form.password = v;
                 // 用户自己动了密码框，上一轮取回的那句话就过期了。
@@ -886,7 +883,7 @@ mod tests {
         assert!(!dumped.contains("7f3a9e"), "口令片段进了 Debug：{dumped}");
 
         // 其余变体照常可读——遮的只有口令那一条，不是整个枚举被掏空。
-        assert!(format!("{:?}", Message::UsernameChanged("zhang".into())).contains("zhang"));
+        assert!(format!("{:?}", Message::CodeChanged("zhang".into())).contains("zhang"));
         assert!(format!("{:?}", Message::TabSelected(Tab::Logs)).contains("Logs"));
         assert!(format!("{:?}", Message::DisconnectSession(7)).contains('7'));
     }
@@ -899,7 +896,7 @@ mod tests {
         const CANARY: &str = "canary-7f3a9e-must-never-be-printed";
         let mut app = App::default();
         app.update(Message::PasswordChanged(Zeroizing::new(CANARY.into())));
-        app.update(Message::UsernameChanged("tunnel-zhang".into()));
+        app.update(Message::CodeChanged("tunnel-zhang".into()));
         let dumped = format!("{app:?}");
 
         assert!(dumped.contains("App"), "{dumped}");
@@ -907,11 +904,11 @@ mod tests {
         assert!(!dumped.contains(CANARY), "口令经 App 漏了出来：{dumped}");
     }
 
-    /// 七条表单消息各自写进**自己**那个字段。
+    /// 五条表单消息各自写进**自己**那个字段。
     ///
-    /// 这个 `match` 有七条形状一样的分支，是复制粘贴最容易写串的地方
-    /// （把 `GatewayHostChanged` 写成 `self.form.appliance_host = v`），
-    /// 而写串之后界面看起来完全正常——只是改运维服务器地址会改到一体机上。
+    /// 这个 `match` 有五条形状一样的分支，是复制粘贴最容易写串的地方
+    /// （把 `CodeChanged` 写成 `self.form.appliance_host = v`），而写串
+    /// 之后界面看起来完全正常——只是改连接码会改到一体机上。
     ///
     /// 逐条验：每次只发一条消息，断言**只有那一个字段变了**。
     #[test]
@@ -921,9 +918,7 @@ mod tests {
             vec![
                 f.appliance_host.clone(),
                 f.appliance_port.clone(),
-                f.gateway_host.clone(),
-                f.gateway_port.clone(),
-                f.username.clone(),
+                f.code.clone(),
                 f.password.to_string(),
                 f.remember.to_string(),
             ]
@@ -932,9 +927,7 @@ mod tests {
         let messages = [
             Message::ApplianceHostChanged("a".into()),
             Message::AppliancePortChanged("b".into()),
-            Message::GatewayHostChanged("c".into()),
-            Message::GatewayPortChanged("d".into()),
-            Message::UsernameChanged("e".into()),
+            Message::CodeChanged("c".into()),
             Message::PasswordChanged(Zeroizing::new("f".into())),
             Message::RememberToggled(true),
         ];
@@ -960,9 +953,9 @@ mod tests {
     fn typing_into_the_form_does_not_move_the_tab() {
         let mut app = App::default();
         app.update(Message::TabSelected(Tab::Logs));
-        app.update(Message::UsernameChanged("zhang".into()));
+        app.update(Message::CodeChanged("zhang".into()));
         assert_eq!(app.tab(), Tab::Logs);
-        assert_eq!(app.form().username, "zhang");
+        assert_eq!(app.form().code, "zhang");
     }
 
     /// 隧道事件经 `App::apply` 推进视图模型。
@@ -1021,13 +1014,25 @@ mod tests {
         (App::with_core(Some(core)), cmd_rx, ev_tx)
     }
 
+    /// 一条能通过全部校验的连接码，账号 `tunnel-zhang`、地址
+    /// `203.0.113.10:22000`。**现生成，不手写常量**——手写的校验位会
+    /// 算错。
+    fn good_code() -> String {
+        rmc_core::code::ConnectionCode::new(
+            rmc_core::code::AccountName::parse("tunnel-zhang").unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            22000,
+            rmc_core::code::ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+        )
+        .expect("夹具必须合法")
+        .to_string()
+    }
+
     fn filled_form() -> Form {
         Form {
             appliance_host: "192.168.100.10".into(),
             appliance_port: "61001".into(),
-            gateway_host: "ops.example.com".into(),
-            gateway_port: "443".into(),
-            username: "tunnel-zhang".into(),
+            code: good_code(),
             password: Zeroizing::new("pw".into()),
             remember: false,
             detected_proxy: None,
@@ -1044,9 +1049,9 @@ mod tests {
     /// 两头都没人守**。在这一轮之前 `Message::ActionPressed(_)` 的分支
     /// 体**就是一对空花括号**，六道闸门全绿。
     ///
-    /// 改红：把 `Action::Start` 那一支改成 `{}`；或者把 `gateway` 与
-    /// `appliance` 写反（那会让隧道去连一体机、把一体机当运维服务器，
-    /// 而界面上一个字都看不出来）。
+    /// 改红：把 `Action::Start` 那一支改成 `{}`；或者把连接码解出来的
+    /// 服务器地址与 `appliance` 写反（那会让隧道去连一体机、把一体机
+    /// 当运维服务器，而界面上一个字都看不出来）。
     #[test]
     fn pressing_start_sends_the_addresses_the_user_typed() {
         let dir = tempfile::tempdir().expect("建临时目录");
@@ -1057,14 +1062,13 @@ mod tests {
 
         match cmd_rx.try_recv().expect("没有任何命令送进内核") {
             Command::Start {
-                username,
+                code,
                 password,
-                gateway,
                 appliance,
             } => {
-                assert_eq!(username, "tunnel-zhang");
+                assert_eq!(code.account().as_str(), "tunnel-zhang");
                 assert_eq!(password.as_str(), "pw");
-                assert_eq!(gateway.to_string(), "ops.example.com:443");
+                assert_eq!(code.server().to_string(), "203.0.113.10:22000");
                 assert_eq!(appliance.to_string(), "192.168.100.10:61001");
             }
             other => panic!("发出去的不是 Start：{other:?}"),
@@ -1451,7 +1455,7 @@ mod tests {
         const CANARY: &str = "canary-7f3a9e-must-never-be-printed";
         let mut app = App::default();
         app.update(Message::PasswordChanged(Zeroizing::new(CANARY.into())));
-        app.update(Message::UsernameChanged("tunnel-zhang".into()));
+        app.update(Message::CodeChanged("tunnel-zhang".into()));
 
         app.apply(TunnelEvent::State(State::Connecting));
         assert_eq!(
@@ -1463,7 +1467,7 @@ mod tests {
         app.apply(TunnelEvent::State(State::Idle));
         assert!(app.form().password.is_empty(), "回到未开启之后口令还留着");
         // 其余已填内容保留——抹的只有口令。
-        assert_eq!(app.form().username, "tunnel-zhang");
+        assert_eq!(app.form().code, "tunnel-zhang");
     }
 
     // ---------- 线 3：Tick（W150） ----------
@@ -1721,7 +1725,20 @@ mod task11_tests {
     use tokio::sync::{broadcast, mpsc};
 
     const CANARY: &str = "canary-3c81af-through-the-ui";
-    const KEY: &str = "tunnel-zhang@ops.example.com:443";
+    const KEY: &str = "tunnel-zhang@203.0.113.10:22000";
+
+    /// 一条能通过全部校验的连接码，账号 `tunnel-zhang`、地址
+    /// `203.0.113.10:22000`——跟 `KEY` 定位的账号是同一个。
+    fn good_code() -> String {
+        rmc_core::code::ConnectionCode::new(
+            rmc_core::code::AccountName::parse("tunnel-zhang").unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            22000,
+            rmc_core::code::ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+        )
+        .expect("夹具必须合法")
+        .to_string()
+    }
 
     // ---------- 假托盘 ----------
 
@@ -1815,9 +1832,7 @@ mod task11_tests {
         Form {
             appliance_host: "192.168.100.10".into(),
             appliance_port: "61001".into(),
-            gateway_host: "ops.example.com".into(),
-            gateway_port: "443".into(),
-            username: "tunnel-zhang".into(),
+            code: good_code(),
             password: Zeroizing::new(CANARY.into()),
             remember: true,
             detected_proxy: None,
@@ -2039,9 +2054,7 @@ mod task11_tests {
         // 新起一个 App，同一个落点——这就是「下一次启动」。
         let (app, _store) = app_that_remembers(dir.path(), FlipSealer);
         assert_eq!(*app.form().password, CANARY, "密码框是空的");
-        assert_eq!(app.form().username, "tunnel-zhang");
-        assert_eq!(app.form().gateway_host, "ops.example.com");
-        assert_eq!(app.form().gateway_port, "443");
+        assert_eq!(app.form().code, good_code(), "连接码没有原样填回来");
         assert!(app.form().remember, "勾没有跟着回来");
         let note = app.password_note().expect("取回成功也该有一句说明");
         assert!(!note.contains(CANARY), "说明里带上了口令：{note}");
@@ -2077,8 +2090,8 @@ mod task11_tests {
             "说的不是那句话：{note}"
         );
         assert_eq!(rmc_core::banned_word_in(note), None, "{note}");
-        // 账号还在，用户重新输入就能接着用。
-        assert_eq!(app.form().username, "tunnel-zhang");
+        // 连接码还在，用户重新输入密码就能接着用。
+        assert_eq!(app.form().code, good_code());
     }
 
     /// 用户一动密码框，上一轮那句话就该消失——它说的是被覆盖掉的那一份。
@@ -2134,7 +2147,10 @@ mod task11_tests {
         app.update(Message::ActionPressed(Action::Start));
 
         assert!(app.password_note().is_none());
-        assert!(!paths.last_account().exists(), "没有密封器却写了账号记录");
+        assert!(
+            !paths.connection_code().exists(),
+            "没有密封器却写了账号记录"
+        );
         assert!(!paths.secrets_dir().exists(), "没有密封器却建了密文目录");
         // 整个应用目录里不许出现明文口令。
         for entry in std::fs::read_dir(dir.path())
