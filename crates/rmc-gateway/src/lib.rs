@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod datadir;
 pub mod identity;
+pub mod server;
 
 #[cfg(test)]
 mod testing_verifier;
