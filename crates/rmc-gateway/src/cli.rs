@@ -407,6 +407,37 @@ pub fn refuse_root(is_root: bool, allow_root: bool) -> Option<String> {
     }
 }
 
+/// `serve` 早检查专用：身份密钥文件本身能不能打开，按 `io::ErrorKind`
+/// 分诊出准确的提示。返回 `Some(退出码)` 表示已经写好错误、调用方直接
+/// `return`；`None` 表示这一步没发现问题，继续往下走。
+///
+/// **修复轮 2/5，评审 Blocking，新增**：见 `cmd_serve` 里这次调用点上方
+/// 那段长注释——不能复用 `Identity::load_from` 的错误文案，它对任何
+/// io 错误都无差别地建议「先运行 init」，权限损坏时这条建议是错的、
+/// 而且会被拒绝。
+fn check_identity_key_present(dir: &DataDir, err: &mut dyn Write) -> Option<i32> {
+    match std::fs::File::open(dir.identity_key()) {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = writeln!(
+                err,
+                "数据目录 {} 下没有身份密钥；先运行 init",
+                dir.root().display()
+            );
+            Some(1)
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "打不开身份密钥 {}：{e}（不是「文件不存在」，检查这份文件与所在目录的属主/权限，\
+                 不要再跑 init——身份文件已经存在，init 会拒绝覆盖它）",
+                dir.identity_key().display()
+            );
+            Some(1)
+        }
+    }
+}
+
 fn cmd_serve(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if let Some(why) = refuse_root(
         crate::datadir::running_as_root(),
@@ -416,18 +447,36 @@ fn cmd_serve(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         return 1;
     }
     let dir = p.data_dir();
-    // **修复轮 1/5，评审 Important，已修**：`serve` 是第一个用户真会敲的
-    // 命令。数据目录从来没被 `init` 建过时，下面 `owned_by_current_user`
-    // 的探针（往目录里建一个临时文件）会因为目录不存在而失败，原来直接把
-    // 那条裸 io 错误（"No such file or directory (os error 2)" 这种）
-    // 甩给用户——第一次用就撞上一条读不懂的系统错误，体验很差。这里先用
-    // `Identity::load_from` 探一下身份密钥是不是在（`init` 落盘的第一份
-    // 文件），它自己的错误文案已经带了「先运行 init」这句提示（见
-    // `identity.rs::load_from`），跟 `account` 系列子命令用的 `load()`
-    // helper 是同一套说法，不用在这里重新编一遍。
-    if let Err(e) = Identity::load_from(&dir) {
-        let _ = writeln!(err, "{e}");
-        return 1;
+    // **修复轮 1/5，评审 Important，已修，随后被修复轮 2/5 的复审发现回归、
+    // 已重做**：`serve` 是第一个用户真会敲的命令。数据目录从来没被 `init`
+    // 建过时，下面 `owned_by_current_user` 的探针（往目录里建一个临时
+    // 文件）会因为目录不存在而失败，原来直接把那条裸 io 错误
+    // （"No such file or directory (os error 2)" 这种）甩给用户——第一次
+    // 用就撞上一条读不懂的系统错误，体验很差。
+    //
+    // 修复轮 1/5当时的做法是先调 `Identity::load_from(&dir)`，复用它自己
+    // 已经带了「先运行 init」这句提示的错误文案（`identity.rs::load_from`）。
+    // **这一步引入了一条回归，复审实测复现过**：`identity.rs::load_from`
+    // 对**任何** io 错误（不只是"文件不存在"）都无差别地套上「先运行
+    // init」——`init` 明明跑过、只是事后 `chmod 000 identity.key`（权限
+    // 损坏），或者数据目录由用户 A 建、用户 B 拿去跑 `serve`（属主不对，
+    // 连穿透目录都做不到），这两种场景下 `Identity::load_from` 一样会说
+    // 「读不到 .../identity.key：Permission denied (os error 13)；先运行
+    // init」——这不只是不够准确，是**建议了一个会被拒绝的错误动作**：
+    // 再跑一次 `init` 会因为身份文件已存在被「拒绝覆盖」挡回，用户没有
+    // 从这句提示里得到任何能真正解决问题的信息。
+    //
+    // 改法：**不复用 `Identity::load_from` 的错误文案**，改成这里自己先
+    // 探一下身份密钥文件本身「能不能打开」，按 `io::ErrorKind` 分诊：
+    // `NotFound`（目录或文件真的不存在）才是「从未 init」，说「先运行
+    // init」；别的任何 io 错误（权限损坏是最常见的一种）都不建议这个
+    // 动作，转而指向属主/权限——这正是 `owned_by_current_user()` 下面
+    // 那支 `Err` 分支本来就在做的诊断，两者的措辞刻意保持一致。
+    // `std::fs::File::open` 只探测这一个文件能不能读，不做完整的身份
+    // 校验（种子格式、指纹计算等）——那些校验仍然只在真正需要用到身份
+    // 密钥的地方（`Server::bind` 内部）做一次，这里不重复。
+    if let Some(code) = check_identity_key_present(&dir, err) {
+        return code;
     }
     match dir.owned_by_current_user() {
         Ok(true) => {}
@@ -556,21 +605,75 @@ fn cmd_status(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 /// 能起来，但 `--data-dir` 实际吃到的只是空格前那一半，指向一个错的（或
 /// 者不存在的）目录，而且**不报错**，运维很难查到这是路径拼接没加引号
 /// 造成的。
+/// **修复轮 2/5，评审同类失败形态，已修**：systemd 对 `ExecStart=` 这类
+/// 字段还会做一遍「specifier 展开」——字面 `$FOO`/`${FOO}` 会被替换成同名
+/// 环境变量的值（没设置就是空串），这一步跟按空白分词/加引号是两件事、
+/// 先后独立发生，跟这个值要不要用双引号包起来无关。含 `$` 的路径不会
+/// 报错，只会被**静默**展开成别的（通常更短、更残缺的）值——跟这个函数
+/// 已经在处理的"空格被切开"是同一种"静默走偏、不报错"的失败形态，只是
+/// 触发条件更少见。改法：先把字面 `$` 换成 `$$`（systemd 转义 `$` 的
+/// 写法），再走原来的空白/引号判断。`ReadWritePaths=` 是否也做 specifier
+/// 展开没有十足把握确认，但它也经过这个函数——多转一次没有坏处，两处
+/// 都一起处理了。
 fn quote_systemd_arg(s: &str) -> String {
-    if s.chars()
+    let escaped_dollar = s.replace('$', "$$");
+    if escaped_dollar
+        .chars()
         .any(|c| c.is_whitespace() || c == '"' || c == '\\')
     {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = escaped_dollar.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{escaped}\"")
     } else {
-        s.to_string()
+        escaped_dollar
+    }
+}
+
+/// `User=` 是否是一个「看起来像合法用户名」的值：只允许小写字母、数字、
+/// `_`、`-`，且以字母或 `_` 开头，长度不超过 32——这比真正的 passwd 规则
+/// 更严一点，但足够堵死空白与任何控制字符（尤其是换行）。
+///
+/// **修复轮 2/5，评审 Blocking，新增**：`User=` 的值来自 `$USER`/
+/// `$LOGNAME` 环境变量，**不是** passwd 库校验过的用户名——环境变量可以
+/// 被设成任意字节，实测 `USER="a b" rmc-gateway service print` 会把
+/// `User=a b` 原样写进单元文本。`User=` 是普通的 `Key=Value` 配置项，
+/// **不走** `ExecStart=` 那套按空白分词、能用双引号包起来的语法——给它
+/// 套 `quote_systemd_arg` 反而会把字面双引号写进用户名值，变成一个包含
+/// 引号字符的非法用户名，比现在更糟。真正的风险不是空格，是**换行
+/// 注入**：`$USER` 里含 `\n` 会在生成的单元文本里插进一整行新内容，
+/// 理论上可以借此注入任意 systemd 指令。所以这里不做转义，做校验/清洗：
+/// 值不像一个合法用户名就整个丢弃，回退到默认值 `"rmc-gateway"`，调用方
+/// 据此在打印出的单元文本里加一行警告注释。**函数不把原始值传回去**——
+/// 一个含换行的值本身就能在"注释"这个上下文里插入新行，注释挡不住这种
+/// 注入，唯一安全的做法是压根不回显它。
+fn sanitize_unit_user(raw: &str) -> (String, bool) {
+    let looks_like_a_username = !raw.is_empty()
+        && raw.len() <= 32
+        && raw
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if looks_like_a_username {
+        (raw.to_string(), false)
+    } else {
+        ("rmc-gateway".to_string(), true)
     }
 }
 
 fn cmd_service_print(p: &Parsed, out: &mut dyn Write, _err: &mut dyn Write) -> i32 {
-    let user = std::env::var("USER")
+    let user_env = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "rmc-gateway".into());
+    let (user, user_was_sanitized) = sanitize_unit_user(&user_env);
+    let user_warning = if user_was_sanitized {
+        "# 警告：USER/LOGNAME 环境变量的值不像一个合法用户名（出于安全考虑，\n\
+         # 原始值不会打印在这里），已回退成 rmc-gateway；请自行确认下面这一行\n\
+         # User= 是不是你想要的账户，必要时手工改掉。\n"
+    } else {
+        ""
+    };
     let exe = quote_systemd_arg(
         &std::env::current_exe()
             .map(|p| p.display().to_string())
@@ -600,7 +703,7 @@ fn cmd_service_print(p: &Parsed, out: &mut dyn Write, _err: &mut dyn Write) -> i
 #   sudo install -m 644 rmc-gateway.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now rmc-gateway
 # 本程序自己不做任何需要特权的事；装不装这个单元由管理员决定。
-[Unit]
+{user_warning}[Unit]
 Description=Remote Maintenance Server (rmc-gateway)
 After=network-online.target
 Wants=network-online.target
@@ -996,6 +1099,105 @@ mod tests {
         assert!(
             out.contains(&format!("ReadWritePaths={quoted}")),
             "ReadWritePaths 同样要被引起来：\n{out}"
+        );
+    }
+
+    /// **修复轮 2/5，评审 Blocking，新增（修复轮 1/5 引入的回归）**：
+    /// `init` 明明跑过、只是身份密钥文件权限损坏（比如 `chmod 000`），
+    /// 不该被误诊成「从未 init」——那条建议还会被拒绝（身份文件已存在，
+    /// `init` 会拒绝覆盖它，用户没有从这句提示里得到任何能解决问题的
+    /// 信息）。这条测试就是复审给的复现步骤本身：`init` 成功之后把
+    /// `identity.key` 权限拿掉再 `serve`。
+    ///
+    /// 改红：把 `check_identity_key_present` 里
+    /// `Err(e) if e.kind() == std::io::ErrorKind::NotFound` 这个分诊
+    /// 条件删掉（退回到不分诊、直接把任何 io 错误都导向同一句提示的
+    /// 行为）——错误文本会变回「...；先运行 init」，
+    /// `assert!(!err.contains("先运行 init"))` 红。
+    #[cfg(unix)]
+    #[test]
+    fn serve_with_a_permission_broken_identity_key_does_not_suggest_running_init_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (code, _, err) = run_in(tmp.path(), &["init", "--public-addr", "203.0.113.10:22000"]);
+        assert_eq!(code, 0, "{err}");
+        let key = tmp.path().join("identity.key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (code, _, err) = run_in(tmp.path(), &["serve"]);
+        // 不管测试跑没跑完，先把权限还原，免得 `tempdir` 在 `Drop` 时
+        // 清理这个 0o000 的文件遇到麻烦。
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(code, 1, "{err}");
+        assert!(
+            !err.contains("先运行 init"),
+            "权限损坏不该被误诊成「从未 init」：{err}"
+        );
+        assert!(
+            err.contains("属主") || err.contains("权限"),
+            "错误应该指向属主/权限这个真实原因：{err}"
+        );
+    }
+
+    /// **修复轮 2/5，评审 Blocking，新增**：`$USER`/`$LOGNAME` 不是
+    /// passwd 库校验过的用户名，可以被设成任意字节；这条测试直接钉住
+    /// `sanitize_unit_user` 这个纯函数的判定逻辑，不依赖修改进程环境变量
+    /// （那样会在并行跑测试时有极小概率互相干扰）——`USER="a b"` 这个
+    /// 端到端场景在报告里贴了手工验证的实际输出。
+    ///
+    /// 改红：把 `sanitize_unit_user` 里 `looks_like_a_username` 的判断
+    /// 整个换成 `true`（等价于什么都不清洗、直接放行任何值）——
+    /// `sanitize_unit_user("a b")` 会原样返回 `("a b".to_string(),
+    /// false)`，第一句 `assert_eq!(u, "rmc-gateway")` 红。
+    #[test]
+    fn sanitize_unit_user_rejects_whitespace_and_control_characters() {
+        let (u, sanitized) = sanitize_unit_user("a b");
+        assert_eq!(u, "rmc-gateway");
+        assert!(sanitized);
+
+        let (u, sanitized) = sanitize_unit_user("a\nUser=root");
+        assert_eq!(u, "rmc-gateway");
+        assert!(sanitized, "换行注入也必须被拒绝，不能只挡空格");
+
+        let (u, sanitized) = sanitize_unit_user("");
+        assert_eq!(u, "rmc-gateway");
+        assert!(sanitized);
+
+        let (u, sanitized) = sanitize_unit_user("zhang-3");
+        assert_eq!(u, "zhang-3");
+        assert!(!sanitized, "合法用户名不该被回退");
+    }
+
+    /// **修复轮 2/5，评审同类失败形态，已修，新增**：含 `$` 的路径会被
+    /// systemd 的 specifier 展开静默替换成别的值而不报错——跟"空格被
+    /// 切开"是同一种"静默走偏、不报错"的失败形态。
+    ///
+    /// 改红：把 `quote_systemd_arg` 里 `s.replace('$', "$$")` 那一行删掉
+    /// （直接用 `s` 本身）——输出里的 `$` 不再被转义成 `$$`，
+    /// `assert!(out.contains(...))` 那两句都红（因为它们要找的是转义后的
+    /// `$$`形态，原样的 `$` 不会出现在预期的位置上）。
+    #[test]
+    fn service_print_escapes_dollar_signs_in_the_data_dir_for_systemd() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("has$dollar");
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = vec![
+            "service".to_string(),
+            "print".to_string(),
+            "--data-dir".to_string(),
+            dir.display().to_string(),
+        ];
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        let code = run(&args, &mut o, &mut e);
+        assert_eq!(code, 0);
+        let out = String::from_utf8(o).unwrap();
+        let expected_escaped = dir.display().to_string().replace('$', "$$");
+        assert!(
+            out.contains(&format!("--data-dir {expected_escaped}")),
+            "$ 应该被转成 $$，防止 systemd 静默展开成别的值：\n{out}"
+        );
+        assert!(
+            out.contains(&format!("ReadWritePaths={expected_escaped}")),
+            "ReadWritePaths 同样要转义：\n{out}"
         );
     }
 }
