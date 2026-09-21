@@ -10,13 +10,15 @@
 //! 做到的，是靠"不写代码"。
 
 use crate::accounts::{AccountReader, Verify};
+use crate::cidr::Cidr;
 use crate::datadir::DataDir;
 use crate::identity::Identity;
 use crate::{Error, Result};
 use rmc_core::code::{AccountName, ServerFingerprint};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -72,21 +74,59 @@ pub struct ServerConfig {
     /// 反向端口绑在哪个地址上：生产 0.0.0.0，测试 127.0.0.1。
     pub reverse_bind: IpAddr,
     pub timings: Timings,
+    /// `--engineer-allow` 的网段列表；空 = 不过滤，任何来源都能连反向端口。
+    pub engineer_allow: Vec<Cidr>,
 }
 
-/// **偏离 brief 字面的 Step 2**：brief 的伪代码里 `Shared` 还有 `identity`
-/// 与 `reverse_bind` 两个字段。本任务用不上它们——`identity` 在 `bind()`
-/// 里派生出 `tls`/`ssh` 之后就没有别的读者，`reverse_bind` 要等 Task 5
-/// 实现反向转发、真的去 `bind` 那个地址时才有读者。控制者在「给后面三个
-/// 任务留好接口形状」那节明确说了同一条原则（针对 `Running.shared`）：
-/// 提前加没人读的字段，`clippy -D warnings` 的 `dead_code` 当场红。这里
-/// 按同一原则处理：先不放这两个字段，Task 5 需要哪个就在那时候加哪个
-/// ——`bind()` 里 `cfg` 整个都在手上，加字段仍然是一行的事。
+/// 一条隧道在服务端这一侧的全部状态。Task 6 的吊销扫描与 Task 7 的
+/// `status.json` 都读这张表（经 `Running::tunnels_snapshot`），本任务只写。
+///
+/// **偏离 brief 字面 Step 3**：brief 的伪代码里还有一个 `since:
+/// SystemTime` 字段。本任务的 `tunnels_snapshot` 契约元组
+/// `(AccountName, u16, SocketAddr, usize)`（brief 自己「Produces」那节给的
+/// 签名）里没有它的位置，本任务也没有别的读者——加上就是又一个「只写不读
+/// 的字段」，`clippy -D warnings` 的 `dead_code` 当场红（这正是 Task 4
+/// 那条「`account` 字段只写不读」踩过的坑，也是这份 GLOBAL.md 里反复强调
+/// 的原则）。等 Task 6/7 真要展示隧道存活时长时再加，到时候顺带扩一下
+/// `tunnels_snapshot` 的元组形状（或另开一个访问器），「字段有读者」这个
+/// 前提自然就满足了。
+pub(crate) struct TunnelInfo {
+    pub port: u16,
+    pub peer: SocketAddr,
+    pub engineers: Arc<AtomicUsize>,
+    pub stop: watch::Sender<bool>,
+}
+
+/// 挂在 `ConnHandler` 上；`ConnHandler`（连同它）随会话一起被丢弃时
+/// （会话正常结束、心跳失联、认证超时、或 Task 6 从外面 `Handle::disconnect`
+/// 断开——都是同一条路：`handle_connection` 返回，`ConnHandler` 被丢弃），
+/// 这里把隧道从表里摘掉并停掉反向监听任务。这是「摘表 + 停监听」唯一的出口。
+pub(crate) struct TunnelGuard {
+    shared: Arc<Shared>,
+    account: AccountName,
+}
+
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        if let Some(info) = lock(&self.shared.tunnels).remove(&self.account) {
+            let _ = info.stop.send(true);
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) struct Shared {
     pub tls: tokio_rustls::TlsAcceptor,
     pub ssh: Arc<russh::server::Config>,
     pub accounts: AccountReader,
     pub timings: Timings,
+    /// 反向端口绑在哪个地址上（生产 0.0.0.0，测试 127.0.0.1）。
+    pub reverse_bind: IpAddr,
+    pub engineer_allow: Vec<Cidr>,
+    pub tunnels: Mutex<HashMap<AccountName, TunnelInfo>>,
 }
 
 pub struct Server;
@@ -96,6 +136,7 @@ pub struct Running {
     fingerprint: ServerFingerprint,
     stop: watch::Sender<bool>,
     accept_task: tokio::task::JoinHandle<()>,
+    shared: Arc<Shared>,
 }
 
 impl Running {
@@ -104,6 +145,32 @@ impl Running {
     }
     pub fn fingerprint(&self) -> ServerFingerprint {
         self.fingerprint
+    }
+    /// 测试与（Task 7）status 用：当前每条隧道的账号名、端口、来源地址、
+    /// 在线工程师连接数。
+    ///
+    /// **偏离 brief 字面**：brief 的接口表把这个方法写成不带可见性限定
+    /// （在 gateway 自己的模块体系里那就是 `pub(crate)`）。本任务实测发现
+    /// 那样会被 `dead_code` 打红：它现在只有 `#[cfg(test)] mod tests`
+    /// 里的调用者，`cargo clippy --all-targets` 里那个不带 `--cfg test`
+    /// 的普通 lib 编译单元看不到 `mod tests`，判定这个方法从未被调用，
+    /// 顺着牵连到 `Running.shared`、`TunnelInfo::port/peer` 一起变成
+    /// 「只写不读」。跟 `Running::local_addr`/`fingerprint` 同理开成完全
+    /// `pub`——它们本来就是给外部消费者（未来的 `cli.rs`/`status.rs`，
+    /// 乃至这个 crate 之外的调用方）看服务器状态的自省接口，这个方法性质
+    /// 一样。
+    pub fn tunnels_snapshot(&self) -> Vec<(AccountName, u16, SocketAddr, usize)> {
+        lock(&self.shared.tunnels)
+            .iter()
+            .map(|(name, info)| {
+                (
+                    name.clone(),
+                    info.port,
+                    info.peer,
+                    info.engineers.load(Ordering::SeqCst),
+                )
+            })
+            .collect()
     }
     pub async fn shutdown(self) {
         let _ = self.stop.send(true);
@@ -128,14 +195,17 @@ impl Server {
             nodelay: true,
             ..Default::default()
         });
-        // 建好之后立刻 clone 进 accept 任务，不要整个 move：Task 5/6/7 都要
-        // 从 `Running` 上再拿一份 `Arc<Shared>`（快照、吊销扫描、发布状态），
-        // 到时候往 `Running` 里加一个 `shared: Arc<Shared>` 字段就是一行的事。
+        // 建好之后立刻 clone 进 accept 任务，不要整个 move：`Running` 也存了
+        // 一份（`tunnels_snapshot`），Task 6/7 的吊销扫描与发布状态都从
+        // `Running.shared` 再拿一份。
         let shared = Arc::new(Shared {
             tls,
             ssh,
             accounts: AccountReader::new(&cfg.data),
             timings: cfg.timings.clone(),
+            reverse_bind: cfg.reverse_bind,
+            engineer_allow: cfg.engineer_allow.clone(),
+            tunnels: Mutex::new(HashMap::new()),
         });
         let listener = tokio::net::TcpListener::bind(cfg.listen)
             .await
@@ -163,6 +233,7 @@ impl Server {
             fingerprint,
             stop,
             accept_task,
+            shared,
         })
     }
 }
@@ -186,6 +257,7 @@ async fn handle_connection(shared: Arc<Shared>, sock: tokio::net::TcpStream, pee
         peer,
         authed: authed.clone(),
         account: None,
+        tunnel: None,
     };
     let running = tokio::select! {
         r = russh::server::run_stream(shared.ssh.clone(), tls, handler) => match r {
@@ -254,6 +326,10 @@ pub(crate) struct ConnHandler {
     pub peer: SocketAddr,
     pub authed: Arc<AtomicBool>,
     pub account: Option<(AccountName, u16)>,
+    /// `Some` 一旦这条会话开成了一条反向隧道。`Drop` 落在 `TunnelGuard`
+    /// 上：会话结束（无论哪条路）时，`ConnHandler` 被丢弃，这个字段随之
+    /// 被丢弃，隧道跟着被摘掉、监听任务被停掉。
+    pub tunnel: Option<TunnelGuard>,
 }
 
 impl russh::server::Handler for ConnHandler {
@@ -290,16 +366,179 @@ impl russh::server::Handler for ConnHandler {
             }
         }
     }
+
+    /// `port == 0` 时把账号绑定的反向端口回填给客户端；申请一个别的端口
+    /// 一律拒绝。同一账号同一时刻只允许一条隧道活着。
+    async fn tcpip_forward(
+        &mut self,
+        _address: &str,
+        port: &mut u32,
+        session: &mut russh::server::Session,
+    ) -> std::result::Result<bool, Self::Error> {
+        let Some((account, account_port)) = self.account.clone() else {
+            return Ok(false);
+        };
+        if *port != 0 && *port != u32::from(account_port) {
+            return Ok(false);
+        }
+        if self.tunnel.is_some() {
+            // 这条会话自己已经有一条隧道了。
+            return Ok(false);
+        }
+        {
+            let mut t = lock(&self.shared.tunnels);
+            if t.contains_key(&account) {
+                return Ok(false);
+            }
+            // 先占位再 bind：同账号并发的第二次申请立刻在这道
+            // `contains_key` 上被拒，不需要等 OS 级别的 `EADDRINUSE`。
+            let (stop, _) = watch::channel(false);
+            t.insert(
+                account.clone(),
+                TunnelInfo {
+                    port: account_port,
+                    peer: self.peer,
+                    engineers: Arc::new(AtomicUsize::new(0)),
+                    stop,
+                },
+            );
+        }
+        // bind 短重试：`TunnelGuard::drop` 摘表是同步的，但上一个反向监听
+        // 任务收到 `stop` 是异步的——它手里的 `TcpListener` 要等任务真正
+        // 跳出循环、局部变量被丢弃才关闭。所以「表里没有这个账号了」和
+        // 「端口真的能 bind 了」之间有一个短暂窗口：客户端断线后很快重连
+        // 可能在这个窗口里撞上 `EADDRINUSE`。这里重试是为了盖住这个窗口，
+        // **不是**为了盖住「上一条隧道真的还活着」——那种情况上面的
+        // `contains_key` 已经拒绝了，重试也拿不到端口，3 次很快就会用完。
+        let mut bound = None;
+        for attempt in 0..3u32 {
+            match tokio::net::TcpListener::bind((self.shared.reverse_bind, account_port)).await {
+                Ok(l) => {
+                    bound = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(%account, account_port, attempt, error = %e, "反向端口绑定失败，准备重试");
+                    if attempt + 1 < 3 {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+        let listener = match bound {
+            Some(l) => l,
+            None => {
+                tracing::warn!(%account, account_port, "反向端口绑定失败（重试 3 次后仍失败）");
+                lock(&self.shared.tunnels).remove(&account);
+                return Ok(false);
+            }
+        };
+        let (stop_rx, engineers) = {
+            let t = lock(&self.shared.tunnels);
+            let info = t.get(&account).expect("刚插的");
+            (info.stop.subscribe(), info.engineers.clone())
+        };
+        *port = u32::from(account_port);
+        tokio::spawn(reverse_accept_loop(
+            self.shared.clone(),
+            account.clone(),
+            account_port,
+            listener,
+            session.handle(),
+            stop_rx,
+            engineers,
+        ));
+        self.tunnel = Some(TunnelGuard {
+            shared: self.shared.clone(),
+            account,
+        });
+        Ok(true)
+    }
+
+    /// 主动取消转发：丢掉 `TunnelGuard` 就是全部——摘表、停监听、断工程师，
+    /// 但不断这条 SSH 会话本身。
+    async fn cancel_tcpip_forward(
+        &mut self,
+        _address: &str,
+        _port: u32,
+        _session: &mut russh::server::Session,
+    ) -> std::result::Result<bool, Self::Error> {
+        Ok(self.tunnel.take().is_some())
+    }
+}
+
+/// 反向监听：接受工程师的 TCP 连接，来源白名单过滤，每条隧道最多
+/// `max_engineers_per_tunnel` 条并发，逐条开 `forwarded-tcpip` 通道并
+/// `copy_bidirectional` 到现场客户端。`stop` 一响就退出循环——退出之后
+/// `listener` 随局部变量丢弃而关闭，端口才真正释放；这正是
+/// `tcpip_forward` 里那段短重试要盖住的窗口的另一半。
+async fn reverse_accept_loop(
+    shared: Arc<Shared>,
+    account: AccountName,
+    port: u16,
+    listener: tokio::net::TcpListener,
+    handle: russh::server::Handle,
+    mut stop: watch::Receiver<bool>,
+    engineers: Arc<AtomicUsize>,
+) {
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = stop.changed() => break,
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            accepted = listener.accept() => {
+                let Ok((mut sock, peer)) = accepted else { continue };
+                if !crate::cidr::allowed(&shared.engineer_allow, peer.ip()) {
+                    tracing::info!(%account, port, %peer, "工程师来源不在白名单，拒绝");
+                    continue; // sock 随作用域关闭
+                }
+                let prev = engineers.fetch_add(1, Ordering::SeqCst);
+                if prev >= shared.timings.max_engineers_per_tunnel {
+                    engineers.fetch_sub(1, Ordering::SeqCst);
+                    tracing::info!(%account, port, %peer, "工程师连接数已达上限，拒绝");
+                    continue;
+                }
+                let handle = handle.clone();
+                let engineers = engineers.clone();
+                let account = account.clone();
+                let _ = sock.set_nodelay(true);
+                tasks.spawn(async move {
+                    let opened = handle
+                        .channel_open_forwarded_tcpip(
+                            "127.0.0.1",
+                            u32::from(port),
+                            peer.ip().to_string(),
+                            u32::from(peer.port()),
+                        )
+                        .await;
+                    match opened {
+                        Ok(ch) => {
+                            let mut st = ch.into_stream();
+                            let r = tokio::io::copy_bidirectional(&mut sock, &mut st).await;
+                            tracing::debug!(%account, port, %peer, ?r, "工程师连接结束");
+                        }
+                        Err(e) => {
+                            tracing::warn!(%account, port, %peer, error = %e, "开 forwarded-tcpip 通道失败");
+                        }
+                    }
+                    engineers.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        }
+    }
+    // stop 之后：监听随 listener 局部变量丢弃而释放，工程师连接全部中止。
+    tasks.abort_all();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::accounts::AccountStore;
+    use crate::cidr::Cidr;
     use crate::config::GatewayConfig;
     use crate::datadir::DataDir;
     use crate::identity::Identity;
-    use crate::testing_verifier::ssh_connect;
+    use crate::testing_verifier::{ssh_connect, ssh_connect_echo};
     use rmc_core::code::AccountName;
     use std::time::Duration;
 
@@ -323,21 +562,35 @@ mod tests {
     pub(crate) async fn server_with_account(
         name: &str,
     ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
-        server_with_account_and_timings(name, Timings::fast()).await
+        server_with_account_and(name, Timings::fast(), Vec::new()).await
     }
 
     async fn server_with_account_and_timings(
         name: &str,
         timings: Timings,
     ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
+        server_with_account_and(name, timings, Vec::new()).await
+    }
+
+    async fn server_with_account_and_allow(
+        name: &str,
+        allow: Vec<Cidr>,
+    ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
+        server_with_account_and(name, Timings::fast(), allow).await
+    }
+
+    async fn server_with_account_and(
+        name: &str,
+        timings: Timings,
+        engineer_allow: Vec<Cidr>,
+    ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let d = DataDir::at(tmp.path().to_path_buf());
         d.create().unwrap();
         Identity::create_in(&d).unwrap();
         let mut cfg = GatewayConfig::new("127.0.0.1:22000".parse().unwrap());
-        // 区间给到几乎整个 u16 空间：账号端口本身不是本任务的服务端会去
-        // bind 的东西（Task 5 才实现反向转发），这里只是要账号表能接受
-        // 操作系统探出来的任何临时端口号。
+        // 区间给到几乎整个 u16 空间，好接受操作系统探出来的任何临时端口号
+        // （见下面 `server_with_account` 挑号那段的注释）。
         cfg.reverse_port_min = 1;
         cfg.reverse_port_max = 65535;
         cfg.save(&d).unwrap();
@@ -357,6 +610,7 @@ mod tests {
             data: d,
             reverse_bind: "127.0.0.1".parse().unwrap(),
             timings,
+            engineer_allow,
         })
         .await
         .unwrap();
@@ -435,8 +689,6 @@ mod tests {
                 .is_err(),
             "正向转发必须被拒"
         );
-        // 本任务还没实现反向转发，也必须被拒（Task 5 才开这一条路）
-        assert!(s.tcpip_forward("", 0).await.is_err());
         srv.shutdown().await;
     }
 
@@ -540,5 +792,266 @@ mod tests {
         let addr = srv.local_addr();
         srv.shutdown().await;
         assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    }
+
+    async fn engineer_roundtrip(port: u16, msg: &[u8]) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("连反向端口");
+        s.write_all(msg).await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf))
+            .await
+            .expect("读超时")
+            .unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    /// 探针 2 的场景：端口 0 → 回填；工程师的字节到客户端再回来。
+    /// 改红：`tcpip_forward` 里不写 `*port = account_port`——第一格红；
+    /// 反向监听里不开 forwarded-tcpip 通道——第二格红。
+    #[tokio::test]
+    async fn port_zero_is_filled_with_the_account_port_and_bytes_flow_both_ways() {
+        let (srv, pw, _tmp) = server_with_account("zhang").await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let got = s.tcpip_forward("", 0).await.expect("tcpip_forward");
+        let expected = srv.tunnels_snapshot()[0].1;
+        assert_eq!(got as u16, expected);
+        assert_eq!(engineer_roundtrip(expected, b"hello").await, b"echo:hello");
+        srv.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_request_for_a_different_port_is_denied() {
+        let (srv, pw, _tmp) = server_with_account("zhang").await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        assert!(s.tcpip_forward("", 9).await.is_err());
+        assert!(
+            srv.tunnels_snapshot().is_empty(),
+            "被拒的申请不能留下隧道记录"
+        );
+        srv.shutdown().await;
+    }
+
+    /// 同账号第二条隧道在第一条还活着时被拒（客户端把它映射成「端口占用」）。
+    /// 改红：`tcpip_forward` 里把「账号已有隧道」那句判断删掉——第二格绿。
+    #[tokio::test]
+    async fn a_second_tunnel_for_the_same_account_is_denied_while_the_first_lives() {
+        let (srv, pw, _tmp) = server_with_account("zhang").await;
+        let mut a = within("a", ssh_connect_echo(srv.local_addr())).await;
+        assert!(a
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        a.tcpip_forward("", 0).await.unwrap();
+        let mut b = within("b", ssh_connect_echo(srv.local_addr())).await;
+        assert!(
+            b.authenticate_password("zhang", pw.as_str())
+                .await
+                .unwrap()
+                .success(),
+            "认证是过的"
+        );
+        assert!(b.tcpip_forward("", 0).await.is_err(), "第二条必须被拒");
+        srv.shutdown().await;
+    }
+
+    /// 客户端一断，端口**立即**能被别人绑上，工程师的连接也被断掉。
+    ///
+    /// **「改红」实测记录（brief 里那条是假支票，已改写）**：brief 字面写的
+    /// 是「`TunnelGuard::drop` 里不发 `stop`——这条在 bind 那一步红」。照字面
+    /// 只删掉 `info.stop.send(true)` 那一行、保留 `remove(&self.account)`，
+    /// 实测**全绿**：`tokio::sync::watch::Receiver::changed()` 在
+    /// `select!` 里只看"这个 future 有没有 resolve"，不看它 resolve 出的是
+    /// `Ok`（真的发了新值）还是 `Err`（Sender 被丢弃）——`remove` 拿到的
+    /// `TunnelInfo`（连同它那个 `stop: watch::Sender`）在 `if let` 块结束时
+    /// 照样被丢弃，`Receiver::changed()` 照样因为"发送端没了"被唤醒，
+    /// 反向监听照样退出、端口照样释放——`.send(true)` 这一行本身其实是
+    /// 冗余的（不发也靠 Sender 被 drop 达到同样效果）。真正能打红这条测试
+    /// 的注入点是让整个 `drop` 什么都不做（连 `remove` 也不做）：这样
+    /// `TunnelInfo`（及其 `stop`）继续留在表里、`Sender` 继续活着，
+    /// `changed()` 永远不 resolve，反向监听永远不退出，`bind` 在同一个
+    /// 端口上拿到真实的 `AddrInUse`——实测确认过（见 task-5-report.md）。
+    ///
+    /// **这个 sleep 等的是「旧监听真的关闭」，不是调度余量**（控制者补充）：
+    /// `TunnelGuard::drop` 摘表是同步的，但反向监听任务收到 `stop` 是
+    /// 异步的——它手里的 `TcpListener` 要等任务真正跳出循环、局部变量被
+    /// 丢弃才关闭。这里 200ms 是给那个异步收尾留的时间，不是给 tokio 调度
+    /// 器留的余量；`tcpip_forward` 里的短重试盖住的是"没有这 200ms"的
+    /// 场景（见下面 `reconnecting_immediately_after_disconnect...` 那条）。
+    #[tokio::test]
+    async fn disconnecting_frees_the_port_immediately_and_drops_engineers() {
+        use tokio::io::AsyncReadExt;
+        let (srv, pw, _tmp) = server_with_account("zhang").await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = s.tcpip_forward("", 0).await.unwrap() as u16;
+        let mut eng = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        s.disconnect(russh::Disconnect::ByApplication, "", "")
+            .await
+            .unwrap();
+        // 旧监听真的关闭需要一点时间：见上面的函数级注释。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
+        assert!(l.is_ok(), "端口没有立即释放：{:?}", l.err());
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(2), eng.read(&mut buf))
+            .await
+            .expect("工程师连接应当被断开")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        assert!(srv.tunnels_snapshot().is_empty());
+        srv.shutdown().await;
+    }
+
+    /// **控制者补充的竞态窗口，回归网**：客户端断开后**立即**（不 sleep）
+    /// 用同一个账号重新申请隧道，必须成功——`tcpip_forward` 里 bind 失败
+    /// 短重试（3 次、每次 50ms）就是为了盖住"表项已摘、旧监听尚未真正
+    /// 关闭"这个窗口。
+    ///
+    /// **实测记录（如实报告，没有删测试）**：把重试次数从 3 改成 1，本机
+    /// 连跑 20 次全绿，没有观察到 flake（见 task-5-report.md）。原因：
+    /// `TunnelGuard::drop` 是 `handle_connection` 返回时同步跑的（摘表 +
+    /// 让 `stop` 这个 `watch::Sender` 被丢弃/发送），发生在"新连接的 SSH
+    /// 握手 + 认证 + 再发一次 `tcpip_forward`"这一整套往返之前；本机这套
+    /// 往返本身就有几毫秒到几十毫秒，足够 tokio 把反向监听那个任务重新
+    /// 调度到、跑完 `break`、丢掉旧 `TcpListener`——窗口在本机这套时序下
+    /// 从没被真正撞开过。这不代表窗口不存在（`TunnelGuard::drop` 摘表和
+    /// 监听任务真正关闭 listener 之间确实有异步间隔，见 `Drop` impl旁的
+    /// 注释），只是本机测得的时间尺度下重试第 1 次几乎总能命中。**按控制者
+    /// 的要求保留这条测试当回归网**：一旦调度更慢的机器/CI 环境撞开这个
+    /// 窗口，这条测试会红，而短重试本身仍然是兜底——不删测试，也不删重试。
+    #[tokio::test]
+    async fn reconnecting_immediately_after_disconnect_gets_the_same_port_back() {
+        let (srv, pw, _tmp) = server_with_account("zhang").await;
+        let mut a = within("a", ssh_connect_echo(srv.local_addr())).await;
+        assert!(a
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = a.tcpip_forward("", 0).await.unwrap() as u16;
+        a.disconnect(russh::Disconnect::ByApplication, "", "")
+            .await
+            .unwrap();
+        // 不 sleep：立刻用同一个账号重新连接、重新申请隧道。
+        let mut b = within("b", ssh_connect_echo(srv.local_addr())).await;
+        assert!(b
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let got = within("重建隧道", b.tcpip_forward("", 0))
+            .await
+            .expect("bind 短重试应当盖住旧监听尚未关闭的窗口");
+        assert_eq!(got as u16, port);
+        srv.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_tcpip_forward_frees_the_port_without_dropping_the_session() {
+        let (srv, pw, _tmp) = server_with_account("zhang").await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = s.tcpip_forward("", 0).await.unwrap() as u16;
+        s.cancel_tcpip_forward("", port as u32).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .is_ok());
+        assert!(!s.is_closed(), "取消转发不该断会话");
+        // 还能再申请一次
+        assert_eq!(s.tcpip_forward("", 0).await.unwrap() as u16, port);
+        srv.shutdown().await;
+    }
+
+    /// 来源白名单：不在名单里的工程师连接被直接关掉，客户端根本收不到通道。
+    /// 改红：`reverse_accept_loop` 里那道 `if !crate::cidr::allowed(...)`
+    /// 判断短路成永假（实测：`应当被立刻关掉: Elapsed(())`，读超时 panic，
+    /// 见 task-5-report.md）。
+    #[tokio::test]
+    async fn engineer_allow_list_filters_sources() {
+        use tokio::io::AsyncReadExt;
+        let (srv, pw, _tmp) =
+            server_with_account_and_allow("zhang", vec![Cidr::parse("10.0.0.0/8").unwrap()]).await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = s.tcpip_forward("", 0).await.unwrap() as u16;
+        let mut eng = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(2), eng.read(&mut buf))
+            .await
+            .expect("应当被立刻关掉")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        srv.shutdown().await;
+    }
+
+    /// 每条隧道最多 N 条工程师连接。改红：`engineers.fetch_add` 那句比较删掉。
+    #[tokio::test]
+    async fn at_most_n_engineers_per_tunnel() {
+        use tokio::io::AsyncReadExt;
+        let (srv, pw, _tmp) = server_with_account_and_timings(
+            "zhang",
+            Timings {
+                max_engineers_per_tunnel: 2,
+                ..Timings::fast()
+            },
+        )
+        .await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = s.tcpip_forward("", 0).await.unwrap() as u16;
+        let _a = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let _b = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(2), c.read(&mut buf))
+            .await
+            .expect("第三条应当被关掉")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        assert_eq!(srv.tunnels_snapshot()[0].3, 2);
+        srv.shutdown().await;
     }
 }

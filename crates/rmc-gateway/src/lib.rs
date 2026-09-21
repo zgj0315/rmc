@@ -3,6 +3,7 @@
 //! `docs/superpowers/specs/2026-09-21-rmc-gateway-design.md`。
 
 pub mod accounts;
+pub mod cidr;
 pub mod cli;
 pub mod config;
 pub mod datadir;

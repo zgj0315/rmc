@@ -72,8 +72,55 @@ impl russh::client::Handler for AnyHostKey {
     }
 }
 
-/// TLS（1.3、`AcceptAll`）+ SSH 握手，返回还没认证的客户端会话。
-pub async fn ssh_connect(addr: std::net::SocketAddr) -> russh::client::Handle<AnyHostKey> {
+/// 假装成现场客户端：收到 forwarded-tcpip 通道就接受，把收到的字节前面加
+/// "echo:" 回写。Task 5 用它验证「工程师连上反向端口 → 字节到达现场客户端」
+/// 那条通路真的通了。
+pub struct EchoClient;
+
+impl russh::client::Handler for EchoClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _k: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut st = channel.into_stream();
+            let mut buf = [0u8; 256];
+            while let Ok(n) = st.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                if st.write_all(&[b"echo:", &buf[..n]].concat()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+/// TLS（1.3、`AcceptAll`）+ SSH 握手，返回还没认证的客户端会话。处理器由
+/// 调用方给（`ssh_connect`/`ssh_connect_echo` 是两个薄包装）。
+pub async fn ssh_connect_with<H: russh::client::Handler + Send + 'static>(
+    addr: std::net::SocketAddr,
+    handler: H,
+) -> russh::client::Handle<H> {
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let tls_cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -96,7 +143,18 @@ pub async fn ssh_connect(addr: std::net::SocketAddr) -> russh::client::Handle<An
         inactivity_timeout: None,
         ..Default::default()
     });
-    russh::client::connect_stream(cfg, tls, AnyHostKey)
+    russh::client::connect_stream(cfg, tls, handler)
         .await
         .expect("SSH 握手失败")
+}
+
+/// TLS（1.3、`AcceptAll`）+ SSH 握手，返回还没认证的客户端会话。
+pub async fn ssh_connect(addr: std::net::SocketAddr) -> russh::client::Handle<AnyHostKey> {
+    ssh_connect_with(addr, AnyHostKey).await
+}
+
+/// 同上，但客户端处理器是会回显的 `EchoClient`——用来验证反向转发的字节
+/// 真的到达了「现场客户端」这一侧。
+pub async fn ssh_connect_echo(addr: std::net::SocketAddr) -> russh::client::Handle<EchoClient> {
+    ssh_connect_with(addr, EchoClient).await
 }
