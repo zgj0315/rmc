@@ -10,16 +10,18 @@
 //! 做到的，是靠"不写代码"。
 
 use crate::accounts::{AccountReader, Verify};
+use crate::audit::{AuditEvent, AuditLog};
 use crate::cidr::Cidr;
 use crate::datadir::DataDir;
 use crate::identity::Identity;
+use crate::throttle::{Admit, Limits, Throttle, UnauthSlot};
 use crate::{Error, Result};
 use rmc_core::code::{AccountName, ServerFingerprint};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use zeroize::Zeroizing;
@@ -76,6 +78,8 @@ pub struct ServerConfig {
     pub timings: Timings,
     /// `--engineer-allow` 的网段列表；空 = 不过滤，任何来源都能连反向端口。
     pub engineer_allow: Vec<Cidr>,
+    /// 认证失败限流与未认证连接限额（Task 6，spec §6）。
+    pub limits: Limits,
 }
 
 /// 一条隧道在服务端这一侧的全部状态。Task 6 的吊销扫描与 Task 7 的
@@ -95,6 +99,19 @@ pub(crate) struct TunnelInfo {
     pub peer: SocketAddr,
     pub engineers: Arc<AtomicUsize>,
     pub stop: watch::Sender<bool>,
+    /// 这条隧道所属会话的 `Handle`，给吊销扫描（`revocation_sweep`）用。
+    ///
+    /// **选择存这里，而不是去 `Shared.connections`（按来源地址索引）里查**：
+    /// `tcpip_forward` 本来就已经调了 `session.handle()` 去 spawn
+    /// `reverse_accept_loop`，`Handle: Clone` 很便宜，多存一份是免费的；
+    /// 而按 `TunnelInfo.peer` 去 `connections` 表反查需要额外一次
+    /// `Mutex` 加锁 + `HashMap` 查找，且要处理"查不到"（连接注册表的条目
+    /// 生命周期跟 `tunnels` 表不完全同步，`ConnHandleGuard` 与
+    /// `TunnelGuard` 是两个独立的 `Drop`）这种本可以从根上不存在的情况。
+    /// 两张表继续并存、各自服务各自的读者（`connections` 服务
+    /// `Running::shutdown()`/认证超时；`tunnels` 服务吊销扫描/状态展示），
+    /// 谁都不用去查另一张表。
+    pub handle: russh::server::Handle,
 }
 
 /// 挂在 `ConnHandler` 上；`ConnHandler`（连同它）随会话真正结束时被丢弃
@@ -112,6 +129,11 @@ impl Drop for TunnelGuard {
     fn drop(&mut self) {
         if let Some(info) = lock(&self.shared.tunnels).remove(&self.account) {
             let _ = info.stop.send(true);
+            self.shared.audit.record(AuditEvent::TunnelDown {
+                account: self.account.as_str().to_string(),
+                port: info.port,
+                reason: "会话结束".to_string(),
+            });
         }
     }
 }
@@ -176,6 +198,10 @@ pub(crate) struct Shared {
     /// 实际查找模式决定，但基础设施（"发 disconnect 能让内部任务自己
     /// 退出"这条路）已经在这里立住了，不需要 Task 6 重新发现。
     pub connections: Mutex<HashMap<SocketAddr, russh::server::Handle>>,
+    /// 认证失败限流与未认证连接限额（spec §6）。
+    pub throttle: Throttle,
+    /// JSON Lines 审计日志（spec §7）。
+    pub audit: AuditLog,
 }
 
 pub struct Server;
@@ -220,6 +246,10 @@ impl Running {
                 )
             })
             .collect()
+    }
+    /// 测试读审计日志用：今天这一份审计文件的路径。
+    pub fn audit_path_today(&self) -> std::path::PathBuf {
+        self.shared.audit.path_for(std::time::SystemTime::now())
     }
     /// 测试用：当前注册表里还有几条"已完成 SSH 握手"的连接。见
     /// `Shared.connections` 上的长注释——这个数字从非零变成零，是"这条
@@ -276,6 +306,7 @@ impl Server {
         // 建好之后立刻 clone 进 accept 任务，不要整个 move：`Running` 也存了
         // 一份（`tunnels_snapshot`），Task 6/7 的吊销扫描与发布状态都从
         // `Running.shared` 再拿一份。
+        let audit = AuditLog::open(&cfg.data)?;
         let shared = Arc::new(Shared {
             tls,
             ssh,
@@ -285,11 +316,16 @@ impl Server {
             engineer_allow: cfg.engineer_allow.clone(),
             tunnels: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
+            throttle: Throttle::new(cfg.limits.clone()),
+            audit,
         });
         let listener = tokio::net::TcpListener::bind(cfg.listen)
             .await
             .map_err(|e| Error::Listen(format!("{}：{e}", cfg.listen)))?;
         let local_addr = listener.local_addr()?;
+        shared.audit.record(AuditEvent::ServerStart {
+            listen: local_addr.to_string(),
+        });
         let (stop, mut stop_rx) = watch::channel(false);
         let accept_shared = shared.clone();
         let accept_task = tokio::spawn(async move {
@@ -299,7 +335,20 @@ impl Server {
                 tokio::select! {
                     _ = stop_rx.changed() => break,
                     accepted = listener.accept() => match accepted {
-                        Ok((sock, peer)) => { conns.spawn(handle_connection(shared.clone(), sock, peer)); }
+                        Ok((sock, peer)) => {
+                            let now = Instant::now();
+                            match shared.throttle.admit(peer.ip(), now) {
+                                Admit::Ok(slot) => { conns.spawn(handle_connection(shared.clone(), sock, peer, slot)); }
+                                Admit::Banned => {
+                                    shared.audit.record(AuditEvent::Banned { peer: peer.to_string() });
+                                    drop(sock);
+                                }
+                                Admit::TooMany => {
+                                    tracing::info!(%peer, "未认证连接过多，拒绝");
+                                    drop(sock);
+                                }
+                            }
+                        }
                         Err(e) => { tracing::warn!(error = %e, "accept 失败"); tokio::time::sleep(Duration::from_millis(50)).await; }
                     },
                     Some(_) = conns.join_next(), if !conns.is_empty() => {}
@@ -307,6 +356,10 @@ impl Server {
             }
             conns.abort_all();
         });
+        // 吊销扫描：随 `Running::shutdown()`（同一个 `stop`）一起退出，
+        // 不需要额外的 `JoinHandle`——它没有需要摘除的注册表条目，
+        // `stop.changed()` 之后自然 `break`，任务结束。
+        tokio::spawn(revocation_sweep(shared.clone(), stop.subscribe()));
         Ok(Running {
             local_addr,
             fingerprint,
@@ -314,6 +367,33 @@ impl Server {
             accept_task,
             shared,
         })
+    }
+}
+
+/// 每个扫描周期检查一次：账号已被吊销（`accounts.toml` 里 `enabled =
+/// false`）但隧道表里还有它的条目，就发 `disconnect` 让对应会话自己收尾
+/// （摘表、释放端口由 `TunnelGuard::drop` 完成，这里不重复做）。同一个
+/// 周期顺带清理过期的审计日志。
+async fn revocation_sweep(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    let mut tick = tokio::time::interval(shared.timings.sweep);
+    loop {
+        tokio::select! {
+            _ = stop.changed() => break,
+            _ = tick.tick() => {
+                let doomed: Vec<(AccountName, russh::server::Handle, u16)> = lock(&shared.tunnels)
+                    .iter()
+                    .filter(|(name, _)| !shared.accounts.is_active(name.as_str()))
+                    .map(|(name, info)| (name.clone(), info.handle.clone(), info.port))
+                    .collect();
+                for (name, handle, port) in doomed {
+                    tracing::info!(%name, port, "账号已吊销，断开在线隧道");
+                    let _ = handle
+                        .disconnect(russh::Disconnect::ByApplication, "账号已吊销".to_string(), String::new())
+                        .await;
+                }
+                shared.audit.prune(crate::audit::RETENTION_DAYS);
+            }
+        }
     }
 }
 
@@ -348,7 +428,21 @@ async fn wait_authed(rx: &mut watch::Receiver<bool>) {
 }
 
 /// 一条连接的全程：TLS 握手 + SSH 认证必须在 `handshake` 内完成，否则直接关掉。
-async fn handle_connection(shared: Arc<Shared>, sock: tokio::net::TcpStream, peer: SocketAddr) {
+///
+/// `slot` 是这条连接在 `Throttle` 里占的未认证名额（accept 时已经拿到）。
+/// 它随这个函数体的局部变量一路传下去：**没走到认证成功**的所有出口
+/// （TLS 失败/超时、SSH 握手失败/超时）都是这个函数自己 `return`，`slot`
+/// 作为局部变量被 `drop`，名额立刻归还。**认证成功之后**，`slot` 被移进
+/// `ConnHandler.slot`，所有权转移给真正持有 `ConnHandler` 的那个内部任务
+/// （见 `Shared.connections` 上的长注释）；`auth_password` 成功那一刻显式
+/// `take().release()`，认证失败/连接异常结束则靠 `ConnHandler`（连同
+/// `slot`）被 `Drop` 归还——两条路都归还，不会有名额泄漏。
+async fn handle_connection(
+    shared: Arc<Shared>,
+    sock: tokio::net::TcpStream,
+    peer: SocketAddr,
+    slot: UnauthSlot,
+) {
     let started = tokio::time::Instant::now();
     let deadline = tokio::time::sleep_until(started + shared.timings.handshake);
     tokio::pin!(deadline);
@@ -389,6 +483,7 @@ async fn handle_connection(shared: Arc<Shared>, sock: tokio::net::TcpStream, pee
         authed: authed_tx,
         account: None,
         tunnel: None,
+        slot: Some(slot),
     };
     let running = tokio::select! {
         r = russh::server::run_stream(shared.ssh.clone(), tls, handler) => match r {
@@ -520,6 +615,13 @@ pub(crate) struct ConnHandler {
     /// 上：会话结束（无论哪条路）时，`ConnHandler` 被丢弃，这个字段随之
     /// 被丢弃，隧道跟着被摘掉、监听任务被停掉。
     pub tunnel: Option<TunnelGuard>,
+    /// 这条连接在 `Throttle` 里占的未认证名额。`auth_password` 认证成功时
+    /// `take()` 出来显式 `release()`；认证失败或连接以任何别的方式结束，
+    /// 都靠 `ConnHandler` 本身被 `Drop`（连同这个字段）归还——两条路都
+    /// 归还，`Option` 只是让"已经显式归还过"这件事可以被观察到
+    /// （`take()` 之后留下 `None`，不会在 `Drop` 时重复归还，`UnauthSlot`
+    /// 自己的 `live` 标志也会挡住重复归还，这里双重保险都在）。
+    pub slot: Option<UnauthSlot>,
 }
 
 impl russh::server::Handler for ConnHandler {
@@ -531,8 +633,17 @@ impl russh::server::Handler for ConnHandler {
         password: &str,
     ) -> std::result::Result<russh::server::Auth, Self::Error> {
         // 账号名先按字符集校验：不合法直接拒，不跑哈希（字符集是公开规则，
-        // 不泄露账号是否存在）。
+        // 不泄露账号是否存在）。字符集不合法本身也是一次认证失败——一样
+        // 记进限流与审计，不然拿一个非法字符的用户名疯狂重试就绕开了
+        // 「同一来源 10 分钟内失败 10 次封 15 分钟」这条限制。
         let Ok(name) = AccountName::parse(user) else {
+            self.shared
+                .throttle
+                .record_failure(self.peer.ip(), Instant::now());
+            self.shared.audit.record(AuditEvent::AuthFail {
+                account: user.to_string(),
+                peer: self.peer.to_string(),
+            });
             return Ok(reject_but_let_client_retry_password());
         };
         let shared = self.shared.clone();
@@ -547,10 +658,27 @@ impl russh::server::Handler for ConnHandler {
             Verify::Ok { port } => {
                 let _ = self.authed.send(true);
                 self.account = Some((name.clone(), port));
+                // 认证过了，不再占未认证名额——`UnauthSlot::release()` 显式
+                // 归还，跟"整条连接结束时 `ConnHandler` 被 `Drop`"那条兜底
+                // 路径不冲突：`take()` 之后这里是 `None`，`Drop` 不会再动它。
+                if let Some(s) = self.slot.take() {
+                    s.release();
+                }
+                self.shared.audit.record(AuditEvent::AuthOk {
+                    account: name.as_str().to_string(),
+                    peer: self.peer.to_string(),
+                });
                 tracing::info!(peer = %self.peer, account = %name, "口令认证成功");
                 Ok(russh::server::Auth::Accept)
             }
             Verify::Rejected => {
+                self.shared
+                    .throttle
+                    .record_failure(self.peer.ip(), Instant::now());
+                self.shared.audit.record(AuditEvent::AuthFail {
+                    account: name.as_str().to_string(),
+                    peer: self.peer.to_string(),
+                });
                 tracing::debug!(peer = %self.peer, account = %name, "口令认证失败");
                 Ok(reject_but_let_client_retry_password())
             }
@@ -590,6 +718,7 @@ impl russh::server::Handler for ConnHandler {
                     peer: self.peer,
                     engineers: Arc::new(AtomicUsize::new(0)),
                     stop,
+                    handle: session.handle(),
                 },
             );
         }
@@ -629,6 +758,11 @@ impl russh::server::Handler for ConnHandler {
             (info.stop.subscribe(), info.engineers.clone())
         };
         *port = u32::from(account_port);
+        self.shared.audit.record(AuditEvent::TunnelUp {
+            account: account.as_str().to_string(),
+            port: account_port,
+            peer: self.peer.to_string(),
+        });
         tokio::spawn(reverse_accept_loop(
             self.shared.clone(),
             account.clone(),
@@ -680,19 +814,31 @@ async fn reverse_accept_loop(
                 let Ok((mut sock, peer)) = accepted else { continue };
                 if !crate::cidr::allowed(&shared.engineer_allow, peer.ip()) {
                     tracing::info!(%account, port, %peer, "工程师来源不在白名单，拒绝");
+                    shared.audit.record(AuditEvent::EngineerRejected {
+                        port,
+                        peer: peer.to_string(),
+                        reason: "不在来源白名单内".to_string(),
+                    });
                     continue; // sock 随作用域关闭
                 }
                 let prev = engineers.fetch_add(1, Ordering::SeqCst);
                 if prev >= shared.timings.max_engineers_per_tunnel {
                     engineers.fetch_sub(1, Ordering::SeqCst);
                     tracing::info!(%account, port, %peer, "工程师连接数已达上限，拒绝");
+                    shared.audit.record(AuditEvent::EngineerRejected {
+                        port,
+                        peer: peer.to_string(),
+                        reason: "工程师连接数已达上限".to_string(),
+                    });
                     continue;
                 }
                 let handle = handle.clone();
                 let engineers = engineers.clone();
                 let account = account.clone();
+                let shared = shared.clone();
                 let _ = sock.set_nodelay(true);
                 tasks.spawn(async move {
+                    let started = Instant::now();
                     let opened = handle
                         .channel_open_forwarded_tcpip(
                             "127.0.0.1",
@@ -703,12 +849,36 @@ async fn reverse_accept_loop(
                         .await;
                     match opened {
                         Ok(ch) => {
+                            shared.audit.record(AuditEvent::EngineerOpen {
+                                account: account.as_str().to_string(),
+                                port,
+                                peer: peer.to_string(),
+                            });
                             let mut st = ch.into_stream();
                             let r = tokio::io::copy_bidirectional(&mut sock, &mut st).await;
                             tracing::debug!(%account, port, %peer, ?r, "工程师连接结束");
+                            // `copy_bidirectional(a, b)` 返回 `(a→b 字节数,
+                            // b→a 字节数)`；这里 `a` 是工程师的 `sock`，`b`
+                            // 是通向现场客户端的 `st`：a→b = 工程师发给
+                            // 客户端 = `to_client`，b→a = 客户端发给工程师
+                            // = `from_client`。
+                            let (to_client, from_client) = r.unwrap_or((0, 0));
+                            shared.audit.record(AuditEvent::EngineerClose {
+                                account: account.as_str().to_string(),
+                                port,
+                                peer: peer.to_string(),
+                                seconds: started.elapsed().as_secs(),
+                                to_client,
+                                from_client,
+                            });
                         }
                         Err(e) => {
                             tracing::warn!(%account, port, %peer, error = %e, "开 forwarded-tcpip 通道失败");
+                            shared.audit.record(AuditEvent::EngineerRejected {
+                                port,
+                                peer: peer.to_string(),
+                                reason: "开 forwarded-tcpip 通道失败".to_string(),
+                            });
                         }
                     }
                     engineers.fetch_sub(1, Ordering::SeqCst);
@@ -752,27 +922,37 @@ mod tests {
     pub(crate) async fn server_with_account(
         name: &str,
     ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
-        server_with_account_and(name, Timings::fast(), Vec::new()).await
+        server_with_account_and(name, Timings::fast(), Vec::new(), Limits::default()).await
     }
 
     async fn server_with_account_and_timings(
         name: &str,
         timings: Timings,
     ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
-        server_with_account_and(name, timings, Vec::new()).await
+        server_with_account_and(name, timings, Vec::new(), Limits::default()).await
     }
 
     async fn server_with_account_and_allow(
         name: &str,
         allow: Vec<Cidr>,
     ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
-        server_with_account_and(name, Timings::fast(), allow).await
+        server_with_account_and(name, Timings::fast(), allow, Limits::default()).await
+    }
+
+    /// 限流/限额数值缩小到 `Limits::tiny()` 那一档，别的（超时、白名单）
+    /// 用默认值。Task 6 那几条测试专用。
+    async fn server_with_limits(
+        name: &str,
+        limits: Limits,
+    ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
+        server_with_account_and(name, Timings::fast(), Vec::new(), limits).await
     }
 
     async fn server_with_account_and(
         name: &str,
         timings: Timings,
         engineer_allow: Vec<Cidr>,
+        limits: Limits,
     ) -> (Running, zeroize::Zeroizing<String>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let d = DataDir::at(tmp.path().to_path_buf());
@@ -801,6 +981,7 @@ mod tests {
             reverse_bind: "127.0.0.1".parse().unwrap(),
             timings,
             engineer_allow,
+            limits,
         })
         .await
         .unwrap();
@@ -1362,7 +1543,23 @@ mod tests {
         let (srv, pw, _tmp) = server_with_account_and_timings(
             "zhang",
             Timings {
-                handshake: Duration::from_millis(300),
+                // **Task 6 实测记录，追加的注释**：这里原来是 300ms（跟
+                // 下面 `an_unauthenticated_connection_...` 那条一致）。
+                // Task 6 往同一个测试二进制里加了好几条会跑 argon2 的
+                // 测试（`repeated_failures_from_one_source_get_banned`
+                // 三次失败认证、`a_revoked_account_is_kicked_...`/
+                // `audit_log_records_...` 各一次成功认证，外加它们各自
+                // `server_with_account` 建账号时的一次哈希），全量并行跑
+                // `cargo test -p rmc-gateway` 时这些 `spawn_blocking`
+                // 的 argon2 调用会跟这条测试自己的认证请求抢同一个阻塞
+                // 线程池/CPU；300ms 在这种争抢下不够稳，连跑 5 次实测
+                // 4/5 红（`!s.is_closed()` 那句），把同一份代码单独跑
+                // （`--test-threads=1` 或单独 filter）5/5 绿——是一次
+                // CPU 争抢的时序问题，不是 deadline 分支本身的逻辑退化。
+                // 把 handshake 放宽到 2 秒（`fast()` 默认握手窗口
+                // 10 秒，这里仍然远短于它，测试意图不变），连跑 10 次
+                // 验证不再复现（见本任务报告）。
+                handshake: Duration::from_secs(2),
                 // keepalive 故意设得极长：这条测试要孤立地验证"deadline
                 // 分支的守卫是不是只求值一次"，不该被另一条完全无关的
                 // 机制（服务端自己的心跳）掺进来干扰。**实测记录**：不设
@@ -1385,9 +1582,9 @@ mod tests {
             .await
             .unwrap()
             .success());
-        // 远超 300ms 的 handshake：如果 deadline 分支的守卫是"进 select!
+        // 远超 2 秒的 handshake：如果 deadline 分支的守卫是"进 select!
         // 时的快照"，这里必然会被断开——即便已经认证成功。
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(
             !s.is_closed(),
             "已认证的会话不该被 handshake 的 deadline 断开"
@@ -1418,5 +1615,231 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(s.is_closed(), "一直没认证，300ms 后服务端该断开");
         assert_eq!(srv.connections_count(), 0);
+    }
+
+    /// 吊销后最迟一个扫描周期内被踢：测试用 200ms 周期，给 1s。
+    /// 改红：`revocation_sweep` 里把 `!is_active` 改成 `is_active`（会踢
+    /// 活人）——这条第一格红（吊销前就被踢）；或者干脆不 spawn 扫描——
+    /// 第二格红。
+    #[tokio::test]
+    async fn a_revoked_account_is_kicked_within_one_sweep() {
+        let (srv, pw, tmp) = server_with_account("zhang").await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = s.tcpip_forward("", 0).await.unwrap() as u16;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!s.is_closed(), "没吊销不能踢");
+        let d = DataDir::at(tmp.path().to_path_buf());
+        let cfg = GatewayConfig::load(&d).unwrap();
+        AccountStore::open(&d, &cfg, 22000)
+            .revoke(&AccountName::parse("zhang").unwrap())
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(s.is_closed(), "吊销 1 秒后还在线");
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .is_ok(),
+            "端口该释放了"
+        );
+        srv.shutdown().await;
+    }
+
+    /// 同一来源失败 N 次后被封：封禁期内连 TLS 都握不成（TCP 直接被关）。
+    ///
+    /// **实测记录，没有直接用 `Limits::tiny()`**：`tiny()` 的 `window`/
+    /// `ban` 都是 2 秒——那个数值是给 `throttle.rs` 自己那两条纯逻辑测试
+    /// 用的，那两条测试的"时间"是调用方直接传的 `Instant`，不摸真实
+    /// 时钟，2 秒短窗口没有任何风险。这条测试不一样：它真的要做 3 次
+    /// TLS+SSH 握手 + 密码认证（哪怕密码是错的，`auth_password` 还是会
+    /// 跑一次 argon2），这段真实耗时在全量并行跑、CPU 被别的测试的
+    /// argon2 调用一起抢占时可以轻松涨到一两秒——如果这时候还用 2 秒的
+    /// `ban`，"3 次失败记完 → 封禁窗口开始 → 测试跑到检查那一步"这段真实
+    /// 耗时有实打实的概率把 2 秒的封禁窗口整个熬过去，封禁在检查前就已经
+    /// 过期，第 4 条连接会被正常 `admit`（不再是 `Banned`），代码走到
+    /// `handle_connection` 里等 TLS ClientHello，10 秒都等不到——测试
+    /// 自己包的 5 秒 `timeout` 会先报 `Elapsed`。**实测确认过**：连跑 5
+    /// 遍全量 `cargo test -p rmc-gateway`，用 `Limits::tiny()` 时 4/5
+    /// 次都在这一步报 `Elapsed(())`（真实报错，不是猜测）；换成下面这个
+    /// 专门放宽了 `window`/`ban` 的 `Limits`（`per_ip_failures` 仍然是 3，
+    /// 保持测试意图不变——只放宽跟真实耗时相关的两个数值）之后，连跑
+    /// 10 遍没有再复现。
+    #[tokio::test]
+    async fn repeated_failures_from_one_source_get_banned() {
+        let (srv, _pw, _tmp) = server_with_limits(
+            "zhang",
+            Limits {
+                per_ip_failures: 3,
+                window: Duration::from_secs(60),
+                ban: Duration::from_secs(30),
+                max_unauth_global: 4,
+                max_unauth_per_ip: 2,
+            },
+        )
+        .await;
+        for _ in 0..3 {
+            let mut s = within("connect", ssh_connect(srv.local_addr())).await;
+            let _ = s.authenticate_password("zhang", "wrong").await;
+        }
+        let r = tokio::time::timeout(Duration::from_secs(5), async {
+            let sock = tokio::net::TcpStream::connect(srv.local_addr())
+                .await
+                .unwrap();
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 4];
+            sock.readable().await.unwrap();
+            let mut sock = sock;
+            sock.read(&mut buf).await
+        })
+        .await
+        .expect("封禁期内应当被立刻关掉");
+        assert_eq!(r.unwrap_or(0), 0, "应当读到 EOF");
+        let text = std::fs::read_to_string(srv.audit_path_today()).unwrap();
+        assert!(text.contains("\"event\":\"banned\""), "{text}");
+        srv.shutdown().await;
+    }
+
+    /// 未认证连接上限：多出来的 TCP 连接被立刻关掉，认证过的不占名额。
+    #[tokio::test]
+    async fn unauthenticated_connections_are_capped_and_authenticated_ones_do_not_count() {
+        use tokio::io::AsyncReadExt;
+        let (srv, pw, _tmp) = server_with_limits("zhang", Limits::tiny()).await; // 每 IP 2
+        let mut a = within("a", ssh_connect(srv.local_addr())).await;
+        assert!(a
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success()); // 认证过：释放名额
+        let _b = tokio::net::TcpStream::connect(srv.local_addr())
+            .await
+            .unwrap(); // 未认证 1
+        let _c = tokio::net::TcpStream::connect(srv.local_addr())
+            .await
+            .unwrap(); // 未认证 2
+        let mut d = tokio::net::TcpStream::connect(srv.local_addr())
+            .await
+            .unwrap(); // 第 3 条：超
+        let mut buf = [0u8; 4];
+        let n = tokio::time::timeout(Duration::from_secs(2), d.read(&mut buf))
+            .await
+            .expect("应当被关掉")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        srv.shutdown().await;
+    }
+
+    /// 审计日志里有真实来源、有隧道起落、有工程师起止与字节数——而且
+    /// **没有口令**。
+    #[tokio::test]
+    async fn audit_log_records_the_whole_story_without_the_password() {
+        let (srv, pw, _tmp) = server_with_account("zhang").await;
+        let mut s = within("connect", ssh_connect_echo(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        let port = s.tcpip_forward("", 0).await.unwrap() as u16;
+        assert_eq!(engineer_roundtrip(port, b"hi").await, b"echo:hi");
+        // **实测记录，brief 字面顺序会 flake，已按 GLOBAL.md 的处置原则
+        // 加一句等待并如实记录**：`engineer_roundtrip` 只等到"应用层拿到
+        // echo 回包"，工程师那条 TCP 连接（连同它对应的 SSH
+        // forwarded-tcpip 通道）的优雅收尾（EOF 换手、
+        // `copy_bidirectional` 真正返回、`reverse_accept_loop` 里那个任务
+        // 走到 `EngineerClose` 那句 `audit.record`）是另一件还在异步进行
+        // 的事。照 brief 字面紧接着就 `s.disconnect(...)` 断掉整条 SSH
+        // 会话：`TunnelGuard::drop` 几乎同时触发，`reverse_accept_loop`
+        // 的外层 `select!` 一见 `stop.changed()` 就 `break` 并
+        // `tasks.abort_all()`——如果那个还在收尾的工程师任务这时候还没
+        // 跑到 `EngineerClose` 那句，就被硬 abort 掉，事件永远不会落盘。
+        // 实测复现过一次：日志里有 `engineer_open` 和几乎同一时刻的
+        // `tunnel_down`，中间缺了 `engineer_close`。这里加 200ms 让前者
+        // 先走完，不是调度余量，是等一次真实的异步收尾。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        s.disconnect(russh::Disconnect::ByApplication, "", "")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let text = std::fs::read_to_string(srv.audit_path_today()).unwrap();
+        for ev in [
+            "auth_ok",
+            "tunnel_up",
+            "engineer_open",
+            "engineer_close",
+            "tunnel_down",
+        ] {
+            assert!(
+                text.contains(&format!("\"event\":\"{ev}\"")),
+                "缺 {ev}：{text}"
+            );
+        }
+        assert!(
+            text.contains("\"peer\":\"127.0.0.1:"),
+            "要有真实来源：{text}"
+        );
+        assert!(!text.contains(pw.as_str()), "口令进了审计日志");
+        srv.shutdown().await;
+    }
+
+    /// **控制者补充第三条要求的这条测试**：Task 5 把认证超时那一支的
+    /// `handle.disconnect(...)` 从"只打日志"改成"真的发消息让内部任务
+    /// 退出"，这里验证下游效果——`UnauthSlot` 真的被归还，不是只信
+    /// "内部任务会退出"这句话。
+    ///
+    /// 用 `max_unauth_global`/`max_unauth_per_ip` 都设成 1：先用一条完成
+    /// TLS+SSH 握手但不认证的连接把唯一的名额占满（这条连接会卡在
+    /// `handle_connection` 第二个 `select!` 里，走的正是需要主动
+    /// `disconnect` 才能真正收尾的那条路——见 `Shared.connections` 上的
+    /// 长注释），确认名额满了之后新连接被立刻拒绝；等 `handshake`
+    /// deadline 过期，确认名额被腾出来，新连接不再被立刻拒绝。
+    ///
+    /// 改红：把 `handle_connection` 第二个 `select!` 里 deadline 分支的
+    /// `handle.disconnect(...)` 那一行删掉（只留日志）——这条测试在最后
+    /// 一步红：`r.is_err()` 断言失败，因为名额从未被真正归还，第三条连接
+    /// 依旧被 `TooMany` 立刻关掉，读到 EOF。
+    #[tokio::test]
+    async fn unauthenticated_slots_are_reclaimed_after_the_handshake_deadline() {
+        use tokio::io::AsyncReadExt;
+        let (srv, _pw, _tmp) = server_with_account_and(
+            "zhang",
+            Timings {
+                handshake: Duration::from_millis(300),
+                // 堵死心跳兜底：这条测试要孤立地验证 deadline 分支归还名额
+                // 这件事，不该被服务端自己的心跳提前打断连接掺进来干扰。
+                keepalive: Duration::from_secs(3600),
+                keepalive_max: 1000,
+                ..Timings::fast()
+            },
+            Vec::new(),
+            Limits {
+                max_unauth_global: 1,
+                max_unauth_per_ip: 1,
+                ..Limits::tiny()
+            },
+        )
+        .await;
+        let addr = srv.local_addr();
+        // 占住唯一的未认证名额：完成 TLS + SSH 握手，但不认证。
+        let _a = within("connect a", ssh_connect(addr)).await;
+        // 名额已满：第二条连接（哪怕只是裸 TCP）应当立刻被 `TooMany` 关掉。
+        let mut b = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), b.read(&mut [0u8; 4]))
+            .await
+            .expect("名额已满，应当被立刻关掉")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "应当读到 EOF");
+        // 等 `_a` 的 handshake deadline 过期、被服务端主动 disconnect 踢掉。
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_millis(300), c.read(&mut [0u8; 4])).await;
+        assert!(
+            r.is_err(),
+            "名额已经归还，这条连接不该立刻被 TooMany 关掉：{r:?}"
+        );
+        srv.shutdown().await;
     }
 }

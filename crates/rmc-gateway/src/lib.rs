@@ -3,12 +3,15 @@
 //! `docs/superpowers/specs/2026-09-21-rmc-gateway-design.md`。
 
 pub mod accounts;
+pub mod audit;
 pub mod cidr;
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod datadir;
 pub mod identity;
 pub mod server;
+pub mod throttle;
 
 #[cfg(test)]
 mod testing_verifier;
