@@ -89,7 +89,7 @@ allow = [
 ]
 
 [bans]
-# 只是警告，不 deny：`cargo deny check bans` 实测报出 12 组重复
+# 只是警告，不 deny：`cargo deny check bans` 实测报出多组重复
 # 版本——`windows-sys`（`ring`/`errno` 等各自拉了不同的版本，Windows
 # 专用代码，不影响 Linux 构建）与 `syn`（proc-macro 构建期依赖，两个
 # 版本互不链接进最终产物）确实无害，但 `sha2`/`sha3`/`digest`/`rand`/
@@ -106,6 +106,23 @@ allow = [
 # 成本；但理由不能只举最无害的那条，免得下次有人以为"反正都是
 # windows-sys 那种小事"就把 `warn` 顺手改成 `allow` 甚至删掉整个
 # `[bans]` 段。
+#
+# Task 3 引入 `toml`（经 `accounts.toml`/`config.toml` 的解析）之后新增的
+# 两组重复版本，同样归进「无害」这一类，理由是实查过的事实，不是猜测
+# （`cargo tree -i winnow` 实跑过）：
+#
+#   winnow v0.7.15  ← toml v0.9.12          ← rmc-gateway
+#   winnow v1.0.4   ← toml_parser v1.1.3    ← toml v0.9.12  ← rmc-gateway
+#
+# 也就是说 `toml 0.9.12` 自己同时依赖 `winnow 0.7`（直接）与
+# `winnow 1.0`（经它自己的 `toml_parser`）——这是 `toml` crate 自身处在
+# 从 winnow 0.7 迁移到 1.0 的过渡期，不是我们选错了版本，也没有任何
+# 版本组合能让我们单方面消掉它（升级/降级 `toml` 的版本号不会改变
+# `toml_parser` 内部锁的 winnow 版本）。`toml_datetime`（0.7 与 1.1
+# 两个版本共存）是同一条过渡线上的另一个包，理由相同。两者都是纯解析器
+# ——不碰密码学、不处理网络上来的不可信输入——两个版本也不会同时链接进
+# 同一条调用路径，跟上面 `sha2`/`rand` 那种「两套密码学实现并存」性质
+# 完全不同，判为无害。
 multiple-versions = "warn"
 # 明确禁止把 OpenSSL 拖进来，TLS 只用 rustls。
 deny = [{ name = "openssl-sys" }, { name = "native-tls" }]

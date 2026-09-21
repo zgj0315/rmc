@@ -2,6 +2,7 @@
 //! 运维服务器：一个二进制，只做口令认证与一条反向转发。设计见
 //! `docs/superpowers/specs/2026-09-21-rmc-gateway-design.md`。
 
+pub mod accounts;
 pub mod cli;
 pub mod config;
 pub mod datadir;
