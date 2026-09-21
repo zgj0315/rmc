@@ -527,8 +527,14 @@ mod tests {
         }
     }
 
+    /// 名字曾经叫 `a_domain_in_the_code_is_refused_with_the_dedicated_text`
+    /// ——名实不符：名字暗示验的是「域名专属报错文案」，实际因为替换 IP
+    /// 会顺带弄坏校验位，**先撞的是 `Checksum` 而不是 `Domain`**（见下面
+    /// 注释）。这条测试真正验证的是「连接码里替换出一个域名之后，无论
+    /// 最终撞在哪个具体错误上，都仍然标在连接码这一框上、且文案不含
+    /// 禁用词」，改名反映这一点。
     #[test]
-    fn a_domain_in_the_code_is_refused_with_the_dedicated_text() {
+    fn a_domain_in_the_code_still_gets_marked_on_the_code_field() {
         let mut f = good();
         // 校验位随之失效——先撞 Checksum，也是 Rejected，但仍然标在
         // 连接码这一框上，且不含禁用词。

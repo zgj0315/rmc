@@ -29,7 +29,7 @@
 
 use rmc_core::preflight::{
     PreflightReport, StepOutcome, ALL_STEPS, STEP_APPLIANCE_HOSTKEY, STEP_APPLIANCE_TCP,
-    STEP_GATEWAY_DNS, STEP_GATEWAY_TLS,
+    STEP_GATEWAY_REACH, STEP_GATEWAY_TLS,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -332,13 +332,14 @@ pub fn advice_for(report: Option<&PreflightReport>) -> Advice {
             "一体机端口开着，但 SSH 握手没完成。请确认那个端口后面确实是一体机的 sshd，\
              而不是被别的服务占用了。"
         }
-        STEP_GATEWAY_DNS => {
-            "运维服务器的域名解析失败。请确认这台笔记本能正常出网，以及地址栏里填的域名无误。"
+        STEP_GATEWAY_REACH => {
+            "连不上运维服务器的这个端口。请确认这台笔记本能出网；客户网络只放行 443 时，\
+             请客户网管放行这个 IP 的端口，或由运维把公网 443 映射到运维服务器后重发连接码。"
         }
-        STEP_GATEWAY_TLS if detail.contains("证书") => {
-            "服务器证书不在客户端的信任根里，说明客户网络上有 TLS 审计设备，\
-             流量被解密之后重新签了名。客户端不接受企业注入的根证书，所以连接中止。\
-             请联系客户的网络管理员，把运维服务器的 443 端口加进审计设备的放行名单。"
+        STEP_GATEWAY_TLS if detail.contains("指纹") => {
+            "运维服务器的身份与连接码里的指纹对不上，连接已经拒绝。两种可能：路径上有做\
+             中间人的 TLS 审计设备（请客户网管对这个 IP 与端口免做审计），或者连接码已经\
+             过期（运维服务器换过密钥，请向运维重新索取连接码）。"
         }
         STEP_GATEWAY_TLS if detail.contains("代理要求认证") => {
             "代理要求认证，而这次协商没有通过。具体是哪一步没过，看上面「代理认证」那一行：\
@@ -896,7 +897,7 @@ mod tests {
             steps: vec![
                 step(STEP_APPLIANCE_TCP, pass("192.168.100.10:61001 可达 · 6 ms")),
                 step(STEP_APPLIANCE_HOSTKEY, pass("SHA256:kM9v7bQe")),
-                step(STEP_GATEWAY_DNS, pass("ops.example.com → 203.0.113.20")),
+                step(STEP_GATEWAY_REACH, pass("203.0.113.20:443 可达 · 直连")),
                 step(STEP_GATEWAY_TLS, tls),
             ],
         }
@@ -937,7 +938,7 @@ mod tests {
     fn a_skipped_step_has_no_verdict_and_is_not_highlighted() {
         let rows = rows(
             Some(&report(StepOutcome::Skipped {
-                detail: "域名解析失败，未执行".into(),
+                detail: "运维服务器未连通，未执行".into(),
             })),
             None,
             None,
@@ -1126,14 +1127,14 @@ mod tests {
                 &["sshd"],
             ),
             (
-                STEP_GATEWAY_DNS,
-                failed("域名解析失败：no records"),
-                &["解析", "出网"],
+                STEP_GATEWAY_REACH,
+                failed("TCP 连接失败：Connection refused (os error 61)"),
+                &["出网", "443"],
             ),
             (
                 STEP_GATEWAY_TLS,
-                failed("运维服务器 TLS 证书链无效：UnknownIssuer"),
-                &["审计", "放行"],
+                failed("运维服务器的身份与连接码里的指纹不一致：invalid peer certificate: application verification failure"),
+                &["指纹", "连接码"],
             ),
             (
                 STEP_GATEWAY_TLS,

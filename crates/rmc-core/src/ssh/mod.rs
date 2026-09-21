@@ -235,8 +235,12 @@ impl TunnelFactory for SshTunnelFactory {
     ) -> Result<Box<dyn TunnelHandle>> {
         // 拨号与 host key 比对读的是同一个 `params.gateway`——这一句
         // 里不存在第二个 Gateway 地址来源，也就没有「预检探的那台」与
-        // 「实际连的那台」分叉的余地，见类型上的 R96 说明。
-        let conn = self.transport.connect(&params.gateway).await?;
+        // 「实际连的那台」分叉的余地，见类型上的 R96 说明。Task 9：TLS
+        // 核对的指纹同样从 `params.fingerprint` 来，不是另一份拷贝。
+        let conn = self
+            .transport
+            .connect(&params.gateway, &params.fingerprint)
+            .await?;
         establish_over(conn, &self.known_hosts, params, tx).await
     }
 }

@@ -681,7 +681,9 @@ mod tests {
         // 一遍完整管道。rmc-core 侧的穷尽扫描在 `rmc_core::wording`。
         for e in [
             host_key_mismatch(),
-            Error::TlsInvalidCert("unknown issuer".into()),
+            Error::TlsPinMismatch(
+                "invalid peer certificate: application verification failure".into(),
+            ),
             Error::KeepaliveTimeout,
         ] {
             let c = model_in(State::Failed {

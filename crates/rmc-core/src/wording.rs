@@ -267,7 +267,7 @@ mod tests {
     fn variant_index(e: &Error) -> usize {
         match e {
             Error::HostKeyMismatch { .. } => 0,
-            Error::TlsInvalidCert(_) => 1,
+            Error::TlsPinMismatch(_) => 1,
             Error::ProxyAuthFailed(_) => 2,
             Error::AuthRejected => 3,
             Error::ForwardPortBusy(_) => 4,
@@ -291,7 +291,9 @@ mod tests {
                 expected: "SHA256:aaa".into(),
                 actual: "SHA256:bbb".into(),
             },
-            Error::TlsInvalidCert("unknown issuer".into()),
+            Error::TlsPinMismatch(
+                "invalid peer certificate: application verification failure".into(),
+            ),
             Error::ProxyAuthFailed("Negotiate".into()),
             Error::AuthRejected,
             Error::ForwardPortBusy(22001),

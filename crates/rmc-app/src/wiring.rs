@@ -53,7 +53,6 @@ use rmc_core::preflight::TransportPreflight;
 use rmc_core::ssh::SshTunnelFactory;
 use rmc_core::state::{Command, TunnelEvent};
 use rmc_core::supervisor::{Deps, Supervisor};
-use rmc_core::transport::tls::TlsRoots;
 use rmc_core::transport::Transport;
 use rmc_win::secret::{FileSecretStore, Sealer, SecretStore};
 use rmc_win::sspi::{
@@ -308,7 +307,6 @@ pub fn wire_egress(proxy: Arc<dyn ProxyResolver>, sspi: Option<SspiContextFactor
     let transport = Arc::new(Transport::new(
         recorder as Arc<dyn ProxyResolver>,
         Arc::clone(&authenticator),
-        TlsRoots::webpki(),
     ));
 
     Egress {
@@ -774,8 +772,10 @@ mod tests {
     ///   调用**，`asked()` 是空的 —— 当场红。
     ///
     /// 为什么要先拨一次号：`ProxyEndpointRecorder` 记的是"最近一次
-    /// `resolve()` 的结果"，而 `resolve()` 只在 `Transport::connect()`
-    /// 里发生。这正是它与协商器必须共用一个对象的原因。
+    /// `resolve()` 的结果"，而 `resolve()` 只在 `Transport::dial()`
+    /// （Task 9 从 `connect()` 里拆出来的那一半，只做 TCP 拨号 + 可选
+    /// CONNECT，不碰 TLS）里发生。这正是它与协商器必须共用一个对象的
+    /// 原因；这几条测试只关心代理/SPN，用 `dial()` 不用 `connect()`。
     #[tokio::test]
     async fn the_negotiator_asks_for_an_spn_built_from_the_proxy_host() {
         let proxy = closed_port().await;
@@ -788,11 +788,11 @@ mod tests {
         // 反向自证：还没连过时，工厂一次都没被问过。
         assert!(spy.asked().is_empty());
 
-        // 走一次真实的 `Transport::connect`：`resolve()` 在这里发生，
+        // 走一次真实的 `Transport::dial`：`resolve()` 在这里发生，
         // 记录器于是记下了这台代理。
         let _ = egress
             .transport
-            .connect(&"ops.example.com:443".parse().unwrap())
+            .dial(&"ops.example.com:443".parse().unwrap())
             .await;
 
         // 驱动一轮协商。
@@ -831,7 +831,7 @@ mod tests {
         let egress = wire_egress(Arc::new(FixedProxy(Some(proxy))), Some(spy.factory()));
         let _ = egress
             .transport
-            .connect(&"ops.example.com:443".parse().unwrap())
+            .dial(&"ops.example.com:443".parse().unwrap())
             .await;
 
         for scheme in ["Negotiate", "NTLM"] {
@@ -852,7 +852,7 @@ mod tests {
         let gateway = closed_port().await;
         let spy = Arc::new(SpnSpy::default());
         let egress = wire_egress(Arc::new(FixedProxy(None)), Some(spy.factory()));
-        let _ = egress.transport.connect(&gateway).await;
+        let _ = egress.transport.dial(&gateway).await;
 
         egress.authenticator.begin_connection().await;
         assert!(egress
@@ -898,7 +898,7 @@ mod tests {
         );
         let _ = egress
             .transport
-            .connect(&"ops.example.com:443".parse().unwrap())
+            .dial(&"ops.example.com:443".parse().unwrap())
             .await;
         egress.authenticator.begin_connection().await;
         let _ = egress.authenticator.next_token("Negotiate", None).await;

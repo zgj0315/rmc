@@ -20,8 +20,13 @@ pub enum Error {
     #[error("运维服务器 host key 与已记录的不一致，已拒绝连接（记录 {expected}，本次 {actual}）")]
     HostKeyMismatch { expected: String, actual: String },
 
-    #[error("运维服务器 TLS 证书链无效：{0}")]
-    TlsInvalidCert(String),
+    /// Task 9：运维服务器没有域名、证书自签，客户端核对的是连接码里的
+    /// 指纹（证书里 ed25519 公钥的 SHA-256），不是公共 CA 链——这个变体
+    /// 原名 `TlsInvalidCert`，说的是"证书链无效"，那个概念在没有 CA 的
+    /// 世界里不成立，改名反映真正核对的是什么。归 `Fatal` 不变：指纹不
+    /// 符可能是中间人，重试同一个可疑对端没有意义。
+    #[error("运维服务器的身份与连接码里的指纹不一致：{0}")]
+    TlsPinMismatch(String),
 
     #[error("代理要求认证，协商失败：{0}")]
     ProxyAuthFailed(String),
@@ -104,7 +109,7 @@ impl Error {
     pub fn class(&self) -> ErrorClass {
         match self {
             Error::HostKeyMismatch { .. }
-            | Error::TlsInvalidCert(_)
+            | Error::TlsPinMismatch(_)
             | Error::ProxyAuthFailed(_)
             | Error::Config(_)
             | Error::LocalIo(_) => ErrorClass::Fatal,
@@ -164,9 +169,15 @@ mod tests {
     }
 
     #[test]
-    fn tls_cert_error_is_fatal() {
+    fn tls_pin_mismatch_is_fatal() {
+        // 指纹不符可能是中间人：重试同一个可疑对端没有意义，必须 Fatal
+        // 而不是 Network——归成 Network 的后果是客户端会无限退避重连一台
+        // 可能冒充的服务器。
         assert_eq!(
-            Error::TlsInvalidCert("unknown issuer".into()).class(),
+            Error::TlsPinMismatch(
+                "invalid peer certificate: application verification failure".into()
+            )
+            .class(),
             ErrorClass::Fatal
         );
     }

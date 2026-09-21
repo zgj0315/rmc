@@ -68,6 +68,7 @@
 //! Rust 按调用形式消歧，两者可以在同一个模块里共存。
 
 use crate::addr::HostPort;
+use crate::code::ServerFingerprint;
 use crate::error::{Error, ErrorClass};
 use crate::knownhosts::fingerprint_of;
 use crate::platform::Conn;
@@ -84,8 +85,11 @@ use tokio::net::TcpStream;
 /// 受需求硬禁令「界面上叫运维服务器，不叫 Gateway/网关」管——而
 /// `wording.rs` 的禁用词扫描只看得见 [`ALL_STEPS`]。宏同时生成常量与
 /// `ALL_STEPS`，绕开它另写一个 `pub const STEP_*` 就等于给扫描器开了
-/// 一个天窗：常量名可以随便叫（`STEP_GATEWAY_DNS` 这个名字本身不上屏，
-/// 刻意没改），值必须进表。
+/// 一个天窗：常量名可以随便叫（不上屏，改了也不影响扫描器），值必须
+/// 进表——Task 9 把 `STEP_GATEWAY_DNS` 改名成 `STEP_GATEWAY_REACH`
+/// 正是"名字可以自由改、值才是受约束的那一半"的一次实例：DNS 解析这一步
+/// 本身被拿掉了，常量名跟着语义改，界面上的文字（"运维服务器连通"）
+/// 同一次改动生效，扫描器不需要，也不会因为常量名变了而漏检。
 macro_rules! steps {
     ($($(#[$m:meta])* $name:ident = $value:literal;)+) => {
         $($(#[$m])* pub const $name: &str = $value;)+
@@ -98,14 +102,14 @@ macro_rules! steps {
 steps! {
     STEP_APPLIANCE_TCP = "一体机 TCP";
     STEP_APPLIANCE_HOSTKEY = "一体机 host key 指纹";
-    STEP_GATEWAY_DNS = "运维服务器域名解析";
-    STEP_GATEWAY_TLS = "运维服务器 TLS";
+    STEP_GATEWAY_REACH = "运维服务器连通";
+    STEP_GATEWAY_TLS = "运维服务器 TLS 与指纹";
 }
 
 /// 单个网络操作的超时预算。预检存在的意义就是把"连不上"这件事在工程师
 /// 现场几秒内说清楚，而不是让界面无限期转圈——见下面 `bounded` 上的说明：
 /// 这个预算不只用在两个一体机步骤上（brief 原始草稿只给这两步套了
-/// 超时），Gateway 的 DNS 解析与 TLS 连接同样套着，理由见 `bounded`。
+/// 超时），运维服务器的连通与 TLS 握手同样套着，理由见 `bounded`。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +308,7 @@ async fn probe_host_key_over(conn: Conn) -> Result<String, Error> {
 pub async fn run(
     transport: &Transport,
     gateway: &HostPort,
+    pin: &ServerFingerprint,
     appliance: &HostPort,
 ) -> PreflightReport {
     let mut steps = Vec::with_capacity(4);
@@ -347,67 +352,59 @@ pub async fn run(
         });
     }
 
-    // 3. Gateway 域名解析。
-    let dns_result = bounded(transport.resolve_dns(gateway.host()), || {
-        Error::Dns(format!("解析 {} 超时", gateway.host()))
+    // 3. 运维服务器连通——TCP 拨号，经代理时含 CONNECT，不做 TLS。
+    // 4. 运维服务器 TLS 与指纹——依赖第 3 步，连不上就没有字节流可以
+    //    握手。Task 9：不再有单独的域名解析步骤——连接码里只有 IP
+    //    （spec §4.2「只用 IP，不接受域名」），`dial()` 直接拨号，
+    //    "运维服务器连通"这一步本身就把"地址能不能拨通"说清楚了。
+    let proxy = transport.effective_proxy(gateway).await;
+    let via = match &proxy {
+        Some(p) => format!("经代理 {p}"),
+        None => "直连".to_string(),
+    };
+    let dial = bounded(transport.dial(gateway), || {
+        Error::Tcp(format!("连接 {gateway} 超时（含 TCP 拨号与代理 CONNECT）"))
     })
     .await;
-    let dns_ok = match dns_result {
-        Ok(addrs) => {
-            let list = addrs
-                .iter()
-                .map(|a| a.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+    match dial {
+        Ok(stream) => {
             steps.push(PreflightStep {
-                name: STEP_GATEWAY_DNS,
+                name: STEP_GATEWAY_REACH,
                 outcome: StepOutcome::Pass {
-                    detail: format!("{} → {list}", gateway.host()),
+                    detail: format!("{gateway} 可达 · {via}"),
                 },
             });
-            true
+            let tls = bounded(
+                crate::transport::tls::wrap_tls(stream, gateway, pin),
+                || Error::TlsHandshake(format!("与 {gateway} 的 TLS 握手超时")),
+            )
+            .await;
+            let outcome = match tls {
+                Ok(t) => {
+                    drop(t);
+                    StepOutcome::Pass {
+                        detail: "TLS 1.3 · 指纹与连接码一致".into(),
+                    }
+                }
+                Err(e) => fail(&e),
+            };
+            steps.push(PreflightStep {
+                name: STEP_GATEWAY_TLS,
+                outcome,
+            });
         }
         Err(e) => {
             steps.push(PreflightStep {
-                name: STEP_GATEWAY_DNS,
+                name: STEP_GATEWAY_REACH,
                 outcome: fail(&e),
             });
-            false
+            steps.push(PreflightStep {
+                name: STEP_GATEWAY_TLS,
+                outcome: StepOutcome::Skipped {
+                    detail: "运维服务器未连通，未执行".into(),
+                },
+            });
         }
-    };
-
-    // 4. Gateway TLS，经代理时含 CONNECT——依赖第 3 步，域名都解不出来就
-    // 没有地址可拨。
-    if dns_ok {
-        let proxy = transport.effective_proxy(gateway).await;
-        let connect_result = bounded(transport.connect(gateway), || {
-            Error::TlsHandshake(format!("连接 {gateway} 超时（含 TCP 拨号与代理 CONNECT）"))
-        })
-        .await;
-        let outcome = match connect_result {
-            Ok(conn) => {
-                drop(conn);
-                let via = match proxy {
-                    Some(p) => format!("经代理 {p}"),
-                    None => "直连".to_string(),
-                };
-                StepOutcome::Pass {
-                    detail: format!("握手成功 · {via}"),
-                }
-            }
-            Err(e) => fail(&e),
-        };
-        steps.push(PreflightStep {
-            name: STEP_GATEWAY_TLS,
-            outcome,
-        });
-    } else {
-        steps.push(PreflightStep {
-            name: STEP_GATEWAY_TLS,
-            outcome: StepOutcome::Skipped {
-                detail: "域名解析失败，未执行".into(),
-            },
-        });
     }
 
     PreflightReport { steps }
@@ -416,7 +413,12 @@ pub async fn run(
 /// 让 [`run`] 可以被替换成假实现的接缝——见模块顶部 R4 的说明。
 #[async_trait::async_trait]
 pub trait Preflight: Send + Sync {
-    async fn run(&self, gateway: &HostPort, appliance: &HostPort) -> PreflightReport;
+    async fn run(
+        &self,
+        gateway: &HostPort,
+        pin: &ServerFingerprint,
+        appliance: &HostPort,
+    ) -> PreflightReport;
 }
 
 /// 生产用的 [`Preflight`] 实现，底层就是本模块的自由函数 [`run`]。
@@ -432,8 +434,13 @@ impl TransportPreflight {
 
 #[async_trait::async_trait]
 impl Preflight for TransportPreflight {
-    async fn run(&self, gateway: &HostPort, appliance: &HostPort) -> PreflightReport {
-        run(&self.transport, gateway, appliance).await
+    async fn run(
+        &self,
+        gateway: &HostPort,
+        pin: &ServerFingerprint,
+        appliance: &HostPort,
+    ) -> PreflightReport {
+        run(&self.transport, gateway, pin, appliance).await
     }
 }
 
@@ -601,16 +608,21 @@ mod tests {
 
         let appliance = HostPort::new("127.0.0.1", port).unwrap();
         // 这条只关心一体机的两步，Gateway 用一个保证解析失败的名字，
-        // 避免这条不需要网络的测试意外摸到真实 DNS。
+        // 避免这条不需要网络的测试意外摸到真实 DNS——`dial()` 内部的
+        // `TcpStream::connect` 仍然要过一次本地 resolver 才知道这个
+        // 名字连不了，这条单个 label 超过 63 字节的名字在任何环境下都
+        // 会在本地校验阶段被拒绝，不会真的发出网络请求。指纹随便传一个：
+        // 反正拨号这一步就会失败，TLS 步骤会被标成 Skipped，不会用到它。
         let gateway: HostPort = format!("{}.invalid:443", "a".repeat(64)).parse().unwrap();
+        let pin = ServerFingerprint::of_ed25519_public(&[0u8; 32]);
 
         let r = run(
             &Transport::new(
                 Arc::new(crate::platform::NoProxy),
                 Arc::new(crate::platform::NoProxyAuth),
-                crate::transport::tls::TlsRoots::webpki(),
             ),
             &gateway,
+            &pin,
             &appliance,
         )
         .await;
@@ -626,7 +638,7 @@ mod tests {
         // 工程师会看到四行在重新检查前后自己跳位置。
         //
         // 改红：把 `steps!` 里任意两行对调；或者把 `run()` 里
-        // 「一体机 host key」与「运维服务器域名解析」两段 push 的先后换掉。
+        // 「一体机 host key」与「运维服务器连通」两段 push 的先后换掉。
         let produced: Vec<&str> = r.steps.iter().map(|s| s.name).collect();
         assert_eq!(
             produced,
@@ -659,92 +671,111 @@ mod tests {
         }
     }
 
-    // --- R54（第二轮评审，HIGH）：四步里 Pass 方向完全没有测试守着——
-    // `tests/preflight.rs` 已有的用例只覆盖 Fail/Skipped，Gateway TLS
-    // 步骤的成功分支唯一的把关者是 `#[ignore]` 的
+    // --- R54（第二轮评审，HIGH），Task 9 订正：四步里 Pass 方向完全没有
+    // 测试守着——`tests/preflight.rs` 已有的用例只覆盖 Fail/Skipped，
+    // Gateway TLS 步骤的成功分支唯一的把关者曾经是 `#[ignore]` 的
     // `all_four_steps_pass_against_the_harness`，本仓没有任何 CI 会跑
-    // 它。评审把 `run()` 里 TLS 步骤的成功分支改成恒定 `Fail`，146 条
-    // 依旧全绿。这里在进程内起一个真正的 rustls TLS 服务端（自签证书，
-    // 固定下来而不是每次现生成——跟 `ssh::test_support` 里固定 Ed25519
-    // host key 是同一个理由：两次连接不需要额外传证书对象），通过
-    // `TlsRoots::with_extra_pem` 把它加成信任根（Task 6 已经趟平的
-    // 用法，跟 `tests/transport.rs` 信任 harness 自签证书是同一个模式），
-    // 证明 DNS 成功、证书受信时 TLS 步骤真的是 `Pass`。
+    // 它。R54 当时的做法是起一个真正的 rustls TLS 服务端，通过
+    // `TlsRoots::with_extra_pem` 把自签证书加成信任根——那条路径连同
+    // `TlsRoots` 这个类型本身已经被 Task 9 整个删掉：客户端不再信任
+    // 任何"根"，核对的是连接码里的指纹。
     //
-    // 会让这条测试变红的实现改法：把 `run()` 里 TLS 步骤 `Ok(conn) =>
-    // {...}` 分支的结果强制改成 `fail(&e)`（不管 `transport.connect`
-    // 是否真的成功）——本地验证过：改完这条测试会在 `match` 的 `other`
-    // 分支上 panic。
-
-    /// 固定的测试专用 EC (P-256) 自签证书 + 私钥，本地用
-    /// `openssl req -x509 -newkey ec ...` 生成一次，CN/SAN 都是
-    /// `localhost`，只用来跑进程内假 Gateway 的 TLS 服务端，不是任何
-    /// 真实环境的凭据，有效期 100 年（避免这条测试因为证书过期而莫名
-    /// 变红）。
-    const TEST_TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
-MIIBODCB36ADAgECAgkAr2yXAE+wDB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJ\n\
-bG9jYWxob3N0MCAXDTI2MDkxNDAzNDE1M1oYDzIxMjYwODIxMDM0MTUzWjAUMRIw\n\
-EAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ50frL\n\
-mLEPSa7z0sqCmmRXJQQxgTfzxlcoJ4CKlST85mlZ9Fl2Un3fPCYFwtRi0eEJ4jAh\n\
-5cf6WHGmEM9gZlsVoxgwFjAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0E\n\
-AwIDSAAwRQIgAQ1gD0AFOxtEdH0SRv1x7wvGDHHzEXsEqehSXayGKjcCIQCXRetW\n\
-I3vKyk+IVraIkoFtpwtyhck6zxYrkM07snH3iw==\n\
------END CERTIFICATE-----\n";
-
-    const TEST_TLS_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqqQ6iAlPo7gj+MbM\n\
-Z5JHB/f/r1o7nt406+2/PKx/N1yhRANCAAQ50frLmLEPSa7z0sqCmmRXJQQxgTfz\n\
-xlcoJ4CKlST85mlZ9Fl2Un3fPCYFwtRi0eEJ4jAh5cf6WHGmEM9gZlsV\n\
------END PRIVATE KEY-----\n";
+    // 换成 `crate::transport::tls::test_support::ed25519_server`（跟
+    // `transport/tls.rs` 单元测试用的是同一个假 TLS 服务端），**一正一反
+    // 成对**验证：指纹对 → 四步全过；指纹错 → 第四步 `Fail` 且
+    // `class == Fatal`，第三步（运维服务器连通）仍然 `Pass`。单独一条
+    // 都抓不住"指纹校验被关掉"这类回归——如果 `wrap_tls` 的校验器被换成
+    // 一个永远接受的实现，"指纹对"那条照样绿。
+    //
+    // 改红：把 `PinnedServer::verify_server_cert`（`transport/tls.rs`）
+    // 里的 `!=` 改成 `==`——下面第一条（指纹对）会红（合法连接反而被
+    // 判定失配），第二条（指纹错）会变绿（错误的指纹反而被接受，
+    // 也就是这条测试想抓的那类回归本身）。
 
     #[tokio::test]
-    async fn gateway_tls_step_passes_when_the_certificate_is_trusted() {
+    async fn all_four_steps_pass_when_the_fingerprint_matches() {
         use crate::platform::{NoProxy, NoProxyAuth};
-        use crate::transport::tls::TlsRoots;
+        use crate::ssh::test_support::{expected_fingerprint, test_host_key};
+        use crate::transport::tls::test_support::{ed25519_server, serve_once};
 
-        // R——依赖审计（Task 12）：`rustls_pemfile` 已被 RUSTSEC-2025-0134
-        // 标记为 unmaintained，改用 `rustls-pki-types` 原生的
-        // `PemObject`，见 `transport/tls.rs` 里 `TlsRoots::with_extra_pem`
-        // 上的同款说明。
-        use rustls_pki_types::pem::PemObject;
-        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-
-        let certs: Vec<_> = CertificateDer::pem_slice_iter(TEST_TLS_CERT_PEM.as_bytes())
-            .collect::<std::result::Result<_, _>>()
-            .expect("测试证书应该能被解析");
-        let key = PrivateKeyDer::from_pem_slice(TEST_TLS_KEY_PEM.as_bytes())
-            .expect("测试私钥应该能被解析");
-        let server_cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .expect("测试证书与私钥应该匹配");
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        struct MinimalServer;
+        impl russh::server::Handler for MinimalServer {
+            type Error = russh::Error;
+        }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let appliance_port = listener.local_addr().unwrap().port();
+        let server_config = Arc::new(russh::server::Config {
+            keys: vec![test_host_key()],
+            ..Default::default()
+        });
         tokio::spawn(async move {
-            if let Ok((sock, _)) = listener.accept().await {
-                // 预检的 TLS 步骤只关心握手成不成功，完成一次握手就够了。
-                let _ = acceptor.accept(sock).await;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let cfg = server_config.clone();
+                tokio::spawn(async move {
+                    let _ = russh::server::run_stream(cfg, stream, MinimalServer).await;
+                });
             }
         });
+        let appliance = HostPort::new("127.0.0.1", appliance_port).unwrap();
 
-        let mut roots = TlsRoots::webpki();
-        roots.with_extra_pem(TEST_TLS_CERT_PEM.as_bytes()).unwrap();
-        let transport = Transport::new(Arc::new(NoProxy), Arc::new(NoProxyAuth), roots);
+        let (cfg, fp) = ed25519_server();
+        let gateway_port = serve_once(cfg).await;
+        let gateway = HostPort::new("127.0.0.1", gateway_port).unwrap();
 
-        let gateway: HostPort = format!("localhost:{port}").parse().unwrap();
+        let transport = Transport::new(Arc::new(NoProxy), Arc::new(NoProxyAuth));
+        let r = run(&transport, &gateway, &fp, &appliance).await;
+        assert!(r.passed(), "{:#?}", r.steps);
+        let hostkey = r
+            .steps
+            .iter()
+            .find(|s| s.name == STEP_APPLIANCE_HOSTKEY)
+            .unwrap();
+        match &hostkey.outcome {
+            StepOutcome::Pass { detail } => assert_eq!(detail, expected_fingerprint().as_str()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_tls_step_fails_as_fatal_when_the_fingerprint_does_not_match_while_reach_still_passes(
+    ) {
+        use crate::platform::{NoProxy, NoProxyAuth};
+        use crate::transport::tls::test_support::{ed25519_server, serve_once};
+
+        let (cfg, _real_fp) = ed25519_server();
+        let port = serve_once(cfg).await;
+        let gateway = HostPort::new("127.0.0.1", port).unwrap();
+        let wrong = ServerFingerprint::of_ed25519_public(&[1u8; 32]);
+
+        let transport = Transport::new(Arc::new(NoProxy), Arc::new(NoProxyAuth));
         // 一体机步骤跟这条测试无关，绑一个立刻释放的端口，保证空置、
-        // 快速失败，不拖慢这条只关心 TLS 步骤的测试。
+        // 快速失败，不拖慢这条只关心运维服务器两步的测试。
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let appliance = HostPort::new("127.0.0.1", dead.local_addr().unwrap().port()).unwrap();
         drop(dead);
 
-        let r = run(&transport, &gateway, &appliance).await;
+        let r = run(&transport, &gateway, &wrong, &appliance).await;
+        let reach = r
+            .steps
+            .iter()
+            .find(|s| s.name == STEP_GATEWAY_REACH)
+            .unwrap();
+        assert!(
+            matches!(reach.outcome, StepOutcome::Pass { .. }),
+            "{:?}",
+            reach.outcome
+        );
         let tls = r.steps.iter().find(|s| s.name == STEP_GATEWAY_TLS).unwrap();
         match &tls.outcome {
-            StepOutcome::Pass { .. } => {}
-            other => panic!("证书受信、握手应该成功，实际却是 {other:?}"),
+            StepOutcome::Fail { class, detail } => {
+                assert_eq!(*class, ErrorClass::Fatal, "{detail}");
+                assert!(detail.contains("指纹"), "{detail}");
+            }
+            other => panic!("指纹不符应该是 Fatal 的 Fail，实际却是 {other:?}"),
         }
     }
 

@@ -315,34 +315,79 @@ mod tests {
         assert_eq!(before, after, "拒绝覆盖必须做到原文件字节不变");
     }
 
-    /// TLS 配置只开 1.3。改红：`with_protocol_versions` 里加上 `TLS12`。
-    #[test]
-    fn tls_config_is_13_only() {
+    /// 一个不带 `supported_versions` 扩展、`legacy_version` 只到 TLS 1.2
+    /// 的手写 ClientHello——RFC 8446 §4.2.1：缺这个扩展时，服务端必须按
+    /// `legacy_version` 判定客户端的最高版本。这一份显式不放这个扩展，
+    /// 模拟一个只会说到 1.2 的老客户端。
+    ///
+    /// R——Task 9 订正：原来这里用 `rustls::ClientConfig::builder_with_
+    /// provider(..).with_protocol_versions(&[&rustls::version::TLS12])`
+    /// 造一个真的 1.2 客户端。rmc-core 的 `Cargo.toml` 在 Task 9 把
+    /// `rustls`/`tokio-rustls` 的 `tls12` feature 整个去掉之后，
+    /// cargo 的 feature 统一：同一个 `Cargo.lock` 解析里，`rustls`
+    /// 这个依赖只有一份编译产物，`workspace` 级命令（`cargo test
+    /// --workspace`、`cargo clippy --workspace --all-targets`）会把
+    /// 所有工作区成员对同一个包声明的 features 取并集——如果这里继续
+    /// 声明要 `tls12`，`rmc-core` 那条"根本编不出 1.2 协商路径"的
+    /// 保证（`transport/tls.rs` 的 `tls12_is_not_compiled_in`）就会在
+    /// `--workspace` 这类命令下失真：它只扫了 `rmc-core/Cargo.toml`
+    /// 的文本，扫不到"`tls12` 因为 gateway 要它而被整个工作区悄悄点亮"
+    /// 这件事。`rustls::version::TLS12`/`ClientConfig::with_protocol_
+    /// versions(&[&TLS12])` 本身就是 `#[cfg(feature = "tls12")]`
+    /// 的符号，rmc-gateway 的 `Cargo.toml` 没单独开这个 feature，
+    /// 这条测试原来能编译，靠的正是 rmc-core 那边"顺手"点亮的 tls12——
+    /// 这是本任务开工前完全没被记录过的一处隐性耦合。改成手写字节：
+    /// 不经过 rustls 的客户端 API，工作区里没有任何人再需要 `tls12`
+    /// 这个 feature，`tls12_is_not_compiled_in` 的保证对整个工作区都
+    /// 成立，不只是对 `rmc-core` 单独编译时成立。
+    fn legacy_hello_without_supported_versions() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version = TLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id 长度 0
+        body.extend_from_slice(&[0x00, 0x02]); // cipher_suites 长度 2
+        body.extend_from_slice(&[0x00, 0x2f]); // TLS_RSA_WITH_AES_128_CBC_SHA
+        body.push(0x01); // compression_methods 长度 1
+        body.push(0x00); // null 压缩
+        body.extend_from_slice(&[0x00, 0x00]); // extensions 长度 0——刻意不放 supported_versions
+
+        let mut handshake = vec![0x01]; // ClientHello
+        let len = body.len() as u32;
+        handshake.extend_from_slice(&len.to_be_bytes()[1..]); // 24 位长度
+        handshake.extend_from_slice(&body);
+
+        let mut record = vec![0x16, 0x03, 0x01]; // Handshake，记录层版本 1.0（兼容写法）
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    /// TLS 配置只开 1.3。改红：`with_protocol_versions` 里加上 `TLS12`
+    /// ——但这一行本身已经编不出来了（`rustls::version::TLS12` 需要
+    /// `tls12` feature，本 crate 与 rmc-core 都没开），得先把 `Cargo.
+    /// toml` 里 `rustls` 的 `features` 加回 `"tls12"` 才谈得上改这一行；
+    /// 真正等价的改红是把 `with_protocol_versions(&[&rustls::version::
+    /// TLS13])` 换成 `rustls::ServerConfig::builder()`（默认支持
+    /// 1.2/1.3 两个版本）——本地验证过：改完这条测试会因为服务端接受了
+    /// 这份只到 1.2 的 ClientHello 而在 `assert!` 上失败。
+    #[tokio::test]
+    async fn tls_config_is_13_only() {
+        use tokio::io::AsyncWriteExt;
+
         let id = Identity::generate();
         let cfg = id.tls_server_config().unwrap();
-        // rustls 的 ServerConfig 没有直接暴露版本列表；用一次握手验：1.2 客户端必须失败。
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-            let client = rustls::ClientConfig::builder_with_provider(provider)
-                .with_protocol_versions(&[&rustls::version::TLS12])
-                .unwrap()
-                .dangerous()
-                .with_custom_certificate_verifier(std::sync::Arc::new(
-                    crate::testing_verifier::AcceptAll,
-                ))
-                .with_no_client_auth();
-            let (c, s) = tokio::io::duplex(64 * 1024);
-            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-            let srv = tokio::spawn(async move { acceptor.accept(s).await.map(|_| ()) });
-            let r = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client))
-                .connect(
-                    rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
-                    c,
-                )
-                .await;
-            assert!(r.is_err(), "只开 1.3 的服务端不该跟 1.2 客户端握成");
-            let _ = srv.await;
-        });
+        let (mut c, s) = tokio::io::duplex(64 * 1024);
+        let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+        let srv = tokio::spawn(async move { acceptor.accept(s).await.map(|_| ()) });
+        c.write_all(&legacy_hello_without_supported_versions())
+            .await
+            .unwrap();
+        drop(c);
+        let r = srv.await.unwrap();
+        assert!(
+            r.is_err(),
+            "只开 1.3 的服务端不该接受一个没有 supported_versions 扩展、\
+             legacy_version 只到 1.2 的 ClientHello"
+        );
     }
 }

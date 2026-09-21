@@ -27,7 +27,6 @@ use rmc_core::code::ServerFingerprint;
 use rmc_core::knownhosts::KnownHosts;
 use rmc_core::platform::{NoProxy, NoProxyAuth};
 use rmc_core::ssh::SshTunnelFactory;
-use rmc_core::transport::tls::TlsRoots;
 use rmc_core::transport::Transport;
 use rmc_core::tunnel::{TunnelMsg, TunnelParams};
 use std::sync::Arc;
@@ -82,22 +81,16 @@ pub fn appliance() -> HostPort {
     "127.0.0.1:2322".parse().unwrap()
 }
 
+/// Task 9 订正：TLS 不再信任任何"根"，核对的是连接码里的指纹——
+/// `TlsRoots`/`with_extra_pem` 那条路已经被整个删掉。这两份 docker 集成
+/// 测试文件（`ssh_tunnel.rs`/`forwarding.rs`）连同 `tests/common/`、
+/// `tests/data/`、`tests/fetch-harness-cert.sh` 按计划要在 Task 10 随
+/// SSH 侧的 host key 校验一起整份删掉重写（那时会换成真实的 harness
+/// 指纹）；这里只做了保持编译通过的最小改动，不改变这几个文件的测试
+/// 语义或删除范围——它们本来就全部标了 `#[ignore]`，本仓没有 CI 会跑
+/// 它们，`params()` 里那个占位指纹因此不会被任何断言用到。
 pub fn factory(known_hosts: KnownHosts) -> SshTunnelFactory {
-    let mut roots = TlsRoots::webpki();
-    roots
-        .with_extra_pem(
-            &std::fs::read(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/data/harness-ca.pem"
-            ))
-            .expect("先运行 tests/fetch-harness-cert.sh"),
-        )
-        .unwrap();
-    let transport = Arc::new(Transport::new(
-        Arc::new(NoProxy),
-        Arc::new(NoProxyAuth),
-        roots,
-    ));
+    let transport = Arc::new(Transport::new(Arc::new(NoProxy), Arc::new(NoProxyAuth)));
     SshTunnelFactory::new(transport, Arc::new(known_hosts))
 }
 

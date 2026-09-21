@@ -835,7 +835,14 @@ fn all_pass() -> rmc_core::preflight::PreflightReport {
     }
 }
 
-/// 一份运维服务器 TLS 卡在审计设备上的预检结果——现场最常见的那一种。
+/// 一份指纹不符（现场最常见的那一种，通常是路径上有 TLS 审计设备）的
+/// 预检结果。
+///
+/// Task 9：TLS 步骤不再校验证书链，核对的是连接码里的指纹——detail 换成
+/// `wrap_tls`/`classify_tls_error` 真的会产出的文案形状
+/// （`Error::TlsPinMismatch` 的 Display），`advice_for` 按这一句里含
+/// 「指纹」分派处置建议，正文仍然会点名审计设备（新文案里的
+/// 「中间人的 TLS 审计设备」一句包含「审计设备」四个字）。
 fn tls_intercepted() -> rmc_core::preflight::PreflightReport {
     use rmc_core::preflight::{PreflightStep, StepOutcome, STEP_GATEWAY_TLS};
     let mut r = all_pass();
@@ -845,7 +852,9 @@ fn tls_intercepted() -> rmc_core::preflight::PreflightReport {
         .unwrap() = PreflightStep {
         name: STEP_GATEWAY_TLS,
         outcome: StepOutcome::Fail {
-            detail: "运维服务器 TLS 证书链无效：UnknownIssuer".into(),
+            detail: "运维服务器的身份与连接码里的指纹不一致：invalid peer certificate: \
+                     application verification failure"
+                .into(),
             class: rmc_core::ErrorClass::Fatal,
         },
     };
@@ -890,14 +899,18 @@ fn the_untouched_diagnostics_page_still_lists_every_step() {
 fn a_failing_preflight_puts_the_reason_and_the_advice_on_screen() {
     let mut model = model_in(State::Failed {
         class: rmc_core::ErrorClass::Fatal,
-        message: "运维服务器 TLS 证书链无效：UnknownIssuer".into(),
+        message: "运维服务器的身份与连接码里的指纹不一致：invalid peer certificate: \
+                  application verification failure"
+            .into(),
     });
     model.preflight = Some(tls_intercepted());
     let mut ui = simulator(diagnostics::view(&model, None, "客户端 0.1.0", false));
 
-    // `Simulator::find(&str)` 是**整段相等**，不是子串包含；失败原因
-    // 是「运维服务器 TLS 证书链无效：UnknownIssuer」一整句，所以这里
-    // 用谓词。第一次写成 `find("UnknownIssuer")` 当场红。
+    // `Simulator::find(&str)` 是**整段相等**，不是子串包含；失败原因是
+    // 「运维服务器的身份与连接码里的指纹不一致：invalid peer
+    // certificate: application verification failure」一整句，所以这里
+    // 用谓词。第一次写成 `find("application verification failure")`
+    // 当场红。
     let contains = |ui: &mut iced_test::Simulator<'_, Message>, want: &str| {
         let want = want.to_string();
         ui.find(move |c: Candidate<'_>| match c {
@@ -906,7 +919,10 @@ fn a_failing_preflight_puts_the_reason_and_the_advice_on_screen() {
         })
         .is_ok()
     };
-    assert!(contains(&mut ui, "UnknownIssuer"), "失败原因没有画出来");
+    assert!(
+        contains(&mut ui, "application verification failure"),
+        "失败原因没有画出来"
+    );
     // 处置建议卡的标题是失败的那一步，正文点名审计设备。
     assert!(
         ui.find(rmc_core::preflight::STEP_GATEWAY_TLS).is_ok(),

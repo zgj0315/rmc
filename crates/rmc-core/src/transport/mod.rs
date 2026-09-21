@@ -4,6 +4,7 @@ pub mod connect;
 pub mod tls;
 
 use crate::addr::HostPort;
+use crate::code::ServerFingerprint;
 use crate::diagnostic::{ConnectOutcome, ProxyObservation};
 use crate::error::{Error, Result};
 use crate::platform::{Conn, ProxyAuthenticator, ProxyResolver};
@@ -29,22 +30,22 @@ enum LastHop {
 pub struct Transport {
     resolver: Arc<dyn ProxyResolver>,
     authenticator: Arc<dyn ProxyAuthenticator>,
-    roots: tls::TlsRoots,
-    /// 最近一次 `connect()` 看见的那一跳，`None` 表示这个进程还没连过。
-    /// 见 [`Transport::last_proxy`]。
+    /// 最近一次 `connect()`/`dial()` 看见的那一跳，`None` 表示这个进程
+    /// 还没连过。见 [`Transport::last_proxy`]。
     last_hop: Mutex<Option<LastHop>>,
 }
 
 impl Transport {
+    /// Task 9：不再收 `TlsRoots`——TLS 侧不再校验一份可复用的信任根，
+    /// 每次 `connect()` 核对的指纹随连接码逐次传入（见 [`Self::connect`]），
+    /// 没有状态可存。
     pub fn new(
         resolver: Arc<dyn ProxyResolver>,
         authenticator: Arc<dyn ProxyAuthenticator>,
-        roots: tls::TlsRoots,
     ) -> Self {
         Self {
             resolver,
             authenticator,
-            roots,
             last_hop: Mutex::new(None),
         }
     }
@@ -112,8 +113,9 @@ impl Transport {
         self.resolver.resolve(gateway).await
     }
 
-    /// 建立到 Gateway 的 TLS 通道。经代理时先 CONNECT，再在其上握手。
-    pub async fn connect(&self, gateway: &HostPort) -> Result<Conn> {
+    /// TCP 拨号，经代理时含 CONNECT，不做 TLS。预检的「运维服务器连通」
+    /// 那一步用它——它只想知道拨得通、CONNECT 过不过，不关心 TLS。
+    pub async fn dial(&self, gateway: &HostPort) -> Result<TcpStream> {
         let hop = self.effective_proxy(gateway).await;
         let dial = hop.clone().unwrap_or_else(|| gateway.clone());
 
@@ -146,7 +148,14 @@ impl Transport {
             });
         }
 
-        let tls = tls::wrap_tls(stream, gateway.host(), &self.roots).await?;
+        Ok(stream)
+    }
+
+    /// 建立到 Gateway 的 TLS 通道：`dial()` 拿到明文字节流之后，核对证书
+    /// 里的公钥是否等于连接码里的 `pin`——见 [`tls::wrap_tls`]。
+    pub async fn connect(&self, gateway: &HostPort, pin: &ServerFingerprint) -> Result<Conn> {
+        let stream = self.dial(gateway).await?;
+        let tls = tls::wrap_tls(stream, gateway, pin).await?;
         Ok(Box::new(tls))
     }
 }
@@ -190,11 +199,7 @@ mod tests {
     }
 
     fn transport(proxy: Option<HostPort>) -> Transport {
-        Transport::new(
-            Arc::new(FixedProxy(proxy)),
-            Arc::new(NoProxyAuth),
-            tls::TlsRoots::webpki(),
-        )
+        Transport::new(Arc::new(FixedProxy(proxy)), Arc::new(NoProxyAuth))
     }
 
     /// 还没连过的时候没有任何记录。
@@ -203,25 +208,25 @@ mod tests {
     /// 返回某个默认值"的实现满足。
     #[test]
     fn a_transport_that_never_connected_has_nothing_to_report() {
-        let t = Transport::new(
-            Arc::new(NoProxy),
-            Arc::new(NoProxyAuth),
-            tls::TlsRoots::webpki(),
-        );
+        let t = Transport::new(Arc::new(NoProxy), Arc::new(NoProxyAuth));
         assert!(t.last_proxy().is_none());
     }
 
     /// 判定直连时记的是 [`ProxyObservation::Direct`]，**不是**一个
     /// 「代理是谁不知道、CONNECT 失败」的四不像。
     ///
-    /// 改红：把 `connect()` 里 `None => LastHop::Direct` 那一支换成
+    /// 用 `dial()` 而不是 `connect()`：这条只关心 `note_hop` 记的是什么，
+    /// 那份记录完全发生在 `dial()` 内部，TLS 那半段（Task 9 拆出去的）
+    /// 跟它无关。
+    ///
+    /// 改红：把 `dial()` 里 `None => LastHop::Direct` 那一支换成
     /// `Via { endpoint: gateway.clone(), connect: Failed }`——这条当场红，
     /// 而界面上会凭空多出一行「系统代理 ops.example.com:443」。
     #[tokio::test]
     async fn a_direct_connection_is_recorded_as_direct() {
         let gateway = closed_port().await;
         let t = transport(None);
-        let _ = t.connect(&gateway).await;
+        let _ = t.dial(&gateway).await;
         assert_eq!(t.last_proxy(), Some(ProxyObservation::Direct));
     }
 
@@ -230,7 +235,7 @@ mod tests {
     async fn a_proxy_that_cannot_even_be_dialled_is_recorded_as_failed() {
         let proxy = closed_port().await;
         let t = transport(Some(proxy.clone()));
-        let _ = t.connect(&"ops.example.com:443".parse().unwrap()).await;
+        let _ = t.dial(&"ops.example.com:443".parse().unwrap()).await;
         assert_eq!(
             t.last_proxy(),
             Some(ProxyObservation::Via {
@@ -248,6 +253,11 @@ mod tests {
     /// `connect()` 返回 `Err`——而诊断页上「代理 CONNECT」那一行必须
     /// 显示「已建立」，因为它确实建立了。把 CONNECT 的失败与 TLS 的
     /// 失败混成一句，现场工程师会去找代理管理员，而问题在证书上。
+    ///
+    /// 用完整的 `connect()`（不是 `dial()`）：这条要的正是"TLS 那半段
+    /// 失败了，但 CONNECT 记录不受影响"这件事本身，指纹随便传一个——
+    /// 假代理接上之后什么都不发，TLS 握手连 ServerHello 都等不到，
+    /// 传哪个指纹都会在同一处失败。
     ///
     /// 改红：把 `note_hop(... Established)` 那一段挪到 `wrap_tls` 之后
     /// （也就是"整条连接成了才算 CONNECT 成了"）——这条当场红。
@@ -268,7 +278,10 @@ mod tests {
         });
 
         let t = transport(Some(proxy.clone()));
-        let err = t.connect(&"ops.example.com:443".parse().unwrap()).await;
+        let pin = ServerFingerprint::of_ed25519_public(&[0u8; 32]);
+        let err = t
+            .connect(&"ops.example.com:443".parse().unwrap(), &pin)
+            .await;
         assert!(err.is_err(), "对面不是 TLS 服务端，这次连接本该失败");
         assert_eq!(
             t.last_proxy(),
@@ -282,7 +295,7 @@ mod tests {
 
     /// 上一次经代理、这一次判定直连时，**旧记录必须被抹掉**。
     ///
-    /// 改红：把 `connect()` 开头那次 `note_hop` 改成只在
+    /// 改红：把 `dial()` 开头那次 `note_hop` 改成只在
     /// `hop.is_some()` 时才记——这条红，而界面会一直画着一台早就不在
     /// 链路上的代理。
     #[tokio::test]
@@ -290,11 +303,11 @@ mod tests {
         let proxy = closed_port().await;
         let gateway = closed_port().await;
         let t = transport(Some(proxy));
-        let _ = t.connect(&gateway).await;
+        let _ = t.dial(&gateway).await;
         assert!(matches!(t.last_proxy(), Some(ProxyObservation::Via { .. })));
 
         let t2 = transport(None);
-        let _ = t2.connect(&gateway).await;
+        let _ = t2.dial(&gateway).await;
         assert_eq!(t2.last_proxy(), Some(ProxyObservation::Direct));
     }
 
@@ -325,12 +338,8 @@ mod tests {
         }
 
         let proxy = closed_port().await;
-        let t = Transport::new(
-            Arc::new(FixedProxy(Some(proxy))),
-            Arc::new(Speaking),
-            tls::TlsRoots::webpki(),
-        );
-        let _ = t.connect(&"ops.example.com:443".parse().unwrap()).await;
+        let t = Transport::new(Arc::new(FixedProxy(Some(proxy))), Arc::new(Speaking));
+        let _ = t.dial(&"ops.example.com:443".parse().unwrap()).await;
         match t.last_proxy() {
             Some(ProxyObservation::Via { auth, .. }) => assert_eq!(
                 auth,

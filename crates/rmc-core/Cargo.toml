@@ -15,9 +15,12 @@ rand.workspace = true
 sha2 = "0.10"
 base64 = "0.22"
 async-trait = "0.1"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "1"
+# Task 9：只开 TLS 1.3——运维服务器没有域名、证书自签，客户端核对的是
+# 连接码里的指纹（证书里 ed25519 公钥的 SHA-256），不是公共 CA 链，1.2
+# 的协商路径没有任何存在的理由，干脆连 feature 都不开：`tls12_is_not_
+# compiled_in`（`transport/tls.rs`）直接扫这两行，钉住谁都别把它加回来。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 # R——依赖审计（Task 12）发现：`rustls-pemfile` 已被 RUSTSEC-2025-0134
 # 标记为 unmaintained（仓库 2025-08 起归档），`cargo deny check
 # advisories` 会因此变红，且公告本身说明"没有安全的升级路径"——它已经
@@ -64,3 +67,10 @@ filetime = "0.2"
 # `cargo deny check` 验证过它与其全部传递依赖都落在现有许可证允许
 # 列表内，不需要改 deny.toml。
 yaml-rust2 = "0.10"
+# Task 9：`tls.rs`/`preflight.rs` 的进程内 TLS 测试服务端要自签证书。
+# rcgen 与它连带的 yasna 已经是 `rmc-gateway` 的生产依赖（`identity.rs`
+# 用同一套手法：ed25519 种子 → 固定 16 字节 PKCS#8 v1 前缀 → 同一份
+# PKCS#8 同时喂 rustls 当私钥），这里只是把它挪一份到 dev-dependencies，
+# `cargo deny check` 不会新增任何包。不开 "zeroize"：测试证书的种子
+# 不是生产密钥，没有清零义务，少一个 feature 少一分要解释的东西。
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }

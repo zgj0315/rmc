@@ -724,8 +724,11 @@ async fn run_connect_sequence(
     if do_preflight {
         let _ = connect_tx.send(ConnectEvent::EnteredPreflight).await;
         // R96：探的就是下面 `factory.establish(params, ..)` 要拨的那
-        // 一对地址——同一个 `params` 的两个字段，不是另一份拷贝。
-        let report = preflight.run(&params.gateway, &params.appliance).await;
+        // 一对地址——同一个 `params` 的两个字段，不是另一份拷贝。Task 9：
+        // 指纹同理，从 `params.fingerprint` 走，不是另一份拷贝。
+        let report = preflight
+            .run(&params.gateway, &params.fingerprint, &params.appliance)
+            .await;
         let passed = report.passed();
         let failure = report.first_failure().cloned();
         let _ = connect_tx.send(ConnectEvent::PreflightReport(report)).await;
@@ -1604,7 +1607,6 @@ mod tests {
     use crate::addr::HostPort;
     use crate::backoff::FixedJitter;
     use crate::platform::{NoProxy, NoProxyAuth, NoSystemEvents, SystemEvent, SystemEvents};
-    use crate::transport::tls::TlsRoots;
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -1714,6 +1716,7 @@ mod tests {
         async fn run(
             &self,
             _gateway: &HostPort,
+            _pin: &crate::code::ServerFingerprint,
             _appliance: &HostPort,
         ) -> preflight::PreflightReport {
             let pass = |name: &'static str| preflight::PreflightStep {
@@ -1726,7 +1729,7 @@ mod tests {
                 steps: vec![
                     pass(preflight::STEP_APPLIANCE_TCP),
                     pass(preflight::STEP_APPLIANCE_HOSTKEY),
-                    pass(preflight::STEP_GATEWAY_DNS),
+                    pass(preflight::STEP_GATEWAY_REACH),
                     pass(preflight::STEP_GATEWAY_TLS),
                 ],
             }
@@ -1743,6 +1746,7 @@ mod tests {
         async fn run(
             &self,
             _gateway: &HostPort,
+            _pin: &crate::code::ServerFingerprint,
             _appliance: &HostPort,
         ) -> preflight::PreflightReport {
             preflight::PreflightReport {
@@ -1800,11 +1804,7 @@ mod tests {
         deps_with_transport(
             factory,
             events,
-            Arc::new(Transport::new(
-                Arc::new(NoProxy),
-                Arc::new(NoProxyAuth),
-                TlsRoots::webpki(),
-            )),
+            Arc::new(Transport::new(Arc::new(NoProxy), Arc::new(NoProxyAuth))),
         )
     }
 
@@ -3484,13 +3484,14 @@ mod tests {
         async fn run(
             &self,
             gateway: &HostPort,
+            pin: &crate::code::ServerFingerprint,
             appliance: &HostPort,
         ) -> preflight::PreflightReport {
             self.0
                 .lock()
                 .unwrap()
                 .push((gateway.clone(), appliance.clone()));
-            AlwaysPassPreflight.run(gateway, appliance).await
+            AlwaysPassPreflight.run(gateway, pin, appliance).await
         }
     }
 
@@ -3858,6 +3859,7 @@ mod tests {
                 async fn run(
                     &self,
                     _gateway: &HostPort,
+                    _pin: &crate::code::ServerFingerprint,
                     _appliance: &HostPort,
                 ) -> preflight::PreflightReport {
                     panic!("PanickingPreflight：模拟 Preflight 实现里的 bug");
@@ -4135,6 +4137,7 @@ mod tests {
                 async fn run(
                     &self,
                     _gateway: &HostPort,
+                    _pin: &crate::code::ServerFingerprint,
                     _appliance: &HostPort,
                 ) -> preflight::PreflightReport {
                     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -4576,13 +4579,15 @@ mod tests {
             let transport = Arc::new(Transport::new(
                 Arc::new(FixedProxy(Some(proxy.clone()))),
                 Arc::new(NoProxyAuth),
-                TlsRoots::webpki(),
             ));
             // 反向自证：还没拨过号时没有任何记录，下面收到的事件不可能
             // 是"恰好有个默认值"。
             assert!(transport.last_proxy().is_none());
+            // 这条只关心 `last_proxy()` 记的是什么，那份记录完全发生在
+            // `dial()` 内部——TLS 那半段（Task 9 拆出去的）跟它无关，
+            // 用 `dial()` 不用 `connect()`。
             let _ = transport
-                .connect(&"ops.example.com:443".parse().unwrap())
+                .dial(&"ops.example.com:443".parse().unwrap())
                 .await;
             assert!(transport.last_proxy().is_some(), "拨号之后该有记录");
 
