@@ -62,7 +62,7 @@ use crate::ssh::{client_config, establish_over};
 use crate::tunnel::{TunnelHandle, TunnelMsg, TunnelParams};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -273,6 +273,12 @@ struct GatewayHandler {
     /// ——`false` 时 `tcpip_forward` 恒返回 `Ok(false)`，客户端会收到
     /// `russh::Error::RequestDenied`，映射成 `Error::ForwardPortBusy`。
     accept_forward: bool,
+    /// R10-3（修复轮 1）：`auth_password` 每被调用一次就
+    /// `fetch_add(1)`——独立于 `Sniff` 的读时间戳之外，直接钉住"口令有
+    /// 没有被发出去"这件事本身，不依赖"没有任何观测手段能看穿协议"这条
+    /// 迂回推理。`spawn_gateway` 把这个计数器原样返出去，调用方能在两个
+    /// 方向上核对：指纹对时确实发生过一次认证尝试，指纹错时一次都没有。
+    auth_attempts: Arc<AtomicUsize>,
 }
 
 impl russh::server::Handler for GatewayHandler {
@@ -283,6 +289,7 @@ impl russh::server::Handler for GatewayHandler {
         user: &str,
         password: &str,
     ) -> Result<russh::server::Auth, Self::Error> {
+        self.auth_attempts.fetch_add(1, Ordering::SeqCst);
         if self.accept_password && user == TEST_USER && password == TEST_PASSWORD {
             Ok(russh::server::Auth::Accept)
         } else {
@@ -453,6 +460,7 @@ pub(crate) fn spawn_freezable_gateway(
         permitted_port: cfg.permitted_port,
         accept_password: cfg.accept_password,
         accept_forward: cfg.accept_forward,
+        auth_attempts: Arc::new(AtomicUsize::new(0)),
     };
 
     let (handle_tx, handle_rx) = oneshot::channel();
@@ -485,7 +493,13 @@ pub(crate) fn spawn_freezable_gateway(
 /// 机会发送任何东西。把 `run_stream(...).await` 丢进独立任务，函数
 /// 立刻带着连接返回，`PendingHandle` 留给调用方在真正驱动过客户端
 /// 之后再兑现。
-pub(crate) fn spawn_gateway(cfg: GatewayConfig) -> (ReadTimestamps, PendingHandle, Box<dyn Io>) {
+/// `Arc<AtomicUsize>` 的最后一个返回值：R10-3（修复轮 1）新增，`auth_
+/// password` 每被调用一次自增一次——独立于 `Sniff` 的读时间戳，直接
+/// 钉住"口令有没有被发出去"，见 `GatewayHandler::auth_attempts` 上的
+/// 说明。绝大多数既有调用点不关心这个值，用 `..` 忽略它即可。
+pub(crate) fn spawn_gateway(
+    cfg: GatewayConfig,
+) -> (ReadTimestamps, PendingHandle, Box<dyn Io>, Arc<AtomicUsize>) {
     let key = test_host_key();
     let server_config = Arc::new(russh::server::Config {
         keys: vec![key],
@@ -494,10 +508,12 @@ pub(crate) fn spawn_gateway(cfg: GatewayConfig) -> (ReadTimestamps, PendingHandl
 
     let (client_side, server_side) = tokio::io::duplex(64 * 1024);
     let (sniffed_server_side, server_reads) = Sniff::new(server_side);
+    let auth_attempts = Arc::new(AtomicUsize::new(0));
     let handler = GatewayHandler {
         permitted_port: cfg.permitted_port,
         accept_password: cfg.accept_password,
         accept_forward: cfg.accept_forward,
+        auth_attempts: auth_attempts.clone(),
     };
 
     let (handle_tx, handle_rx) = oneshot::channel();
@@ -523,6 +539,7 @@ pub(crate) fn spawn_gateway(cfg: GatewayConfig) -> (ReadTimestamps, PendingHandl
         server_reads,
         PendingHandle(handle_rx),
         Box::new(client_side),
+        auth_attempts,
     )
 }
 
@@ -561,7 +578,7 @@ mod tests {
             }
         }
 
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let result = with_timeout(
             "connect_stream（预期因 check_server_key 返回 Ok(false) 而失败）",
             russh::client::connect_stream(client_config(), conn, AlwaysRejectHostKey),
@@ -590,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_password_is_auth_rejected() {
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, _rx) = mpsc::channel(32);
         let err = expect_err(
             with_timeout(
@@ -622,7 +639,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn keepalive_interval_matches_the_configured_ten_seconds() {
-        let (reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
             .await
@@ -682,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn forwarded_channel_open_is_confirmed_when_port_matches() {
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
             .await
@@ -709,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn forwarded_channel_open_is_rejected_when_port_does_not_match() {
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
             .await
@@ -739,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_message_reports_the_expected_fingerprint() {
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
             .await

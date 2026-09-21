@@ -96,9 +96,24 @@ impl russh::client::Handler for ClientHandler {
     ///
     /// Task 10：判断的基准从"构造时写死的 `reverse_port`"换成了
     /// `registered_port`——服务端回填的端口在 `establish_over` 里
-    /// `session.tcpip_forward("", 0)` 拿到结果之后才写进这个原子变量，
-    /// 握手/认证阶段它恒为 0，任何这个阶段送进来的 forwarded-tcpip
-    /// 通道都会被拒绝（`want == 0` 那一支）。
+    /// `session.tcpip_forward("", 0)` 拿到结果之后才写进这个原子变量。
+    ///
+    /// R10-2（修复轮 1，订正）：**这个"恒为 0"的窗口不止覆盖握手/认证
+    /// 阶段**，上一版文案在这里写得像窗口只到认证完成——不对，窗口一直
+    /// 延伸到 `establish_over` 里 `registered_port.store(port, ...)`
+    /// 那一行真正执行完为止：`tcpip_forward("", 0).await` 拿到服务端的
+    /// 应答之后，`u16::try_from` 转换、`port == 0` 校验、`store` 写入这
+    /// 几步都还没做完，`registered_port` 读到的仍然是 0。如果服务端在
+    /// 应答 tcpip-forward 之后、`store` 完成之前的这一小段时间窗口内就
+    /// 主动开出一条 forwarded-tcpip 通道（协议上没有任何东西禁止它这样
+    /// 抢跑），这条通道会被这里的 `want == 0` 分支误判成"未注册"而拒绝
+    /// ——即便它注册的端口完全正确。
+    ///
+    /// 这个误拒不是假设：**裁决明确接受它**（见 R10-2 的裁决，不改成
+    /// `Notify`/`watch` 这类握手结构）——代价是"隧道刚建立、工程师立刻
+    /// 连进反向端口"这个极窄的时间点上，可能多失败一次重试，不是永久性
+    /// 的功能缺陷；引入握手结构去堵这条窗口的复杂度不随时间收益，不值得
+    /// 为了一个几毫秒的窗口引入额外的同步原语。
     async fn server_channel_open_forwarded_tcpip(
         &mut self,
         channel: russh::Channel<russh::client::Msg>,

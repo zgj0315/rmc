@@ -3491,11 +3491,16 @@ mod tests {
     // 会让这条测试变红的实现改法（三处，各自单独试过）：
     //
     // 1. 把 `Credentials::params` 里的
-    //    `gateway: self.addrs.gateway().clone()` 换成别的地址
-    //    （比如 `ctx.cfg.gateway`）——第一条断言红。
-    // 2. 把 `run_connect_sequence` 里的
-    //    `preflight.run(&params.gateway, &params.appliance)` 换成探测
-    //    另一个地址——第二条断言红。
+    //    `gateway: self.addrs.gateway().clone()` 换成别的地址（比如一个
+    //    写死的错误字面量 `"203.0.113.99:443".parse().unwrap()`——R10-6
+    //    订正：原文写的是 `ctx.cfg.gateway`，那是修复轮 1 之前的写法，
+    //    `Ctx` 现在已经没有 `cfg` 字段了，照字面注入连编译都过不去）——
+    //    第一条断言红。
+    // 2. 把 `run_connect_sequence` 里的 `preflight.run(&params.gateway,
+    //    &params.fingerprint, &params.appliance)` 换成探测另一个地址
+    //    （R10-6 订正：原文漏抄了 Task 9 加的 `pin`/`fingerprint` 那个
+    //    参数，三个参数一个都不能少，否则连签名都对不上）——第二条
+    //    断言红。
     // 3. 给 `SshTunnelFactory` 加回构造期固定的 `gateway` 字段、让
     //    `establish()` 拨那一个——这条测试用的是假工厂，抓不到；那一
     //    层现在靠"字段整个不存在"在结构上保证，见 `ssh/mod.rs` 上

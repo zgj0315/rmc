@@ -481,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_close_is_reported_as_a_disconnected_message() {
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
             .await
@@ -504,9 +504,14 @@ mod tests {
     ///
     /// 改红：`establish_over` 里把 `tcpip_forward("", 0)` 的返回值丢掉、
     /// `ForwardRegistered` 填 0——第三格红。
+    ///
+    /// R10-3（修复轮 1）：`auth_attempts == 1` 是这条测试正面的那一半
+    /// ——跟 `a_wrong_fingerprint_is_fatal_before_any_password_is_sent`
+    /// 里的 `== 0` 成对：只断言其中一边，一个恒定返回同一个数的计数器
+    /// 也能让断言过关。
     #[tokio::test]
     async fn pinned_fingerprint_matches_and_the_port_comes_back_from_the_server() {
-        let (_reads, _pending, conn) = spawn_gateway(GatewayConfig {
+        let (_reads, _pending, conn, auth_attempts) = spawn_gateway(GatewayConfig {
             permitted_port: 22007,
             ..Default::default()
         });
@@ -524,6 +529,11 @@ mod tests {
             TunnelMsg::ForwardRegistered { port } => assert_eq!(port, 22007),
             other => panic!("{other:?}"),
         }
+        assert_eq!(
+            auth_attempts.load(Ordering::SeqCst),
+            1,
+            "指纹对的时候应该发生过一次口令认证"
+        );
         handle.shutdown().await;
     }
 
@@ -532,9 +542,17 @@ mod tests {
     ///
     /// 改红：`check_server_key` 里把 `!=` 改成 `==`——第一格红（而且上一
     /// 条也红）。
+    ///
+    /// R10-3（修复轮 1）：原来这里靠 `Sniff` 的读时间戳去侧面论证"服务端
+    /// 没读到过 USERAUTH"，复审指出那条推理证明不了这件事本身（`Sniff`
+    /// 只数字节到达的时间戳，KEX 本身就是多轮读取，没法从"读过字节"反推
+    /// "读到的不是 USERAUTH"）。改成直接的证据：`GatewayHandler::auth_
+    /// password` 每被调用一次自增一次的计数器，跟上一条测试的 `== 1`
+    /// 成对，正反两面都要断言——否则一个恒为 0 的计数器也能让这条单独
+    /// 的断言过关。
     #[tokio::test]
     async fn a_wrong_fingerprint_is_fatal_before_any_password_is_sent() {
-        let (reads, _pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (reads, _pending, conn, auth_attempts) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(32);
         let wrong = ServerFingerprint::of_ed25519_public(&[3u8; 32]);
         let err = expect_err(
@@ -548,13 +566,68 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::Fatal);
         assert!(err.to_string().contains("连接码"), "{err}");
         assert!(rx.try_recv().is_err(), "不该有任何隧道消息");
-        // 服务端没读到过 USERAUTH：`Sniff` 只数"读到过字节的时间戳"，
-        // 不解密协议，没法直接断言"这批字节到底是不是 USERAUTH"——
-        // 实测过：这里只能确认服务端确实读到过字节（KEX 那几拍），不能
-        // 断言"之后再没有任何读取"，因为 KEX 本身就是多轮的。这条
-        // 断言没带载，删掉比留一条测不出名字声称的事的断言更诚实（见
-        // GLOBAL.md 关于「测试通过但没验证名字声称的事」的规矩）。
+        assert_eq!(
+            auth_attempts.load(Ordering::SeqCst),
+            0,
+            "指纹不符时不该发生过任何一次口令认证尝试"
+        );
+        // `Sniff` 的读时间戳证明不了"服务端没读到过 USERAUTH"这件事
+        // 本身（见上面的说明），留着只是记录服务端确实读到过 KEX 那几拍
+        // 的字节，不是这条测试的核心证据。
         let _ = reads;
+    }
+
+    /// R10-1（修复轮 1，must-fix）：服务端把 tcpip-forward 回成"成功但
+    /// 端口是 0"——russh `client/encrypted.rs:938-940` 会把"服务端回
+    /// REQUEST_SUCCESS 但 payload 为空"解成 `Ok(0)`，这是协议上真会
+    /// 出现的形状，不是臆造的边界。`registered_port` 停在 0 的后果是
+    /// `server_channel_open_forwarded_tcpip` 会拒掉**每一条**通道——
+    /// 界面显示"已连接"，实际一个字节都转不了，而且没有任何错误。
+    ///
+    /// 改红：把 `establish_over` 里 `if port == 0 { return Err(...) }`
+    /// 整块删掉——**已实测**：`err` 不再是 `SshTransport`，`establish_
+    /// over` 会返回 `Ok`，`with_timeout(...).await.unwrap()` 那一行由
+    /// panic 变成正常返回，`expect_err` 反而会在 `Ok(_) => panic!(...)`
+    /// 那一支炸掉（"期望建立隧道失败，实际却成功了"）。实测记录见
+    /// task-10-fix-1-report.md。
+    #[tokio::test]
+    async fn a_server_that_fills_back_port_zero_is_a_transport_error() {
+        let (_r, _p, conn, ..) = spawn_gateway(GatewayConfig {
+            permitted_port: 0,
+            ..Default::default()
+        });
+        let (tx, _rx) = mpsc::channel(32);
+        let err = expect_err(
+            with_timeout("establish_over", establish_over(conn, test_params(), tx)).await,
+        );
+        assert!(matches!(err, Error::SshTransport(_)), "{err:?}");
+        assert!(err.to_string().contains("没有回填"), "{err}");
+    }
+
+    /// R10-1（修复轮 1，must-fix）：服务端回填的端口超出 `u16` 范围
+    /// ——SSH 协议里 tcpip-forward 的端口字段是 wire 上的 `uint32`
+    /// （russh 的 `Handle::tcpip_forward` 签名 `port: u32`、返回值也是
+    /// `u32`），`GatewayConfig::permitted_port` 同样是 `u32`，能喂出一个
+    /// 合法编码、但转不进 `u16` 的值，不用凑什么触发不了的场景。
+    ///
+    /// 改红：把 `establish_over` 里 `u16::try_from(port).map_err(...)?`
+    /// 换成 `port as u16`（截断而不是拒绝）——**已实测**：`err` 变量
+    /// 根本走不到 `Err` 分支（70000 截成 u16 是 4464，不是 0，也过不了
+    /// 下面 `if port == 0` 那道守卫），`establish_over` 成功返回，跟上一
+    /// 条测试同样的失败形状（`expect_err` 在 `Ok(_)` 那一支炸掉）。
+    #[tokio::test]
+    async fn a_server_that_fills_back_a_port_above_u16_range_is_a_transport_error() {
+        let (_r, _p, conn, ..) = spawn_gateway(GatewayConfig {
+            permitted_port: 70_000,
+            ..Default::default()
+        });
+        let (tx, _rx) = mpsc::channel(32);
+        let err = expect_err(
+            with_timeout("establish_over", establish_over(conn, test_params(), tx)).await,
+        );
+        assert!(matches!(err, Error::SshTransport(_)), "{err:?}");
+        assert!(err.to_string().contains("70000"), "{err}");
+        assert!(err.to_string().contains("不合法"), "{err}");
     }
 
     /// 服务端拒绝转发（比如同账号已在线）→ PortBusy，不带端口号也说
@@ -567,7 +640,7 @@ mod tests {
     /// （实际输出：`SshTransport("MUTATED")`）。
     #[tokio::test]
     async fn a_denied_forward_is_port_busy_class() {
-        let (_r, _p, conn) = spawn_gateway(GatewayConfig {
+        let (_r, _p, conn, ..) = spawn_gateway(GatewayConfig {
             accept_forward: false,
             ..Default::default()
         });
@@ -597,7 +670,7 @@ mod tests {
     // 其余测试无一变红）。
     #[tokio::test]
     async fn dropping_the_handle_without_shutdown_still_disconnects_the_session() {
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(32);
         let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
             .await

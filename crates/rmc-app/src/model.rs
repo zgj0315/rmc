@@ -918,28 +918,60 @@ mod tests {
         assert!(m.elapsed(start - Duration::from_secs(1)).is_none());
     }
 
+    // R10-7（修复轮 1）：`server_fingerprint` 装的是 `ServerFingerprint`
+    // 的渲染——43 个 base64url 字符，**没有** `SHA256:` 前缀（那是
+    // `knownhosts::Fingerprint` 那一套 OpenSSH 风格指纹的形状，给一体机
+    // 展示用，跟这里核对的是两件不同的事，见 `knownhosts.rs` 模块文档）。
+    // 旧夹具 `"SHA256:aaa"` 混进了错误的那一族，这里换成真的
+    // `ServerFingerprint::of_ed25519_public(&[1u8; 32])`/`&[2u8; 32]`
+    // 的渲染值。
     #[test]
     fn server_verified_is_recorded_for_the_diagnostics_page() {
+        let fp_a = rmc_core::code::ServerFingerprint::of_ed25519_public(&[1u8; 32]).to_string();
+        let fp_b = rmc_core::code::ServerFingerprint::of_ed25519_public(&[2u8; 32]).to_string();
+        assert_ne!(fp_a, fp_b, "夹具没起作用，两个种子撞出了同一个指纹");
+
         let mut m = Model::default();
         assert!(m.server_fingerprint.is_none());
         m.apply(TunnelEvent::ServerVerified {
-            fingerprint: "SHA256:aaa".into(),
+            fingerprint: fp_a.clone(),
         });
-        assert_eq!(m.server_fingerprint, Some("SHA256:aaa".to_string()));
+        assert_eq!(m.server_fingerprint, Some(fp_a));
 
         // 换一个不同的值也得走一遍：只测一次的话，把字段写死成某个固定
         // 值不会红。
         m.apply(TunnelEvent::ServerVerified {
-            fingerprint: "SHA256:bbb".into(),
+            fingerprint: fp_b.clone(),
         });
-        assert_eq!(m.server_fingerprint, Some("SHA256:bbb".to_string()));
+        assert_eq!(m.server_fingerprint, Some(fp_b));
     }
 
     /// Task 10：反向端口来自服务端回填，回到 `Idle`/`Failed` 时必须清掉
     /// ——否则界面会显示一个已经失效的端口号（上一轮成功时留下的）。
     ///
-    /// 改红：把 `apply` 里 `matches!(s, State::Idle | State::Failed { .. })`
-    /// 那个守卫删掉——第二、第三组断言会各自红。
+    /// R10-4（修复轮 1）：Task 10 原稿这里的「改红」预测是假的——「把
+    /// `matches!(...)` 那个守卫删掉，第二、第三组断言会各自红」没有
+    /// 说清楚是哪一种「删掉」，两种读法都实打过，各红在完全不同的地方：
+    /// - 把守卫**连同 `if` 一起删掉**（`self.forward_port = None`
+    ///   变成不带条件、每次 `apply` 都跑一遍）→ 红的是**第四组**
+    ///   （`Backoff` 那一段，`assert_eq!(m.forward_port, Some(22003),
+    ///   "Backoff 不该清掉端口")`）：`Backoff` 事件一来，端口被无条件
+    ///   清空，这条反向自证当场炸掉。
+    /// - 把整个 `if matches!(...) { self.forward_port = None; }` 块
+    ///   **整段删掉**（端口永远不会被清空）→ 红的是**第二组**（回到
+    ///   `Idle` 之后那一句 `assert!(m.forward_port.is_none(), "回到
+    ///   Idle 应该清掉上一轮的端口")`），而且测试在那里就 panic 了，
+    ///   第三组根本跑不到。
+    ///
+    /// 两种读法都已实测确认（见 task-10-fix-1-report.md），下面只留
+    /// 第二种写法作为「改红」——它是唯一一种真的对应"删掉守卫"这句话
+    /// 字面含义的改法（保留 `if`，只是让条件恒为 false 等价于块整段
+    /// 消失）。
+    ///
+    /// 改红：把 `apply` 里那个 `if matches!(s, State::Idle | State::
+    /// Failed { .. }) { self.forward_port = None; }` 整块删掉——第二组
+    /// 断言（"回到 Idle 应该清掉上一轮的端口"）当场红，测试在那里就
+    /// panic，后面的组根本跑不到。
     #[test]
     fn forward_port_is_cleared_when_the_session_really_ends() {
         let mut m = Model::default();

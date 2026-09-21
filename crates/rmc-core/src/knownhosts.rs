@@ -99,6 +99,21 @@ impl std::fmt::Display for Fingerprint {
 /// 删掉的文件损坏检测的事），但 `transport/connect.rs` 里代理响应头的
 /// 长度截断规范仍然引用这条规矩（同一处不受信任原文进错误文案的规矩，
 /// 不必另写一份），留着给它当参照与共用的转义实现。
+///
+/// R10-5（修复轮 1，交代原委）：Task 10 的 brief 明确要求
+/// knownhosts.rs 瘦身之后仍要留着这个函数，但瘦身之后**全仓库没有任何
+/// 生产代码调用它**——本模块自己的测试是唯一的调用方（见下面
+/// `mod tests`）。如果保持它原来那样的私有（`fn`），`cargo clippy -D
+/// warnings` 会报 `dead_code`：一个私有项只在自己的 `#[cfg(test)]`
+/// 测试里被调用，在非 test 构建里就是"从未被使用"。这里改成 `pub`
+/// 不是为了真的对外公开一个 API，是**绕开 `dead_code` 检查的同时不
+/// 删掉这个函数**——`pub` 项默认被当作"库的对外接口，可能被这个 crate
+/// 之外的代码调用"，因此不受 `dead_code` 分析。这是刻意的取舍，不是
+/// 疏漏：本函数**故意不去找一个调用点**（比如硬把 `transport/
+/// connect.rs`、`rmc-win/src/sspi.rs` 改成调它）——那些地方已经各自
+/// 有自己的截断/转义实现，去凑一个调用点是本末倒置，扩大了本次改动的
+/// 范围。留给以后真的需要"不受信任原文进错误文案"这个操作的调用方
+/// 复用。
 pub fn redact_for_error(raw: &str) -> String {
     const MAX_CHARS: usize = 120;
     let mut chars = raw.chars();

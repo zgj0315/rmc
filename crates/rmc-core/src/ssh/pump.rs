@@ -236,7 +236,7 @@ mod tests {
         let appliance_addr = appliance_listener.local_addr().unwrap();
         let appliance = HostPort::new("127.0.0.1", appliance_addr.port()).unwrap();
 
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
@@ -364,7 +364,7 @@ mod tests {
         drop(probe);
         let appliance = HostPort::new("127.0.0.1", dead_addr.port()).unwrap();
 
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
@@ -443,7 +443,7 @@ mod tests {
         let appliance =
             HostPort::new("127.0.0.1", appliance_listener.local_addr().unwrap().port()).unwrap();
 
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
@@ -610,7 +610,7 @@ mod tests {
         let appliance_addr = appliance_listener.local_addr().unwrap();
         let appliance = HostPort::new("127.0.0.1", appliance_addr.port()).unwrap();
 
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",

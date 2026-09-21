@@ -1005,13 +1005,17 @@ fn nothing_the_diagnostics_page_draws_is_banned() {
             "经代理且 CONNECT 建立",
             Some(all_pass()),
             Some(proxy_status(ConnectOutcome::Established)),
-            Some("SHA256:kM9v7bQe".to_string()),
+            // R10-7（修复轮 1）：`server_fingerprint` 是 `ServerFingerprint`
+            // 的渲染（43 个 base64url 字符，没有 `SHA256:` 前缀）——旧夹具
+            // `"SHA256:kM9v7bQe"` 混进了 OpenSSH 风格那一族，见
+            // `knownhosts.rs` 模块文档「两套指纹算法不是一回事」。
+            Some(ServerFingerprint::of_ed25519_public(&[3u8; 32]).to_string()),
         ),
         case(
             "经代理但 CONNECT 没建立",
             Some(tls_intercepted()),
             Some(proxy_status(ConnectOutcome::Failed)),
-            Some("SHA256:kM9v7bQe".to_string()),
+            Some(ServerFingerprint::of_ed25519_public(&[3u8; 32]).to_string()),
         ),
     ];
 

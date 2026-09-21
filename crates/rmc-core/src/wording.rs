@@ -194,10 +194,13 @@ pub fn strip_placeholders(lit: &str) -> String {
 ///
 /// 的第一行那个 `"` 永远等不到闭合，**整条字面量被丢掉、一声不响**。
 /// 这不是假想：rmc-core 的生产代码已经在用这种写法写用户可见文案
-/// （`knownhosts.rs` 的 `corrupt(format!(..))` 经 `Error` 进
-/// `State::Failed{message}` 上屏，`supervisor.rs` 的审计行经 Task 11
-/// 的日志页上屏）。评审实测：把禁用词埋进那样一条续行里，**八条防线
-/// 一条都没响**。
+/// （R10-6，修复轮 1 订正：原文举的例子是 `knownhosts.rs` 的
+/// `corrupt(format!(..))`，那个函数随 Task 10 的瘦身一起删掉了，指向
+/// 已删代码；换成仍然存在的例子——`error.rs` 里 `Error::
+/// HostKeyMismatch` 的 `#[error("...")]` 文案就是一条续行字面量，经
+/// `Error::to_string()` 进 `State::Failed{message}` 上屏；
+/// `supervisor.rs` 的审计行经 Task 11 的日志页上屏）。评审实测：把
+/// 禁用词埋进那样一条续行里，**八条防线一条都没响**。
 ///
 /// 接法跟 Rust 自己一致：吃掉换行与下一行的前导空白。
 fn join_continuations(text: &str) -> Vec<(usize, String)> {

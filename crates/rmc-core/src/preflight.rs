@@ -540,7 +540,7 @@ mod tests {
             expected_openssh_fingerprint, spawn_gateway, with_timeout, GatewayConfig,
         };
 
-        let (_reads, _pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (_reads, _pending, conn, ..) = spawn_gateway(GatewayConfig::default());
         let fp = with_timeout("probe_host_key_over", probe_host_key_over(conn))
             .await
             .expect("对着假 Gateway 探测 host key 不应该失败");
