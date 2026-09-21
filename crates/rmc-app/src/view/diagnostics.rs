@@ -123,11 +123,14 @@ pub fn view<'a>(
     environment: &'a str,
     form_ready: bool,
 ) -> Element<'a, Message> {
-    let host_key = model
-        .host_key
-        .as_ref()
-        .map(crate::diag::HostKeyRecord::from_model);
-    let lines = rows(model.preflight.as_ref(), proxy, host_key.as_ref());
+    let server_verified =
+        model
+            .server_fingerprint
+            .as_ref()
+            .map(|fingerprint| crate::diag::ServerVerified {
+                fingerprint: fingerprint.clone(),
+            });
+    let lines = rows(model.preflight.as_ref(), proxy, server_verified.as_ref());
 
     let mut list = column![];
     for r in &lines {

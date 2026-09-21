@@ -47,7 +47,6 @@ use crate::logs;
 use rmc_core::audit;
 use rmc_core::backoff::RandJitter;
 use rmc_core::config::Config;
-use rmc_core::knownhosts::KnownHosts;
 use rmc_core::platform::{NoProxyAuth, ProxyAuthenticator, ProxyResolver, SystemEvents};
 use rmc_core::preflight::TransportPreflight;
 use rmc_core::ssh::SshTunnelFactory;
@@ -68,10 +67,15 @@ use tokio::sync::{broadcast, mpsc};
 
 /// 应用目录。方案 §3.8：`%LOCALAPPDATA%\rmc\`。
 ///
-/// **三处落点一次接完**（W28）：审计日志、`known_hosts`、记住的密码。
-/// 在这一轮之前它们各自等着一个落点——`Config::default()` 给的是相对
-/// 路径（`logs`、`known_hosts`，跟着进程的当前目录跑），`FileSecretStore`
-/// 的构造函数上明写着「`dir` 从哪来由接线的那一层决定」。就是这一层。
+/// **落点一次接完**（W28）：审计日志、记住的密码、上一次记住密码的
+/// 连接码（W200）。在这一轮之前它们各自等着一个落点——`Config::
+/// default()` 给的是相对路径（`logs`，跟着进程的当前目录跑），
+/// `FileSecretStore` 的构造函数上明写着「`dir` 从哪来由接线的那一层
+/// 决定」。就是这一层。
+///
+/// Task 10：`known_hosts()` 删掉了——SSH host key 校验换成核对连接码
+/// 里的指纹，没有本地文件需要落点，`Config` 也不再有 `known_hosts_path`
+/// 字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
     root: PathBuf,
@@ -128,16 +132,9 @@ impl AppPaths {
     /// 审计日志目录（也是日志页读的地方、诊断包收的地方）。
     ///
     /// 单独一个子目录，不直接用根目录：`diag::bundle` 会把 `log_dir` 下
-    /// 所有 `rmc-*.log` 收进包里，根目录下还躺着 `known_hosts` 与密文，
-    /// 混在一起早晚出事。
+    /// 所有 `rmc-*.log` 收进包里，根目录下还躺着密文，混在一起早晚出事。
     pub fn log_dir(&self) -> PathBuf {
         self.root.join("logs")
-    }
-
-    /// 运维服务器 host key 的记录。方案 §3.8：「应用目录下的
-    /// known_hosts」。
-    pub fn known_hosts(&self) -> PathBuf {
-        self.root.join("known_hosts")
     }
 
     /// 记住的密码（DPAPI 密文）落在哪儿。
@@ -182,7 +179,6 @@ impl AppPaths {
     /// 说明），Supervisor 不看 `Config` 里的那两个。
     pub fn config(&self) -> Config {
         Config {
-            known_hosts_path: self.known_hosts(),
             log_dir: self.log_dir(),
             ..Config::default()
         }
@@ -402,11 +398,7 @@ pub fn spawn_core(paths: AppPaths, platform: Platform) -> Core {
     let egress = wire_egress(proxy, sspi);
     let config = paths.config();
 
-    let known_hosts = Arc::new(KnownHosts::open(config.known_hosts_path.clone()));
-    let factory = Arc::new(SshTunnelFactory::new(
-        Arc::clone(&egress.transport),
-        known_hosts,
-    ));
+    let factory = Arc::new(SshTunnelFactory::new(Arc::clone(&egress.transport)));
     let preflight = Arc::new(TransportPreflight::new(Arc::clone(&egress.transport)));
 
     let (commands, events_rx) = Supervisor::spawn(
@@ -640,34 +632,30 @@ mod tests {
 
     // ================= W28：落点 =================
 
-    /// `%LOCALAPPDATA%\rmc\` 这个落点，三处一次接完。
+    /// `%LOCALAPPDATA%\rmc\` 这个落点，一次接完。
     ///
-    /// 改红：把 `known_hosts()` 改回 `PathBuf::from("known_hosts")`
-    /// （也就是 `Config::default()` 里那个跟着进程工作目录跑的相对
-    /// 路径）——第二组断言当场红。
+    /// 改红：把 `log_dir()` 改回 `PathBuf::from("logs")`（也就是
+    /// `Config::default()` 里那个跟着进程工作目录跑的相对路径）——
+    /// 第二组断言当场红。
     #[test]
-    fn all_three_landing_spots_live_under_the_app_directory() {
+    fn all_landing_spots_live_under_the_app_directory() {
         let p = AppPaths::from_env(Some("C:\\Users\\zhang\\AppData\\Local"), None);
         assert_eq!(
             p.root(),
             Path::new("C:\\Users\\zhang\\AppData\\Local").join("rmc")
         );
 
-        // 三处（W28）：审计日志、known_hosts、记住的密码；W200 又加了
-        // 第四处：上一次记住密码的那个账号。
-        let spots = [
-            p.log_dir(),
-            p.known_hosts(),
-            p.secrets_dir(),
-            p.connection_code(),
-        ];
+        // Task 10：known_hosts 那一处随 SSH host key 校验一起删掉了
+        // （见 `AppPaths` 上的说明）。剩下的三处：审计日志、记住的密码、
+        // W200 那条上一次记住密码的连接码。
+        let spots = [p.log_dir(), p.secrets_dir(), p.connection_code()];
         for spot in &spots {
             assert!(
                 spot.starts_with(p.root()),
                 "{spot:?} 没落在应用目录里，它会跟着进程的工作目录跑"
             );
         }
-        // 四处互不重叠——诊断包会把 log_dir 下的东西整个收走。
+        // 三处互不重叠——诊断包会把 log_dir 下的东西整个收走。
         let mut distinct = std::collections::BTreeSet::new();
         for spot in &spots {
             assert!(distinct.insert(spot.clone()), "两处落点撞在一起：{spot:?}");
@@ -676,10 +664,9 @@ mod tests {
         // （那里只该有密文）。
         assert!(!p.connection_code().starts_with(p.log_dir()));
         assert!(!p.connection_code().starts_with(p.secrets_dir()));
-        // 配置真的用上了这两处，不是算出来放着不用。
+        // 配置真的用上了这一处，不是算出来放着不用。
         let cfg = p.config();
         assert_eq!(cfg.log_dir, p.log_dir());
-        assert_eq!(cfg.known_hosts_path, p.known_hosts());
         assert!(cfg.validate().is_ok(), "接出来的配置本身不合法");
     }
 
@@ -1194,8 +1181,8 @@ mod tests {
     /// **整套装配真的能跑起来，而且命令真的到得了内核。**
     ///
     /// 这条是这个模块的"接线通了"总闸：`spawn_core` 里任何一处
-    /// （`Deps` 的五个字段、`KnownHosts` 的路径、`TransportPreflight`）
-    /// 拼错都编译不过，而"拼对了但内核根本没起来"只有这条看得见。
+    /// （`Deps` 的五个字段、`TransportPreflight`）拼错都编译不过，而
+    /// "拼对了但内核根本没起来"只有这条看得见。
     #[tokio::test]
     async fn the_assembled_core_starts_and_accepts_commands() {
         let dir = tempfile::tempdir().expect("建临时目录");

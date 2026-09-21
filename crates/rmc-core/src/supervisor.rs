@@ -384,14 +384,14 @@ impl Credentials {
     /// 会让 `start_passes_the_commanded_gateway_all_the_way_to_the_
     /// factory` 变红的实现改法：把下面这一行换成任何别的地址。
     ///
-    /// Task 8：`fingerprint` 是新加的一段——连接码里的指纹现在跟着
-    /// 传到这里，但还没有任何人核对它（见 `tunnel::TunnelParams` 上
-    /// 关于这个字段的说明），这是刻意的中间态。
-    fn params(&self, reverse_port: u16) -> TunnelParams {
+    /// `fingerprint`（连接码里带出来的指纹）由 Task 9（TLS）与本任务
+    /// （SSH）两层核对，读的是同一个 `self.code.fingerprint()`。
+    /// Task 10：`reverse_port` 不再是这个函数的入参——反向端口改成
+    /// 申请 0 由运维服务器回填，`ctx.cfg` 也不再有这个字段。
+    fn params(&self) -> TunnelParams {
         TunnelParams {
             username: self.code.account().to_string(),
             password: self.password.clone(),
-            reverse_port,
             gateway: self.addrs.gateway().clone(),
             appliance: self.addrs.appliance().clone(),
             fingerprint: *self.code.fingerprint(),
@@ -476,7 +476,6 @@ enum ConnectEvent {
 type PendingHandle = Arc<std::sync::Mutex<Option<Box<dyn TunnelHandle>>>>;
 
 struct Ctx {
-    cfg: Config,
     deps: Deps,
     ev: broadcast::Sender<TunnelEvent>,
     state: State,
@@ -786,7 +785,7 @@ fn spawn_connect(
     // R96：地址不再单独拷一份出来——`params` 自己带着 gateway 与
     // appliance，预检与拨号读的是同一对值，见 `ConnectRequest` 上的
     // 说明。
-    let params = creds.params(ctx.cfg.reverse_port);
+    let params = creds.params();
     let preflight = ctx.deps.preflight.clone();
     let factory = ctx.deps.factory.clone();
 
@@ -929,7 +928,6 @@ async fn run(
         tracing::warn!(error = %e, "审计日志清理失败，忽略");
     }
     let mut ctx = Ctx {
-        cfg,
         deps,
         ev,
         state: State::Idle,
@@ -1494,25 +1492,19 @@ async fn handle_msg(
     pending_handle: &PendingHandle,
 ) {
     match msg {
-        TunnelMsg::Authenticated {
-            host_key_fp,
-            first_seen,
-        } => {
+        TunnelMsg::Authenticated { fingerprint } => {
             ctx.audit.record(
                 Level::Info,
-                &format!(
-                    "运维服务器认证通过，host key {host_key_fp}{}",
-                    if first_seen { "（首次记录）" } else { "" }
-                ),
+                &format!("运维服务器身份已核对，指纹 {fingerprint}"),
             );
-            let _ = ctx.ev.send(TunnelEvent::HostKey {
-                fingerprint: host_key_fp,
-                first_seen,
+            let _ = ctx.ev.send(TunnelEvent::ServerVerified {
+                fingerprint: fingerprint.to_string(),
             });
         }
         TunnelMsg::ForwardRegistered { port } => {
             ctx.audit
-                .record(Level::Info, &format!("反向端口 {port} 已注册"));
+                .record(Level::Info, &format!("反向端口 {port} 已由运维服务器分配"));
+            let _ = ctx.ev.send(TunnelEvent::ForwardPort(port));
         }
         TunnelMsg::RemoteSessionOpened { id } => {
             ctx.audit
@@ -1606,10 +1598,18 @@ mod tests {
     // `Preflight` 签名和地址字面量还要用它，所以导入收进测试模块。
     use crate::addr::HostPort;
     use crate::backoff::FixedJitter;
+    use crate::code::ServerFingerprint;
     use crate::platform::{NoProxy, NoProxyAuth, NoSystemEvents, SystemEvent, SystemEvents};
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    /// 测试夹具用的固定指纹——这些测试脚本化假隧道发出的
+    /// `TunnelMsg::Authenticated`，不经过真实的 `check_server_key`，
+    /// 具体数值只要够构造出一个 `ServerFingerprint` 就行。
+    fn test_fp() -> ServerFingerprint {
+        ServerFingerprint::of_ed25519_public(&[9u8; 32])
+    }
 
     /// 给整条测试套一层超时：真正卡死时给出"判定为死锁"的清晰失败，而
     /// 不是让 `cargo test` 无限期挂起。即使在 `#[tokio::test(start_paused
@@ -1765,8 +1765,6 @@ mod tests {
         Config {
             gateway: "gateway.company.com:443".parse().unwrap(),
             appliance: "192.168.100.10:22".parse().unwrap(),
-            reverse_port: 22001,
-            known_hosts_path: PathBuf::from("/tmp/rmc-test/known_hosts"),
             log_dir: test_log_dir(),
         }
     }
@@ -1875,8 +1873,7 @@ mod tests {
         guard(async {
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: true,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
             ])]);
@@ -1957,7 +1954,7 @@ mod tests {
             match seen.last().unwrap() {
                 State::Failed { class, message } => {
                     assert_eq!(*class, ErrorClass::Fatal);
-                    assert!(message.contains("host key"), "{message}");
+                    assert!(message.contains("指纹"), "{message}");
                 }
                 other => panic!("{other:?}"),
             }
@@ -1982,8 +1979,7 @@ mod tests {
                 .map(|_| Outcome::Err(Error::Tcp("refused".into())))
                 .chain(std::iter::once(Outcome::Ok(vec![
                     TunnelMsg::Authenticated {
-                        host_key_fp: "SHA256:aaa".into(),
-                        first_seen: false,
+                        fingerprint: test_fp(),
                     },
                     TunnelMsg::ForwardRegistered { port: 22001 },
                 ])))
@@ -2028,7 +2024,7 @@ mod tests {
     async fn port_busy_retries_every_five_seconds_then_fails_after_budget() {
         guard(async {
             let outcomes = (0..40)
-                .map(|_| Outcome::Err(Error::ForwardPortBusy(22001)))
+                .map(|_| Outcome::Err(Error::ForwardPortBusy))
                 .collect();
             let (factory, calls) = Scripted::new(outcomes);
             let (tx, mut rx) =
@@ -2075,8 +2071,7 @@ mod tests {
         guard(async {
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
                 TunnelMsg::ApplianceDialFailed {
@@ -2121,8 +2116,7 @@ mod tests {
         for _ in 0..300 {
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
                 TunnelMsg::ApplianceDialFailed {
@@ -2185,8 +2179,7 @@ mod tests {
         for i in 0..200 {
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
             ])]);
@@ -2247,8 +2240,7 @@ mod tests {
                 tokio::spawn(async move {
                     let _ = tx
                         .send(TunnelMsg::Authenticated {
-                            host_key_fp: "SHA256:aaa".into(),
-                            first_seen: false,
+                            fingerprint: test_fp(),
                         })
                         .await;
                     let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
@@ -2373,8 +2365,7 @@ mod tests {
                 tokio::spawn(async move {
                     let _ = tx
                         .send(TunnelMsg::Authenticated {
-                            host_key_fp: "SHA256:aaa".into(),
-                            first_seen: false,
+                            fingerprint: test_fp(),
                         })
                         .await;
                     let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
@@ -2444,8 +2435,7 @@ mod tests {
 
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
                 TunnelMsg::ApplianceDialFailed {
@@ -2503,8 +2493,7 @@ mod tests {
         guard(async {
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
                 TunnelMsg::ApplianceDialFailed {
@@ -2606,8 +2595,7 @@ mod tests {
             let (factory, calls) = Scripted::new(vec![
                 Outcome::Ok(vec![
                     TunnelMsg::Authenticated {
-                        host_key_fp: "SHA256:aaa".into(),
-                        first_seen: false,
+                        fingerprint: test_fp(),
                     },
                     TunnelMsg::ForwardRegistered { port: 22001 },
                     TunnelMsg::Disconnected {
@@ -2616,8 +2604,7 @@ mod tests {
                 ]),
                 Outcome::Ok(vec![
                     TunnelMsg::Authenticated {
-                        host_key_fp: "SHA256:aaa".into(),
-                        first_seen: false,
+                        fingerprint: test_fp(),
                     },
                     TunnelMsg::ForwardRegistered { port: 22001 },
                 ]),
@@ -2645,8 +2632,7 @@ mod tests {
                 Outcome::Err(Error::Tcp("refused".into())),
                 Outcome::Ok(vec![
                     TunnelMsg::Authenticated {
-                        host_key_fp: "SHA256:aaa".into(),
-                        first_seen: false,
+                        fingerprint: test_fp(),
                     },
                     TunnelMsg::ForwardRegistered { port: 22001 },
                 ]),
@@ -2744,8 +2730,7 @@ mod tests {
                     tokio::spawn(async move {
                         let _ = tx
                             .send(TunnelMsg::Authenticated {
-                                host_key_fp: "SHA256:aaa".into(),
-                                first_seen: false,
+                                fingerprint: test_fp(),
                             })
                             .await;
                         let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
@@ -2795,8 +2780,7 @@ mod tests {
         guard(async {
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
             ])]);
@@ -2932,8 +2916,7 @@ mod tests {
 
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: true,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
             ])]);
@@ -2997,8 +2980,7 @@ mod tests {
 
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: true,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
             ])]);
@@ -3044,8 +3026,7 @@ mod tests {
 
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: true,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
             ])]);
@@ -3148,8 +3129,7 @@ mod tests {
 
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
                 TunnelMsg::RemoteSessionOpened { id: 7 },
@@ -3186,7 +3166,7 @@ mod tests {
                 text.contains("192.168.100.10:22"),
                 "「连到了哪台一体机」这条账目丢了：{text}"
             );
-            assert!(text.contains("22001 已注册"), "{text}");
+            assert!(text.contains("22001 已由运维服务器分配"), "{text}");
             assert!(text.contains("远程会话 7 已开启"), "{text}");
             assert!(text.contains("远程会话 7 已关闭"), "{text}");
             assert!(
@@ -3198,9 +3178,13 @@ mod tests {
             // 全绿——补上。会让这条断言变红的实现改法：把 `handle_msg`
             // 里 `TunnelMsg::Authenticated` 分支对应的
             // `ctx.audit.record(...)` 那一行删掉。
+            //
+            // Task 10：文案从「host key {fp}」换成「身份已核对，指纹
+            // {fp}」，指纹本身也从 OpenSSH 风格换成了 `ServerFingerprint`
+            // 的 base64url 渲染——断言跟着这两处变化一起改。
             assert!(
-                text.contains("host key SHA256:aaa"),
-                "「host key 指纹」这条账目丢了：{text}"
+                text.contains(&format!("指纹 {}", test_fp())),
+                "「指纹」这条账目丢了：{text}"
             );
         })
         .await;
@@ -3273,8 +3257,7 @@ mod tests {
 
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
                 TunnelMsg::ApplianceDialFailed {
@@ -3335,8 +3318,7 @@ mod tests {
 
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: true,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
                 TunnelMsg::RemoteSessionOpened { id: 7 },
@@ -3537,8 +3519,7 @@ mod tests {
 
             let (factory, calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: false,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
             ])]);
@@ -3651,7 +3632,6 @@ mod tests {
         let cfg = config();
         let audit = Audit::open(cfg.log_dir.clone()).unwrap();
         Ctx {
-            cfg,
             deps: deps(
                 Arc::new(PanicsIfEstablishIsCalled),
                 Arc::new(NoSystemEvents::default()),
@@ -3689,7 +3669,7 @@ mod tests {
             let mut ctx = test_ctx();
 
             // 第一次端口占用：记下 since，重试计数从 1 开始。
-            schedule_retry(&mut ctx, Error::ForwardPortBusy(22001));
+            schedule_retry(&mut ctx, Error::ForwardPortBusy);
             assert!(ctx.port_busy_since.is_some());
             assert_eq!(ctx.port_busy_attempt, 1);
 
@@ -3706,7 +3686,7 @@ mod tests {
             tokio::time::advance(Duration::from_secs(300)).await;
 
             // 全新的端口占用：预算应该从 0 重新计时，不应立刻 Failed。
-            schedule_retry(&mut ctx, Error::ForwardPortBusy(22001));
+            schedule_retry(&mut ctx, Error::ForwardPortBusy);
             assert!(
                 matches!(ctx.state, State::Backoff { .. }),
                 "{:?}",
@@ -3758,7 +3738,7 @@ mod tests {
         guard(async {
             let mut ctx = test_ctx();
             for expected in 1..=3u32 {
-                schedule_retry(&mut ctx, Error::ForwardPortBusy(22001));
+                schedule_retry(&mut ctx, Error::ForwardPortBusy);
                 match &ctx.state {
                     State::Backoff { attempt, delay } => {
                         assert_eq!(
@@ -3896,24 +3876,23 @@ mod tests {
         .await;
     }
 
-    // --- R67：ConnectedSince / HostKey 事件确实会被广播 ---
+    // --- R67：ConnectedSince / ServerVerified 事件确实会被广播 ---
     //
     // 生产代码里这两处 `ctx.ev.send(...)` 调用此前没有任何测试直接
-    // 断言过——之前的测试都只订阅 `TunnelEvent::State`，`HostKey`/
+    // 断言过——之前的测试都只订阅 `TunnelEvent::State`，`ServerVerified`/
     // `ConnectedSince` 两种事件即使被送出，也从来没人检查过内容或者
     // "有没有被送出"这件事本身。
     //
     // 会让这条测试变红的实现改法：删掉 `handle_connect_event` 里
     // `Established` 分支的 `ctx.ev.send(TunnelEvent::ConnectedSince(...))`
     // 那一行，或者删掉 `handle_msg` 里 `Authenticated` 分支的
-    // `ctx.ev.send(TunnelEvent::HostKey { .. })` 那一行。
+    // `ctx.ev.send(TunnelEvent::ServerVerified { .. })` 那一行。
     #[tokio::test(start_paused = true)]
-    async fn established_session_reports_connected_since_and_host_key_events() {
+    async fn established_session_reports_connected_since_and_server_verified_events() {
         guard(async {
             let (factory, _calls) = Scripted::new(vec![Outcome::Ok(vec![
                 TunnelMsg::Authenticated {
-                    host_key_fp: "SHA256:aaa".into(),
-                    first_seen: true,
+                    fingerprint: test_fp(),
                 },
                 TunnelMsg::ForwardRegistered { port: 22001 },
             ])]);
@@ -3921,18 +3900,14 @@ mod tests {
                 Supervisor::spawn(config(), deps(factory, Arc::new(NoSystemEvents::default())));
             tx.send(start()).await.unwrap();
 
-            let mut saw_host_key = false;
+            let mut saw_server_verified = false;
             let mut saw_connected_since = false;
             let deadline = Instant::now() + Duration::from_secs(60);
-            while Instant::now() < deadline && !(saw_host_key && saw_connected_since) {
+            while Instant::now() < deadline && !(saw_server_verified && saw_connected_since) {
                 match rx.recv().await {
-                    Ok(TunnelEvent::HostKey {
-                        fingerprint,
-                        first_seen,
-                    }) => {
-                        assert_eq!(fingerprint, "SHA256:aaa");
-                        assert!(first_seen);
-                        saw_host_key = true;
+                    Ok(TunnelEvent::ServerVerified { fingerprint }) => {
+                        assert_eq!(fingerprint, test_fp().to_string());
+                        saw_server_verified = true;
                     }
                     Ok(TunnelEvent::ConnectedSince(_)) => saw_connected_since = true,
                     Ok(_) => {}
@@ -3940,8 +3915,8 @@ mod tests {
                 }
             }
             assert!(
-                saw_host_key,
-                "Authenticated 消息应该转成 HostKey 事件广播出去"
+                saw_server_verified,
+                "Authenticated 消息应该转成 ServerVerified 事件广播出去"
             );
             assert!(saw_connected_since, "连接成功应该广播 ConnectedSince");
         })
@@ -3986,8 +3961,7 @@ mod tests {
                     tokio::spawn(async move {
                         let _ = tx
                             .send(TunnelMsg::Authenticated {
-                                host_key_fp: "SHA256:aaa".into(),
-                                first_seen: false,
+                                fingerprint: test_fp(),
                             })
                             .await;
                         let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
@@ -4056,8 +4030,7 @@ mod tests {
                     tokio::spawn(async move {
                         let _ = tx
                             .send(TunnelMsg::Authenticated {
-                                host_key_fp: "SHA256:aaa".into(),
-                                first_seen: false,
+                                fingerprint: test_fp(),
                             })
                             .await;
                         let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
@@ -4193,8 +4166,7 @@ mod tests {
                 Outcome::Err(Error::Tcp("refused".into())),
                 Outcome::Ok(vec![
                     TunnelMsg::Authenticated {
-                        host_key_fp: "SHA256:aaa".into(),
-                        first_seen: false,
+                        fingerprint: test_fp(),
                     },
                     TunnelMsg::ForwardRegistered { port: 22001 },
                 ]),
@@ -4248,8 +4220,7 @@ mod tests {
                     tokio::spawn(async move {
                         let _ = tx
                             .send(TunnelMsg::Authenticated {
-                                host_key_fp: "SHA256:aaa".into(),
-                                first_seen: false,
+                                fingerprint: test_fp(),
                             })
                             .await;
                         let _ = tx.send(TunnelMsg::ForwardRegistered { port: 22001 }).await;
@@ -4305,15 +4276,16 @@ mod tests {
             params: TunnelParams,
             tx: mpsc::Sender<TunnelMsg>,
         ) -> crate::error::Result<Box<dyn TunnelHandle>> {
-            use crate::ssh::test_support::{
-                spawn_freezable_gateway, tmp_known_hosts, GatewayConfig,
-            };
+            use crate::ssh::test_support::{spawn_freezable_gateway, GatewayConfig};
+            // Task 10：客户端永远申请端口 0，`permitted_port` 只是这个
+            // 假 Gateway 回填的值——具体数字跟这条测试的断言（耗时）
+            // 无关，随便挑一个合法端口。
             let (reads, switch, pending, conn) = spawn_freezable_gateway(GatewayConfig {
-                permitted_port: params.reverse_port as u32,
+                permitted_port: 22001,
                 accept_password: true,
+                accept_forward: true,
             });
-            let known_hosts = Arc::new(tmp_known_hosts());
-            let handle = crate::ssh::establish_over(conn, &known_hosts, params, tx).await?;
+            let handle = crate::ssh::establish_over(conn, params, tx).await?;
             *self.state.lock().unwrap() = Some((switch, reads));
             // 不需要驱动服务端 handle 做任何事，这条测试只关心客户端一侧
             // 的行为；丢弃它不影响后台的 `run_stream` 任务继续运行。
@@ -4332,7 +4304,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn keepalive_disconnect_is_measured_end_to_end_from_a_real_ssh_session() {
         guard(async {
-            use crate::ssh::test_support::{TEST_PASSWORD, TEST_USER};
+            use crate::ssh::test_support::{expected_fingerprint, TEST_PASSWORD, TEST_USER};
 
             let factory = Arc::new(FreezeAfterEstablish {
                 state: Mutex::new(None),
@@ -4341,10 +4313,26 @@ mod tests {
                 config(),
                 deps(factory.clone(), Arc::new(NoSystemEvents::default())),
             );
+            // 不能用 `crate::state::test_code()`：那份夹具的指纹是
+            // `[9u8; 32]` 派生的占位值，跟这里真正握手的假 Gateway
+            // （`ssh::test_support::test_host_key()`）算出来的指纹不是
+            // 一回事——Task 10 起 `check_server_key` 真的会比对这两个
+            // 值，指纹不符会在握手阶段就以 `Error::HostKeyMismatch`
+            // 失败，状态机永远进不了 `Connected`，下面 `states_until`
+            // 会一直等到 300 秒的 `guard` 超时（这正是本任务开工时
+            // 第一次跑这条测试踩到的死锁，不是预先设计好的坑）。这里
+            // 手造一份账号相同、指纹是真值的连接码。
+            //
             // `test_code()` 的账号必须跟假 SSH 服务端接受的账号
             // (`TEST_USER`) 一致——两者碰巧都是 "tunnel-zhang"，这里断言
             // 一下，免得日后某一边改了字面量而这条测试悄悄失去意义。
-            let code = crate::state::test_code();
+            let code = crate::code::ConnectionCode::new(
+                crate::code::AccountName::parse(TEST_USER).unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                22000,
+                expected_fingerprint(),
+            )
+            .expect("测试夹具必须合法");
             assert_eq!(code.account().as_str(), TEST_USER);
             tx.send(Command::Start {
                 code,

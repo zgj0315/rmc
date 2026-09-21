@@ -537,14 +537,14 @@ mod tests {
     #[tokio::test]
     async fn probe_host_key_over_reports_the_real_servers_fingerprint() {
         use crate::ssh::test_support::{
-            expected_fingerprint, spawn_gateway, with_timeout, GatewayConfig,
+            expected_openssh_fingerprint, spawn_gateway, with_timeout, GatewayConfig,
         };
 
         let (_reads, _pending, conn) = spawn_gateway(GatewayConfig::default());
         let fp = with_timeout("probe_host_key_over", probe_host_key_over(conn))
             .await
             .expect("对着假 Gateway 探测 host key 不应该失败");
-        assert_eq!(fp, expected_fingerprint().as_str());
+        assert_eq!(fp, expected_openssh_fingerprint().as_str());
     }
 
     // R56（第二轮评审，LOW）：`tests/preflight.rs` 原来有一条 `#[ignore]`
@@ -571,7 +571,7 @@ mod tests {
     // 的 `Ok`/`Err` 分支写反。
     #[tokio::test]
     async fn appliance_tcp_and_hostkey_steps_pass_over_a_real_tcp_socket() {
-        use crate::ssh::test_support::{expected_fingerprint, test_host_key};
+        use crate::ssh::test_support::{expected_openssh_fingerprint, test_host_key};
 
         struct MinimalServer;
         impl russh::server::Handler for MinimalServer {
@@ -665,7 +665,7 @@ mod tests {
         match &hostkey.outcome {
             StepOutcome::Pass { detail } => {
                 assert!(detail.contains("SHA256:"), "{detail}");
-                assert_eq!(detail, expected_fingerprint().as_str());
+                assert_eq!(detail, expected_openssh_fingerprint().as_str());
             }
             other => panic!("{other:?}"),
         }
@@ -702,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn all_four_steps_pass_when_the_fingerprint_matches() {
         use crate::platform::{NoProxy, NoProxyAuth};
-        use crate::ssh::test_support::{expected_fingerprint, test_host_key};
+        use crate::ssh::test_support::{expected_openssh_fingerprint, test_host_key};
         use crate::transport::tls::test_support::{ed25519_server, serve_once};
 
         struct MinimalServer;
@@ -742,7 +742,9 @@ mod tests {
             .find(|s| s.name == STEP_APPLIANCE_HOSTKEY)
             .unwrap();
         match &hostkey.outcome {
-            StepOutcome::Pass { detail } => assert_eq!(detail, expected_fingerprint().as_str()),
+            StepOutcome::Pass { detail } => {
+                assert_eq!(detail, expected_openssh_fingerprint().as_str())
+            }
             other => panic!("{other:?}"),
         }
     }

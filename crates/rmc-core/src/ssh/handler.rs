@@ -6,9 +6,10 @@
 //! `#[async_trait::async_trait]`，直接写 `async fn` 就是它要的形状。
 //!
 //! R3（预扫描已发现）：`check_server_key` 收的是
-//! `&PublicKeyOrCertificate`，不是 `&PublicKey`——`PublicKeyBase64::
-//! public_key_bytes` 是给 `PublicKey`/`PrivateKey` 用的，不适用于
-//! `PublicKeyOrCertificate`，必须先 `.public_key()` 转一次。
+//! `&PublicKeyOrCertificate`，不是 `&PublicKey`——取 ed25519 公钥字节
+//! 之前必须先 `.public_key()` 转一次；`.public_key()` 返回**拥有值**，
+//! 不能在同一行里再借它的字段（`k.public_key().key_data().ed25519()`
+//! 一行写会 E0716），必须先 `let pk = k.public_key();` 绑定。
 //!
 //! R4（预扫描已发现，后果最隐蔽的一处）：`server_channel_open_forwarded_tcpip`
 //! 在 `session` 之前新增了一个 `reply: ChannelOpenHandle` 参数——
@@ -18,32 +19,35 @@
 //! `_reply` 能让代码编译通过、隧道正常连上、认证成功、反向端口也注册
 //! 成功，但只要真的有人连进反向端口，通道会被悄悄拒绝，什么都转发不了
 //! ——编译器抓不出这个问题。`crate::ssh::test_support` 里的进程内 russh
-//! 服务端在协议层面直接验证这一点（服务端主动开一个
-//! forwarded-tcpip 通道，断言收到的是 CHANNEL_OPEN_CONFIRMATION 而不是
-//! CHANNEL_OPEN_FAILURE，见 R40），`tests/ssh_tunnel.rs` 里
-//! `establishes_and_reports_first_seen_host_key` 末尾另有一段对着真实
-//! gateway/test-env 的原始 TCP 探测作为补充。
+//! 服务端在协议层面直接验证这一点。
+//!
+//! # Task 10：host key 校验从 known_hosts 换成核对连接码里的指纹
+//!
+//! 没有「首次连接自动信任」，也没有本地状态可以回退——`fingerprint` 是
+//! 连接码解析出来那一刻就定死的值（`code::ServerFingerprint`），跟
+//! Task 9 里 TLS 那一层核对的是同一个数。握手阶段指纹不符就直接
+//! `Err(Error::HostKeyMismatch)`，`connect_stream` 的 `?` 把它原样透传
+//! 出去，认证请求根本不会被发出去——见 `ssh::mod` 上 `establish_over`
+//! 的说明与 `mod::tests::a_wrong_fingerprint_is_fatal_before_any_password_is_sent`。
 
 use crate::addr::HostPort;
+use crate::code::ServerFingerprint;
 use crate::error::Error;
-use crate::knownhosts::{fingerprint_of, KnownHosts, Verdict};
 use crate::tunnel::TunnelMsg;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub struct ClientHandler {
-    pub gateway: HostPort,
-    pub known_hosts: Arc<KnownHosts>,
+    /// 连接码里带出来的运维服务器指纹，TLS（Task 9）与 SSH（本任务）
+    /// 两层核对的是同一个值。
+    pub fingerprint: ServerFingerprint,
     pub appliance: HostPort,
-    pub reverse_port: u16,
+    /// 服务端回填的反向端口；0 表示还没申请。forwarded-tcpip 通道按它
+    /// 过滤——见下面 `server_channel_open_forwarded_tcpip` 的说明。
+    pub registered_port: Arc<AtomicU16>,
     pub tx: mpsc::Sender<TunnelMsg>,
     pub next_session_id: Arc<AtomicU64>,
-    /// host key 校验结果（指纹, 是否首次记录），establish 在认证成功后
-    /// 读出来打包成 `TunnelMsg::Authenticated`。`check_server_key` 在
-    /// 认证之前调用，用 `Mutex` 而不是直接返回值——它是 trait 方法，
-    /// 签名由 russh 定死，没有别的地方能把结果带出去。
-    pub verdict: Arc<Mutex<Option<(String, bool)>>>,
     /// 与 `SshTunnel` 共享的"当前打开的会话"账本，见
     /// `super::pump::SharedChannels` 上的文档。每次 accept 一条
     /// forwarded-tcpip 通道都把它原样传给 `pump::spawn`——插入/移除账本
@@ -60,44 +64,28 @@ impl ClientHandler {
 impl russh::client::Handler for ClientHandler {
     type Error = Error;
 
-    /// 首次连接记录指纹，之后变更即拒绝。拒绝时返回 Err，握手随即失败，
-    /// 且这个 Err 就是 `Error::HostKeyMismatch` 本身（不经过
-    /// `From<russh::Error>` 那条笼统路径），分类是 Fatal，Supervisor
-    /// 不会自动重试——见 error.rs 上 `From<russh::Error>` 的文档注释。
+    /// 核对连接码里的指纹，不一致立刻拒绝——拒绝时返回的 `Err` 就是
+    /// `Error::HostKeyMismatch` 本身（不经过 `From<russh::Error>` 那条
+    /// 笼统路径），分类是 Fatal，Supervisor 不会自动重试。
     async fn check_server_key(
         &mut self,
         server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        use russh::keys::PublicKeyBase64;
-        // R3：先转成 PublicKey 再取编码字节；PublicKeyOrCertificate 自己
-        // 没有 public_key_bytes()。指纹算法与呈现方式见
-        // knownhosts::fingerprint_of 的文档——直接产出 Fingerprint，不
-        // 在这个安全关键路径上留一个本可以避免的 expect（R35）。
-        let key = server_public_key.public_key();
-        let blob = key.public_key_bytes();
-        // R47（第二轮评审发现）：`public_key_bytes()` 上游实现是
-        // `key_data().encoded().unwrap_or_default()`——编码失败时悄悄
-        // 退化成空 `Vec`，而不是返回错误。空 blob 的指纹是一个固定值
-        // （`SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU`，空字符串
-        // 的 SHA256），会匹配**任何**同样触发了编码失败的服务端——这在
-        // 实践中触发不了（当前支持的 key 类型都能正常编码），但拒绝它
-        // 只要两行，没有理由留着这个口子。
-        if blob.is_empty() {
+        // R3：`public_key()` 返回拥有值，先绑定再借，否则 E0716。
+        let pk = server_public_key.public_key();
+        let Some(ed) = pk.key_data().ed25519() else {
             return Err(Error::SshTransport(
-                "服务端公钥编码为空，无法计算指纹".into(),
+                "运维服务器的 host key 不是 ed25519".into(),
             ));
+        };
+        let actual = ServerFingerprint::of_ed25519_public(&ed.0);
+        if actual != self.fingerprint {
+            return Err(Error::HostKeyMismatch {
+                expected: self.fingerprint.to_string(),
+                actual: actual.to_string(),
+            });
         }
-        let fp = fingerprint_of(&blob);
-        match self.known_hosts.check(&self.gateway, &fp)? {
-            Verdict::FirstSeen => {
-                *self.verdict.lock().unwrap() = Some((fp.as_str().to_string(), true));
-                Ok(true)
-            }
-            Verdict::Matched => {
-                *self.verdict.lock().unwrap() = Some((fp.as_str().to_string(), false));
-                Ok(true)
-            }
-        }
+        Ok(true)
     }
 
     /// Gateway 上有人连到反向端口时触发。把通道接到一体机（Task 8 填实
@@ -105,36 +93,27 @@ impl russh::client::Handler for ClientHandler {
     ///
     /// R4：`reply` 必须显式 `accept()` 或 `reject()`，两条路径都要走到
     /// 底——drop 掉 `reply` 等效于拒绝，见模块顶部的说明。
+    ///
+    /// Task 10：判断的基准从"构造时写死的 `reverse_port`"换成了
+    /// `registered_port`——服务端回填的端口在 `establish_over` 里
+    /// `session.tcpip_forward("", 0)` 拿到结果之后才写进这个原子变量，
+    /// 握手/认证阶段它恒为 0，任何这个阶段送进来的 forwarded-tcpip
+    /// 通道都会被拒绝（`want == 0` 那一支）。
     async fn server_channel_open_forwarded_tcpip(
         &mut self,
         channel: russh::Channel<russh::client::Msg>,
-        connected_address: &str,
+        _connected_address: &str,
         connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
         reply: russh::client::ChannelOpenHandle,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
-        // 只接受自己注册过的端口，防止服务端把别处的通道塞进来。
-        //
-        // R42（第二轮评审发现）：上一版这里还比较了
-        // `connected_address != "127.0.0.1"`，已经删掉——两个字段都是
-        // 服务端自己决定填什么的（这条消息报的是 Gateway 认为的"连接
-        // 目标"，不是客户端能验证的东西），而这个账号只注册了一个端口，
-        // 端口比对已经把范围收得够窄了，地址比对不能再排除任何攻击者
-        // 服务端能满足的情况——不划走一分风险。它划走的是可用性：任何
-        // 一个把这个字段回显成别的写法的 Gateway（不同的 sshd 实现、
-        // Dropbear、IPv6 规整化写法、未来某个 OpenSSH 版本改了回显格式）
-        // 会导致**全部**转发通道被拒绝，而 `establish()` 前面几步毫无
-        // 异常——`Ok`、`Authenticated`、`ForwardRegistered` 照样发出去，
-        // 界面显示隧道健康，实际什么都转发不了。这正是 R4 说的"通道被
-        // 悄悄拒绝"那个后果，只是触发路径从"代码写错 `_reply`"换成了
-        // "服务端回显的字符串跟预期不一样"，两条路径殊途同归，加这个
-        // 检查反而是在制造它，不是在防它。
-        if connected_port as u16 != self.reverse_port {
+        let want = self.registered_port.load(Ordering::SeqCst);
+        if want == 0 || connected_port != u32::from(want) {
             tracing::warn!(
-                connected_address,
                 connected_port,
+                want,
                 "拒绝未注册端口的 forwarded-tcpip 通道"
             );
             reply

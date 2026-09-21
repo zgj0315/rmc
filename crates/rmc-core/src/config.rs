@@ -2,19 +2,12 @@
 
 use crate::addr::HostPort;
 use crate::error::{Error, Result};
-use std::ops::RangeInclusive;
 use std::path::PathBuf;
-
-/// 允许申请的反向端口范围，编译进二进制。
-pub const ALLOWED_REVERSE_PORTS: RangeInclusive<u16> = 22000..=22999;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub gateway: HostPort,
     pub appliance: HostPort,
-    /// 本账号的反向端口，随账号由运维下发，存在应用目录。
-    pub reverse_port: u16,
-    pub known_hosts_path: PathBuf,
     pub log_dir: PathBuf,
 }
 
@@ -30,11 +23,6 @@ impl Default for Config {
             // 这个端口简化回 22，因为 22 恰恰是掩盖这整类错误的值。主机部分
             // 同样只是占位符，现场必须按实际网络修改。
             appliance: HostPort::new("192.168.1.1", 61001).expect("内置默认值必须自解析通过"),
-            // 真实值随账号由运维下发；这里先给范围内的最小值占位，保证
-            // 一份刚生成、还没被现场信息覆盖的默认配置本身也能通过
-            // validate（见 default_config_passes_its_own_validation）。
-            reverse_port: *ALLOWED_REVERSE_PORTS.start(),
-            known_hosts_path: PathBuf::from("known_hosts"),
             log_dir: PathBuf::from("logs"),
         }
     }
@@ -113,14 +101,6 @@ impl ValidatedAddresses {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        if !ALLOWED_REVERSE_PORTS.contains(&self.reverse_port) {
-            return Err(Error::Config(format!(
-                "反向端口 {} 超出允许范围 {}-{}",
-                self.reverse_port,
-                ALLOWED_REVERSE_PORTS.start(),
-                ALLOWED_REVERSE_PORTS.end()
-            )));
-        }
         validate_addresses(&self.gateway, &self.appliance)
     }
 }
@@ -130,37 +110,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn cfg(reverse_port: u16) -> Config {
+    fn cfg() -> Config {
         Config {
             gateway: "gateway.company.com:443".parse().unwrap(),
             appliance: "192.168.100.10:22".parse().unwrap(),
-            reverse_port,
-            known_hosts_path: PathBuf::from("/tmp/rmc/known_hosts"),
             log_dir: PathBuf::from("/tmp/rmc/logs"),
         }
     }
 
     #[test]
-    fn accepts_port_inside_allowed_range() {
-        assert!(cfg(22001).validate().is_ok());
-        assert!(cfg(22000).validate().is_ok());
-        assert!(cfg(22999).validate().is_ok());
-    }
-
-    #[test]
-    fn rejects_port_below_range() {
-        let err = cfg(21999).validate().unwrap_err();
-        assert!(err.to_string().contains("22000"), "{err}");
-    }
-
-    #[test]
-    fn rejects_port_above_range() {
-        assert!(cfg(23000).validate().is_err());
-    }
-
-    #[test]
     fn rejects_appliance_equal_to_gateway() {
-        let mut c = cfg(22001);
+        let mut c = cfg();
         c.appliance = c.gateway.clone();
         let err = c.validate().unwrap_err();
         assert!(err.to_string().contains("一体机"), "{err}");
@@ -169,7 +129,7 @@ mod tests {
     #[test]
     fn rejects_loopback_appliance() {
         // 转发目标指向本机毫无意义，且会把 Gateway 的通道接到客户端自己身上。
-        let mut c = cfg(22001);
+        let mut c = cfg();
         c.appliance = "127.0.0.1:22".parse().unwrap();
         assert!(c.validate().is_err());
     }

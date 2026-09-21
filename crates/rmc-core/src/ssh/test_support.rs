@@ -56,7 +56,7 @@
 use crate::addr::HostPort;
 use crate::code::ServerFingerprint;
 use crate::error::Error;
-use crate::knownhosts::{fingerprint_of, Fingerprint, KnownHosts};
+use crate::knownhosts::{fingerprint_of, Fingerprint};
 use crate::platform::Io;
 use crate::ssh::{client_config, establish_over};
 use crate::tunnel::{TunnelHandle, TunnelMsg, TunnelParams};
@@ -89,8 +89,15 @@ pub(crate) async fn with_timeout<F: Future>(what: &str, fut: F) -> F::Output {
 
 /// 固定的测试专用 Ed25519 私钥（OpenSSH PEM），本地用
 /// `ssh-keygen -t ed25519` 生成，只用来跑进程内假 Gateway，不是任何
-/// 真实环境的凭据。固定下来而不是每次随机生成，是为了让"同一把 key
-/// 的两次连接"（FirstSeen → Matched）这类测试不需要额外传递 key 对象。
+/// 真实环境的凭据。固定下来而不是每次随机生成，是为了让期望指纹
+/// （[`expected_fingerprint`]/[`expected_openssh_fingerprint`]）可以是
+/// 编译期就能算出来的常量，不需要在每个测试里现算一遍再传来传去。
+///
+/// **控制者补充第 1 条**：这把私钥确实是 ed25519（base64 里看得到
+/// `ssh-ed25519`），所以 `check_server_key` 里 `key_data().ed25519()`
+/// 这一支在测试里走得到；「不是 ed25519」那一支目前找不到别的办法验证
+/// ——本 crate 没有现成的非 ed25519（比如 RSA/ECDSA）host key 测试
+/// 夹具，见 `ssh::mod::tests` 顶部关于这件事的说明。
 const TEST_HOST_KEY_OPENSSH_PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
 QyNTUxOQAAACC04AS5X0Rwa1fyke2kxrkaK18ceNvUghxXexXQGWLROAAAAJhld9/5ZXff
@@ -109,41 +116,49 @@ pub(crate) fn test_gateway_hostport() -> HostPort {
     "in-process-gateway.test:22".parse().unwrap()
 }
 
-/// `test_host_key()` 对应的指纹，跟 `ClientHandler::check_server_key`
-/// 走的是同一个 `fingerprint_of`。
-pub(crate) fn expected_fingerprint() -> Fingerprint {
+/// `test_host_key()` 对应的、本任务真正核对的那个指纹——`ServerFingerprint`
+/// 对裸 32 字节 ed25519 公钥做哈希，跟 `ClientHandler::check_server_key`
+/// 走的是同一条算法。**不要跟 [`expected_openssh_fingerprint`] 混用**：
+/// 两者不是一回事，见 `knownhosts.rs` 模块文档。
+pub(crate) fn expected_fingerprint() -> ServerFingerprint {
+    let key = test_host_key();
+    let pk = key.public_key();
+    let ed = pk
+        .key_data()
+        .ed25519()
+        .expect("固定的测试专用私钥必须是 ed25519");
+    ServerFingerprint::of_ed25519_public(&ed.0)
+}
+
+/// `test_host_key()` 对应的 OpenSSH 风格指纹（`SHA256:...`，对整个公钥
+/// blob 做哈希）——`preflight.rs` 探测一体机 host key 那一步用的是这个
+/// 算法（给人看的展示指纹，不是我们钉死比对的那个），见
+/// `knownhosts.rs` 模块文档「两套指纹算法不是一回事」。
+pub(crate) fn expected_openssh_fingerprint() -> Fingerprint {
     use russh::keys::PublicKeyBase64;
     fingerprint_of(&test_host_key().public_key().public_key_bytes())
 }
 
-/// 每次都要一个全新、保证互不冲突的路径——纳秒时间戳做不到这一点：
-/// 这个 harness 跑得极快（全套 9 条用例加起来一秒多），多个测试并发
-/// 跑的时候，两次 `tmp_known_hosts()` 落在同一个纳秒上不是理论风险，
-/// 是实测踩到过的真故障：`wrong_password_is_auth_rejected` 曾经因为
-/// 跟另一条测试撞了同一个纳秒、共用同一份 `known_hosts` 文件，读到了
-/// 别的用例写进去的指纹，报出一个不相关的 `HostKeyMismatch` 而不是预期
-/// 的 `AuthRejected`。`tempfile::tempdir()` 内部用的是操作系统级别的
-/// 唯一名字生成，不会有这个问题——拿到路径之后立刻让 `TempDir` guard
-/// 被丢弃也没关系：`KnownHosts::append()` 自己会在第一次写入时用
-/// `create_dir_all` 补上目录，路径本身的唯一性才是这里真正依赖的
-/// 性质，目录现在存不存在无所谓。
-pub(crate) fn tmp_known_hosts() -> KnownHosts {
-    let dir = tempfile::tempdir().expect("创建临时目录失败");
-    KnownHosts::open(dir.path().join("known_hosts"))
+pub(crate) fn test_params() -> TunnelParams {
+    test_params_with_password(TEST_PASSWORD)
 }
 
-pub(crate) fn test_params(reverse_port: u16) -> TunnelParams {
-    test_params_with_password(TEST_PASSWORD, reverse_port)
-}
-
-pub(crate) fn test_params_with_password(password: &str, reverse_port: u16) -> TunnelParams {
+pub(crate) fn test_params_with_password(password: &str) -> TunnelParams {
     TunnelParams {
         username: TEST_USER.into(),
         password: Zeroizing::new(password.to_string()),
-        reverse_port,
         gateway: test_gateway_hostport(),
         appliance: "192.168.100.10:61001".parse().unwrap(),
-        fingerprint: ServerFingerprint::of_ed25519_public(&[9u8; 32]),
+        fingerprint: expected_fingerprint(),
+    }
+}
+
+/// 指纹错的夹具：跟 [`test_params`] 相同，只是 `fingerprint` 换成一个
+/// 保证跟 `test_host_key()` 不一致的值。
+pub(crate) fn test_params_with_fingerprint(fingerprint: ServerFingerprint) -> TunnelParams {
+    TunnelParams {
+        fingerprint,
+        ..test_params()
     }
 }
 
@@ -250,8 +265,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Sniff<S> {
 /// 进程内假 Gateway 的 `server::Handler`：只实现测试需要的两个回调，
 /// 其余用 trait 的默认实现（默认拒绝一切）。
 struct GatewayHandler {
+    /// 客户端申请端口 0 时回填的端口——Task 10 起，生产客户端
+    /// (`ssh::establish_over`) 永远申请 0，服务端决定实际端口。
     permitted_port: u32,
     accept_password: bool,
+    /// 模拟"服务端拒绝这次反向端口注册"（比如同账号已有一条隧道在线）
+    /// ——`false` 时 `tcpip_forward` 恒返回 `Ok(false)`，客户端会收到
+    /// `russh::Error::RequestDenied`，映射成 `Error::ForwardPortBusy`。
+    accept_forward: bool,
 }
 
 impl russh::server::Handler for GatewayHandler {
@@ -269,17 +290,27 @@ impl russh::server::Handler for GatewayHandler {
         }
     }
 
-    /// 模拟 Gateway 侧 `sshd_tunnel_config` 的 `PermitListen`：只放行
-    /// `permitted_port` 这一个端口，其余一律拒绝——对应真实环境里
-    /// "端口不在 PermitListen 里"与"端口已被占用"这两种服务端拒绝
-    /// （见 ssh/mod.rs 里 `map_tcpip_forward_error` 的文档注释，协议层
-    /// 面这两种在客户端看来是同一个信号）。
+    /// Task 10：客户端永远申请端口 0（见 `ssh::establish_over`），服务端
+    /// 按账号回填实际端口——这里用 `permitted_port` 模拟"这个账号分配
+    /// 到的端口"。`accept_forward = false` 模拟服务端拒绝这次注册（比如
+    /// 同账号已有一条隧道在线，对应真实环境里的 `Error::ForwardPortBusy`）。
+    ///
+    /// 非 0 请求那一支保留是为了这个假 Gateway 本身仍然是一个协议层面
+    /// 合理的实现（不会在收到非 0 请求时无条件放行任意端口），生产客户端
+    /// 不会走到这一支。
     async fn tcpip_forward(
         &mut self,
         _address: &str,
         port: &mut u32,
         _session: &mut russh::server::Session,
     ) -> Result<bool, Self::Error> {
+        if !self.accept_forward {
+            return Ok(false);
+        }
+        if *port == 0 {
+            *port = self.permitted_port;
+            return Ok(true);
+        }
         Ok(*port == self.permitted_port)
     }
 }
@@ -287,6 +318,7 @@ impl russh::server::Handler for GatewayHandler {
 pub(crate) struct GatewayConfig {
     pub permitted_port: u32,
     pub accept_password: bool,
+    pub accept_forward: bool,
 }
 
 impl Default for GatewayConfig {
@@ -294,6 +326,7 @@ impl Default for GatewayConfig {
         Self {
             permitted_port: 22001,
             accept_password: true,
+            accept_forward: true,
         }
     }
 }
@@ -419,6 +452,7 @@ pub(crate) fn spawn_freezable_gateway(
     let handler = GatewayHandler {
         permitted_port: cfg.permitted_port,
         accept_password: cfg.accept_password,
+        accept_forward: cfg.accept_forward,
     };
 
     let (handle_tx, handle_rx) = oneshot::channel();
@@ -463,6 +497,7 @@ pub(crate) fn spawn_gateway(cfg: GatewayConfig) -> (ReadTimestamps, PendingHandl
     let handler = GatewayHandler {
         permitted_port: cfg.permitted_port,
         accept_password: cfg.accept_password,
+        accept_forward: cfg.accept_forward,
     };
 
     let (handle_tx, handle_rx) = oneshot::channel();
@@ -497,67 +532,15 @@ mod tests {
     use crate::error::ErrorClass;
     use crate::tunnel::TunnelMsg;
 
-    // --- 1. host key 首次记录 / 匹配（FirstSeen → Matched）---
+    // --- Task 10：host key 首次记录/变更拒绝那两条测试（FirstSeen →
+    // Matched）已经跟着 `KnownHosts` 一起删掉——SSH host key 校验换成了
+    // 核对连接码里的指纹，没有本地状态、也没有"首次连接自动信任"这一说。
+    // 等价的正/反两面证据现在在 `ssh::mod::tests`：
+    // `pinned_fingerprint_matches_and_the_port_comes_back_from_the_server`
+    // （指纹对）与 `a_wrong_fingerprint_is_fatal_before_any_password_is_sent`
+    // （指纹错，Fatal）。
 
-    #[tokio::test]
-    async fn first_seen_then_matched_across_two_connections() {
-        let kh_dir = tempfile::tempdir().unwrap();
-        let kh_path = kh_dir.path().join("known_hosts");
-
-        for expect_first_seen in [true, false] {
-            let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-            let known_hosts = Arc::new(KnownHosts::open(kh_path.clone()));
-            let (tx, mut rx) = mpsc::channel(32);
-            let handle = with_timeout(
-                "establish_over",
-                establish_over(conn, &known_hosts, test_params(22001), tx),
-            )
-            .await
-            .unwrap();
-
-            match next_msg(&mut rx).await {
-                TunnelMsg::Authenticated { first_seen, .. } => {
-                    assert_eq!(first_seen, expect_first_seen)
-                }
-                other => panic!("{other:?}"),
-            }
-
-            handle.shutdown().await;
-            drop(pending);
-        }
-    }
-
-    // --- 2. host key 变更 → Fatal（R40 的主证据：这条测试会在
-    // check_server_key 的错误传播被换成 `Ok(false)` 时变红）---
-
-    #[tokio::test]
-    async fn host_key_mismatch_is_fatal() {
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
-        known_hosts
-            .check(
-                &test_gateway_hostport(),
-                &Fingerprint::new("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(),
-            )
-            .unwrap();
-
-        let (tx, _rx) = mpsc::channel(32);
-        let err = expect_err(
-            with_timeout(
-                "establish_over",
-                establish_over(conn, &known_hosts, test_params(22001), tx),
-            )
-            .await,
-        );
-        assert!(
-            matches!(err, Error::HostKeyMismatch { .. }),
-            "应为 HostKeyMismatch，实际 {err:?}"
-        );
-        assert_eq!(err.class(), ErrorClass::Fatal);
-        drop(pending);
-    }
-
-    // --- 3. 专门写给 `Ok(false)` 这条路径的负面测试（R40 点名要求）---
+    // --- 专门写给 `Ok(false)` 这条路径的负面测试（R40 点名要求）---
 
     #[tokio::test]
     async fn check_server_key_returning_ok_false_is_not_fatal() {
@@ -603,22 +586,16 @@ mod tests {
         drop(pending);
     }
 
-    // --- 4. 口令错误 → AuthRejected / Auth ---
+    // --- 口令错误 → AuthRejected / Auth ---
 
     #[tokio::test]
     async fn wrong_password_is_auth_rejected() {
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, _rx) = mpsc::channel(32);
         let err = expect_err(
             with_timeout(
                 "establish_over",
-                establish_over(
-                    conn,
-                    &known_hosts,
-                    test_params_with_password("definitely-wrong", 22001),
-                    tx,
-                ),
+                establish_over(conn, test_params_with_password("definitely-wrong"), tx),
             )
             .await,
         );
@@ -627,32 +604,11 @@ mod tests {
         drop(pending);
     }
 
-    // --- 5. tcpip_forward 被拒 → ForwardPortBusy ---
+    // --- tcpip_forward 被拒 → ForwardPortBusy：等价证据在
+    // `ssh::mod::tests::a_denied_forward_is_port_busy_class`（用
+    // `GatewayConfig { accept_forward: false, .. }` 模拟服务端拒绝）。
 
-    #[tokio::test]
-    async fn tcpip_forward_denied_is_port_busy() {
-        // 服务端只放行 22001，这里请求 22002，模拟"端口不在
-        // PermitListen 里"（或者已被占用——协议层面是同一个信号，见
-        // ssh/mod.rs 上 map_tcpip_forward_error 的说明）。
-        let (_reads, pending, conn) = spawn_gateway(GatewayConfig {
-            permitted_port: 22001,
-            accept_password: true,
-        });
-        let known_hosts = Arc::new(tmp_known_hosts());
-        let (tx, _rx) = mpsc::channel(32);
-        let err = expect_err(
-            with_timeout(
-                "establish_over",
-                establish_over(conn, &known_hosts, test_params(22002), tx),
-            )
-            .await,
-        );
-        assert!(matches!(err, Error::ForwardPortBusy(22002)), "实际 {err:?}");
-        assert_eq!(err.class(), ErrorClass::PortBusy);
-        drop(pending);
-    }
-
-    // --- 6. keepalive 间隔：数服务端收到字节的时间戳，不解密协议
+    // --- keepalive 间隔：数服务端收到字节的时间戳，不解密协议
     // （R43，评审明确要求"protocol 级别数 keepalive 请求"，跟
     // ssh::tests::client_config_keepalive_matches_the_operator_runbook_numbers
     // 那条快速的直接断言互补：那条钉的是"字面量没被改错"，这条钉的是
@@ -667,14 +623,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn keepalive_interval_matches_the_configured_ten_seconds() {
         let (reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(32);
-        let handle = with_timeout(
-            "establish_over",
-            establish_over(conn, &known_hosts, test_params(22001), tx),
-        )
-        .await
-        .unwrap();
+        let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
+            .await
+            .unwrap();
         drain_authenticated_and_forward_registered(&mut rx).await;
         let _server_handle = pending.get().await;
 
@@ -731,14 +683,10 @@ mod tests {
     #[tokio::test]
     async fn forwarded_channel_open_is_confirmed_when_port_matches() {
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(32);
-        let handle = with_timeout(
-            "establish_over",
-            establish_over(conn, &known_hosts, test_params(22001), tx),
-        )
-        .await
-        .unwrap();
+        let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
+            .await
+            .unwrap();
         drain_authenticated_and_forward_registered(&mut rx).await;
         let server_handle = pending.get().await;
 
@@ -762,14 +710,10 @@ mod tests {
     #[tokio::test]
     async fn forwarded_channel_open_is_rejected_when_port_does_not_match() {
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(32);
-        let handle = with_timeout(
-            "establish_over",
-            establish_over(conn, &known_hosts, test_params(22001), tx),
-        )
-        .await
-        .unwrap();
+        let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
+            .await
+            .unwrap();
         drain_authenticated_and_forward_registered(&mut rx).await;
         let server_handle = pending.get().await;
 
@@ -796,18 +740,14 @@ mod tests {
     #[tokio::test]
     async fn authenticated_message_reports_the_expected_fingerprint() {
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(32);
-        let handle = with_timeout(
-            "establish_over",
-            establish_over(conn, &known_hosts, test_params(22001), tx),
-        )
-        .await
-        .unwrap();
+        let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
+            .await
+            .unwrap();
 
         match next_msg(&mut rx).await {
-            TunnelMsg::Authenticated { host_key_fp, .. } => {
-                assert_eq!(host_key_fp, expected_fingerprint().as_str());
+            TunnelMsg::Authenticated { fingerprint } => {
+                assert_eq!(fingerprint, expected_fingerprint());
             }
             other => panic!("{other:?}"),
         }

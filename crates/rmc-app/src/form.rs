@@ -15,10 +15,9 @@
 //! 工程师自己核对三个字段有没有抄对。
 //!
 //! 这一步（Task 8）只接线：连接码解析出来的指纹已经流到
-//! `rmc_core::tunnel::TunnelParams`，但**还没有任何人核对它**——TLS 仍然
-//! 只走公共 CA、SSH 仍然只走 known_hosts，指纹比对是 Task 9 的事，端口
-//! 仍然是 `Config::reverse_port`（Task 10 换）。中间态在功能上自相矛盾
-//! 是刻意的，只存在于这条 feature 分支。
+//! `rmc_core::tunnel::TunnelParams`——TLS（Task 9）与 SSH（Task 10）两层
+//! 现在都核对它；反向端口也不再是配置里写死的值，改成申请 0 由运维
+//! 服务器按账号回填（Task 10）。
 //!
 //! # W139：校验的出口带字段身份，不是一串裸字符串
 //!

@@ -94,10 +94,14 @@ pub enum TunnelEvent {
     State(State),
     Preflight(PreflightReport),
     RemoteSessions(Vec<RemoteSessionInfo>),
-    HostKey {
+    /// SSH host key 与连接码里的指纹核对一致（Task 10：换掉了带
+    /// `first_seen` 的 `HostKey` 变体——没有「首次记录」这一说，见
+    /// `tunnel::TunnelMsg::Authenticated` 上的说明）。
+    ServerVerified {
         fingerprint: String,
-        first_seen: bool,
     },
+    /// 反向端口已经由运维服务器回填注册（Task 10）。
+    ForwardPort(u16),
     ConnectedSince(SystemTime),
     /// 这次连接实际经过了什么：直连，还是某一台代理。
     ///

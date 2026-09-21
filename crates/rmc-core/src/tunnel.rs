@@ -112,16 +112,15 @@ use zeroize::Zeroizing;
 pub struct TunnelParams {
     pub username: String,
     pub password: Zeroizing<String>,
-    pub reverse_port: u16,
     /// 这条隧道实际要拨的 Gateway，也是 host key 要比对的那一台。
     pub gateway: HostPort,
     pub appliance: HostPort,
-    /// 连接码里带出来的运维服务器指纹。
+    /// 连接码里带出来的运维服务器指纹。TLS（Task 9）与 SSH（Task 10）
+    /// 两层都核对同一个值，没有第二份拷贝。
     ///
-    /// Task 8（本任务）只接线：这个字段已经从连接码一路传到这里，但
-    /// 还没有任何人核对它——TLS 仍然只走公共 CA、SSH 仍然只走
-    /// known_hosts，指纹比对是 Task 9 的事。中间态在功能上自相矛盾
-    /// （指纹传进去了却没人核对）是刻意的，只存在于这条 feature 分支。
+    /// Task 10：`reverse_port` 字段删掉了——反向端口不再由客户端指定，
+    /// 而是 `ssh::establish_over` 申请端口 0，由运维服务器按账号回填
+    /// （见 `tunnel::TunnelMsg::ForwardRegistered`）。
     pub fingerprint: ServerFingerprint,
 }
 
@@ -130,7 +129,6 @@ impl std::fmt::Debug for TunnelParams {
         f.debug_struct("TunnelParams")
             .field("username", &self.username)
             .field("password", &"<redacted>")
-            .field("reverse_port", &self.reverse_port)
             .field("gateway", &self.gateway)
             .field("appliance", &self.appliance)
             // 指纹不是秘密——它跟账号名、地址一样是连接码里公开的一段。
@@ -142,10 +140,15 @@ impl std::fmt::Debug for TunnelParams {
 /// 隧道运行期间向 Supervisor 上报的事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunnelMsg {
+    /// SSH host key 与连接码里的指纹核对一致（`ssh::handler::
+    /// ClientHandler::check_server_key`）。没有「首次记录」这一说——
+    /// 指纹要么跟连接码一致，要么握手在这条消息能发出去之前就已经
+    /// 失败了。
     Authenticated {
-        host_key_fp: String,
-        first_seen: bool,
+        fingerprint: ServerFingerprint,
     },
+    /// 反向端口已经注册；`port` 是运维服务器按账号回填的值，不是客户端
+    /// 自己申请的（Task 10：客户端始终申请端口 0）。
     ForwardRegistered {
         port: u16,
     },
@@ -213,7 +216,6 @@ mod tests {
         let p = TunnelParams {
             username: "tunnel-zhang".into(),
             password: Zeroizing::new("super-secret-pw".to_string()),
-            reverse_port: 22001,
             gateway: HostPort::new("gateway.company.com", 443).unwrap(),
             appliance: HostPort::new("192.168.1.1", 61001).unwrap(),
             fingerprint: ServerFingerprint::of_ed25519_public(&[9u8; 32]),

@@ -43,12 +43,14 @@ pub const PROXY_ENDPOINT_ROW: &str = "系统代理";
 /// 诊断页上「代理 CONNECT」那一行的行首文字。
 pub const PROXY_CONNECT_ROW: &str = "代理 CONNECT";
 
-/// 诊断页上运维服务器 host key 那一行的行首文字。
+/// 诊断页上运维服务器指纹那一行的行首文字。
 ///
-/// **不要用 `name.contains("host key")` 去找它**：预检的第二步叫
-/// 「一体机 host key 指纹」，也含这三个字，而且排在前面。写测试时踩过
-/// 一次，留这个常量就是为了别再踩第二次。
-pub const HOST_KEY_ROW: &str = "运维服务器 host key";
+/// Task 10：SSH host key 校验换成核对连接码里的指纹，这一行随之改名——
+/// **不要用 `name.contains("指纹")` 去找它**：预检第二步叫「一体机
+/// host key 指纹」、第四步叫「运维服务器 TLS 与指纹」，两者都含「指纹」
+/// 二字，而且排在前面。写测试时踩过一次，留这个常量就是为了别再踩
+/// 第二次。
+pub const HOST_KEY_ROW: &str = "运维服务器指纹";
 
 /// 诊断页上的一行。
 ///
@@ -120,43 +122,16 @@ impl ProxyStatus {
     }
 }
 
-/// 运维服务器 host key 的比对结果。
+/// 运维服务器 SSH host key 与连接码里的指纹核对一致后的展示值。
 ///
-/// W159：这是 brief 那个 `(String, bool)` 的带类型版本。`bool` 是
-/// 「是不是第一次见到」——写成两个变体之后，读的人不必再去别处查。
+/// Task 10：换掉了带 `bool`（是不是第一次见到）的 `HostKeyRecord`——
+/// SSH host key 校验换成核对连接码里的指纹，没有「首次记录」这一说，
+/// 指纹要么跟连接码一致，要么握手直接失败，`Model.server_fingerprint`
+/// 因此只是一个 `Option<String>`，这里不再需要一个"哪个变体"的判断，
+/// 直接是一个带字段的结构体。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HostKeyRecord {
-    /// 本机第一次见到这个指纹，已经记下来了。
-    FirstSeen { fingerprint: String },
-    /// 与本机已有记录一致。
-    Matches { fingerprint: String },
-}
-
-impl HostKeyRecord {
-    /// 从 [`crate::model::Model::host_key`] 那个 `(指纹, 是否首次)` 转过来。
-    ///
-    /// 这个适配器存在的唯一理由是 `Model` 的字段形状是 Task 7 定的、
-    /// 由 `TunnelEvent::HostKey` 直接喂进去；换掉它要动 rmc-core 的事件
-    /// 定义，不在本任务范围内。**判断（那个 `bool` 是什么意思）关在这里，
-    /// 视图里只剩一次 `map`。**
-    pub fn from_model(v: &(String, bool)) -> Self {
-        let (fingerprint, first_seen) = v;
-        if *first_seen {
-            Self::FirstSeen {
-                fingerprint: fingerprint.clone(),
-            }
-        } else {
-            Self::Matches {
-                fingerprint: fingerprint.clone(),
-            }
-        }
-    }
-
-    pub fn fingerprint(&self) -> &str {
-        match self {
-            Self::FirstSeen { fingerprint } | Self::Matches { fingerprint } => fingerprint,
-        }
-    }
+pub struct ServerVerified {
+    pub fingerprint: String,
 }
 
 /// 处置建议卡上的字。
@@ -226,7 +201,7 @@ impl Advice {
 pub fn rows(
     report: Option<&PreflightReport>,
     proxy: Option<&ProxyStatus>,
-    host_key: Option<&HostKeyRecord>,
+    server_verified: Option<&ServerVerified>,
 ) -> Vec<DiagRow> {
     let mut out: Vec<DiagRow> = match report {
         Some(r) => r
@@ -282,15 +257,11 @@ pub fn rows(
         });
     }
 
-    if let Some(hk) = host_key {
-        let detail = match hk {
-            HostKeyRecord::FirstSeen { fingerprint } => format!("{fingerprint}（首次记录）"),
-            HostKeyRecord::Matches { fingerprint } => format!("{fingerprint}（与记录一致）"),
-        };
+    if let Some(sv) = server_verified {
         out.push(DiagRow {
             name: HOST_KEY_ROW.to_string(),
             verdict: Verdict::Pass,
-            detail,
+            detail: format!("{}（与连接码一致）", sv.fingerprint),
         });
     }
 
@@ -336,6 +307,22 @@ pub fn advice_for(report: Option<&PreflightReport>) -> Advice {
             "连不上运维服务器的这个端口。请确认这台笔记本能出网；客户网络只放行 443 时，\
              请客户网管放行这个 IP 的端口，或由运维把公网 443 映射到运维服务器后重发连接码。"
         }
+        // Task 10：SSH 那一层的 `Error::HostKeyMismatch`（文案里含
+        // 「SSH 身份」与「指纹」两个词）实际上从不会流进这里——它发生
+        // 在 `ssh::establish_over` 握手阶段，preflight 的四步里没有一步
+        // 检查运维服务器的 SSH host key（第四步「运维服务器 TLS 与
+        // 指纹」只检查 TLS 层的证书公钥）。这一支留着是防御性的：万一
+        // 将来预检也加了一步核对 SSH host key，产出的 `detail` 直接是
+        // `Error::HostKeyMismatch` 的 `Display`，这一支能接住它，而且
+        // 必须排在下面那条更宽的「指纹」分支之前——两条文案都含「指纹」
+        // 二字，先到先得。**控制者补充第 6 条要求核实这一点**：见
+        // `tests::a_synthetic_ssh_host_key_mismatch_detail_is_not_
+        // swallowed_by_the_generic_fingerprint_branch`，用一条断言核实
+        // 过，不是靠读代码下结论。
+        STEP_GATEWAY_TLS if detail.contains("SSH 身份") => {
+            "运维服务器的 SSH 身份与连接码里的指纹不一致，连接已经拒绝。两种可能：路径上\
+             有中间人，或者连接码已经过期（运维服务器换过密钥，请向运维重新索取连接码）。"
+        }
         STEP_GATEWAY_TLS if detail.contains("指纹") => {
             "运维服务器的身份与连接码里的指纹对不上，连接已经拒绝。两种可能：路径上有做\
              中间人的 TLS 审计设备（请客户网管对这个 IP 与端口免做审计），或者连接码已经\
@@ -346,11 +333,6 @@ pub fn advice_for(report: Option<&PreflightReport>) -> Advice {
              它分得清「代理要的是本机不做的认证方式」「这台笔记本建不出安全上下文」\
              「协商走完了而代理不接受当前用户」。前两种找 IT 把笔记本加域或换认证方式，\
              最后一种要网络管理员给当前用户开出网权限。"
-        }
-        STEP_GATEWAY_TLS if detail.contains("host key") => {
-            "运维服务器的 host key 与本机记录的不一致，连接已经拒绝。\
-             若运维服务器确实换过主机密钥，请联系运维核对指纹之后再删掉本机的记录；\
-             否则这次连接可能被引到了一台冒充的服务器上。"
         }
         _ => {
             return Advice::Unrecognized(card(
@@ -1061,36 +1043,36 @@ mod tests {
         assert!(auth.detail.contains("不接受当前用户"), "{auth:?}");
     }
 
+    /// Task 10：没有「首次记录」这一说了——SSH host key 校验换成核对
+    /// 连接码里的指纹，指纹要么跟连接码一致，要么握手直接失败。这一行
+    /// 现在只有一种展示形态。
+    ///
+    /// 改红：把 `rows()` 里那一段拼接改成不带指纹的固定文案——
+    /// `a.contains(&sv.fingerprint)` 那条断言会红。
     #[test]
-    fn the_host_key_row_tells_first_sight_from_a_match() {
-        let first = HostKeyRecord::from_model(&("SHA256:aaa".to_string(), true));
-        let again = HostKeyRecord::from_model(&("SHA256:aaa".to_string(), false));
-        assert_eq!(first.fingerprint(), "SHA256:aaa");
-
-        let detail_of = |hk: &HostKeyRecord| {
-            rows(None, None, Some(hk))
-                .into_iter()
-                .find(|r| r.name == HOST_KEY_ROW)
-                .expect("没有画出 host key 那一行")
-                .detail
+    fn the_server_fingerprint_row_shows_the_pinned_value() {
+        let sv = ServerVerified {
+            fingerprint: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
         };
-        // 反向自证：「一体机 host key 指纹」那一行也含「host key」三个字，
-        // 而且排在前面。这一条确认我们找的是运维服务器那一行。
-        let all = rows(None, None, Some(&first));
+
+        // 反向自证：`HOST_KEY_ROW`（"运维服务器指纹"）现在不含「host
+        // key」这个子串了——预检第二步「一体机 host key 指纹」才含，
+        // 这一条确认我们找的是运维服务器那一行，不是撞上了那一步。
+        let all = rows(None, None, Some(&sv));
         assert_eq!(
-            all.iter().filter(|r| r.name.contains("host key")).count(),
-            2,
-            "含「host key」的行数变了，下面的查找可能找错行：{all:#?}"
+            all.iter().filter(|r| r.name.contains("指纹")).count(),
+            3,
+            "含「指纹」的行数变了（一体机 host key 指纹、运维服务器 TLS \
+             与指纹、运维服务器指纹），下面的查找可能找错行：{all:#?}"
         );
 
-        let a = detail_of(&first);
-        let b = detail_of(&again);
-        assert!(a.contains("首次记录"), "{a}");
-        assert!(b.contains("与记录一致"), "{b}");
-        assert!(a.contains("SHA256:aaa") && b.contains("SHA256:aaa"));
-        // 反向自证：两句话真的不同。`from_model` 把 bool 读反了的话，
-        // 上面两条会各自红；而如果两个变体画出同一句话，这条红。
-        assert_ne!(a, b);
+        let detail = all
+            .into_iter()
+            .find(|r| r.name == HOST_KEY_ROW)
+            .expect("没有画出运维服务器指纹那一行")
+            .detail;
+        assert!(detail.contains(&sv.fingerprint), "{detail}");
+        assert!(detail.contains("与连接码一致"), "{detail}");
     }
 
     // ================= 处置建议 =================
@@ -1197,6 +1179,50 @@ mod tests {
         assert_eq!(card.failed_step, STEP_GATEWAY_TLS);
         assert!(card.body.contains("导出诊断包"), "{}", card.body);
         assert!(advice.card().is_some(), "认不出也要画卡");
+    }
+
+    /// **控制者补充第 6 条**：`advice_for` 是按 `detail.contains(...)`
+    /// 顺序分派的，而 `Error::HostKeyMismatch`（SSH 那一层，本任务新写
+    /// 的文案）跟 `Error::TlsPinMismatch`（TLS 那一层，Task 9 的文案）
+    /// 都含「指纹」两个字——如果分派顺序不对，前者会被后者那条更宽的
+    /// 分支先截走，现场工程师看到的会是「TLS 审计设备」这一套跟 SSH
+    /// 握手完全无关的建议。
+    ///
+    /// 这条测试**不代表这个场景在生产环境里会真的发生**：SSH host key
+    /// 校验发生在 `ssh::establish_over` 握手阶段，preflight 的四步里
+    /// 没有一步会检查它，`Error::HostKeyMismatch` 的文案今天不会流进
+    /// 任何 `PreflightReport`。这里喂的是一个假设性的
+    /// `StepOutcome::Fail { detail: <HostKeyMismatch 的 Display> }`，
+    /// 只用来核实"如果它有一天真的流进来了，分派顺序是不是对的"这件
+    /// 事本身——核的办法是这条断言，不是读代码下结论。
+    #[test]
+    fn a_synthetic_ssh_host_key_mismatch_detail_is_not_swallowed_by_the_generic_fingerprint_branch()
+    {
+        let detail = rmc_core::error::Error::HostKeyMismatch {
+            expected: "SHA256:aaa".into(),
+            actual: "SHA256:bbb".into(),
+        }
+        .to_string();
+        assert!(detail.contains("SSH 身份"), "夹具没起作用：{detail}");
+        assert!(detail.contains("指纹"), "夹具没起作用：{detail}");
+
+        let r = PreflightReport {
+            steps: vec![step(STEP_GATEWAY_TLS, failed(&detail))],
+        };
+        let advice = advice_for(Some(&r));
+        let Advice::Known(card) = &advice else {
+            panic!("应当落在 Known 上，却是 {advice:?}");
+        };
+        assert!(
+            card.body.contains("SSH 身份"),
+            "命中的是「指纹」那条更宽的通用分支，不是 SSH 专用的那一支：{}",
+            card.body
+        );
+        assert!(
+            !card.body.contains("TLS 审计设备"),
+            "文案里出现了跟 SSH 握手无关的 TLS 审计设备建议：{}",
+            card.body
+        );
     }
 
     // ================= 脱敏 =================

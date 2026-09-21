@@ -17,7 +17,15 @@ pub enum ErrorClass {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("运维服务器 host key 与已记录的不一致，已拒绝连接（记录 {expected}，本次 {actual}）")]
+    /// Task 10：运维服务器没有 known_hosts 这类本地记录可以比对——SSH
+    /// host key 校验换成了核对连接码里的指纹（`ssh::handler::
+    /// ClientHandler::check_server_key`），跟 Task 9 TLS 那一层比对的是
+    /// 同一个 `ServerFingerprint`。没有「首次连接自动信任」，也不留作
+    /// 后备：指纹不符时握手阶段就直接失败，口令根本不会被送出去。
+    #[error(
+        "运维服务器的 SSH 身份与连接码里的指纹不一致（连接码 {expected}，本次 {actual}），\
+         已拒绝连接。可能路径上有中间人，或连接码已过期（运维服务器换过密钥）"
+    )]
     HostKeyMismatch { expected: String, actual: String },
 
     /// Task 9：运维服务器没有域名、证书自签，客户端核对的是连接码里的
@@ -34,8 +42,10 @@ pub enum Error {
     #[error("账号或口令不正确")]
     AuthRejected,
 
-    #[error("反向端口 {0} 被占用，上一条隧道的监听尚未回收")]
-    ForwardPortBusy(u16),
+    /// Task 10：端口改成申请 0 由运维服务器回填，客户端不再知道、也不
+    /// 需要知道具体端口号——这个变体因此不再带字段。
+    #[error("反向端口被占用：这个账号上一条隧道的监听尚未回收")]
+    ForwardPortBusy,
 
     #[error("域名解析失败：{0}")]
     Dns(String),
@@ -114,7 +124,7 @@ impl Error {
             | Error::Config(_)
             | Error::LocalIo(_) => ErrorClass::Fatal,
             Error::AuthRejected => ErrorClass::Auth,
-            Error::ForwardPortBusy(_) => ErrorClass::PortBusy,
+            Error::ForwardPortBusy => ErrorClass::PortBusy,
             Error::Dns(_)
             | Error::Tcp(_)
             | Error::TlsHandshake(_)
@@ -198,7 +208,7 @@ mod tests {
 
     #[test]
     fn port_busy_is_its_own_class() {
-        assert_eq!(Error::ForwardPortBusy(22001).class(), ErrorClass::PortBusy);
+        assert_eq!(Error::ForwardPortBusy.class(), ErrorClass::PortBusy);
     }
 
     #[test]

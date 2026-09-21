@@ -7,11 +7,10 @@ pub mod pump;
 pub(crate) mod test_support;
 
 use crate::error::{Error, Result};
-use crate::knownhosts::KnownHosts;
 use crate::platform::Conn;
 use crate::transport::Transport;
 use crate::tunnel::{TunnelFactory, TunnelHandle, TunnelMsg, TunnelParams, UnknownSessionId};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -28,19 +27,17 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 /// 实测见 `tunnel::TunnelParams` 上的文档。
 ///
 /// 现在 Gateway 地址随每一次 `establish` 从 [`TunnelParams`] 进来，
-/// 工厂只留跟具体目标无关的两样东西：拨号用的 `Transport` 与
-/// `known_hosts` 账本。
+/// 工厂只留跟具体目标无关的一样东西：拨号用的 `Transport`。
+///
+/// Task 10：`known_hosts` 字段删掉了——SSH host key 校验换成核对连接码
+/// 里的指纹（`params.fingerprint`），没有本地状态需要工厂替它保管。
 pub struct SshTunnelFactory {
     transport: Arc<Transport>,
-    known_hosts: Arc<KnownHosts>,
 }
 
 impl SshTunnelFactory {
-    pub fn new(transport: Arc<Transport>, known_hosts: Arc<KnownHosts>) -> Self {
-        Self {
-            transport,
-            known_hosts,
-        }
+    pub fn new(transport: Arc<Transport>) -> Self {
+        Self { transport }
     }
 }
 
@@ -241,7 +238,7 @@ impl TunnelFactory for SshTunnelFactory {
             .transport
             .connect(&params.gateway, &params.fingerprint)
             .await?;
-        establish_over(conn, &self.known_hosts, params, tx).await
+        establish_over(conn, params, tx).await
     }
 }
 
@@ -266,12 +263,14 @@ impl TunnelFactory for SshTunnelFactory {
 /// 会用到的每一段逻辑（包括 `handler.rs` 里 `check_server_key`/
 /// `server_channel_open_forwarded_tcpip` 那两段安全关键代码）钉在
 /// **任何一次** `cargo test -p rmc-core` 里，不需要等 docker、DNS、
-/// `/etc/hosts` 都凑齐才能验证。docker 版的 `tests/ssh_tunnel.rs` 仍然
-/// 保留——它验证的是"真实 Gateway/sshd 是否也这样表现"，跟这里验证的
-/// "我们自己的代码是否这样表现"是两件事，互补不冲突。
+/// `/etc/hosts` 都凑齐才能验证。docker 版的 `tests/ssh_tunnel.rs`
+/// （连同 `tests/forwarding.rs`、`tests/common/`）在 Task 10 删掉了：
+/// Task 9 把客户端 TLS 改成指纹钉扣之后，它描述的已经是旧的 CA/
+/// known_hosts 世界，真跑起来会在握手那一步失败，留着只是"能编译但
+/// 语义过期"，见 task-10-report.md。
 ///
 /// R96：原来这里还单独收一个 `gateway: &HostPort` 参数，跟
-/// `params.appliance`/`params.reverse_port` 并列着往 `ClientHandler`
+/// `params.appliance` 并列着往 `ClientHandler`
 /// 里塞。`TunnelParams` 现在自己带着 gateway（见
 /// `tunnel::TunnelParams` 上的 R96 说明），那个参数就删掉了——留着它
 /// 等于在函数签名上重新开一个"host key 对着哪台机器比"的独立入口，
@@ -280,22 +279,22 @@ impl TunnelFactory for SshTunnelFactory {
 /// 一个 `params.gateway`。
 pub(crate) async fn establish_over(
     conn: Conn,
-    known_hosts: &Arc<KnownHosts>,
     params: TunnelParams,
     tx: mpsc::Sender<TunnelMsg>,
 ) -> Result<Box<dyn TunnelHandle>> {
     let config = client_config();
 
-    let verdict = Arc::new(std::sync::Mutex::new(None));
     let channels = pump::new_shared_channels();
+    // Task 10：服务端回填的反向端口，握手/认证阶段恒为 0——
+    // `ClientHandler::server_channel_open_forwarded_tcpip` 据此拒绝这
+    // 个阶段送进来的任何 forwarded-tcpip 通道，见该方法上的说明。
+    let registered_port = Arc::new(AtomicU16::new(0));
     let handler = handler::ClientHandler {
-        gateway: params.gateway.clone(),
-        known_hosts: known_hosts.clone(),
+        fingerprint: params.fingerprint,
         appliance: params.appliance.clone(),
-        reverse_port: params.reverse_port,
+        registered_port: registered_port.clone(),
         tx: tx.clone(),
         next_session_id: Arc::new(AtomicU64::new(1)),
-        verdict: verdict.clone(),
         channels: channels.clone(),
     };
 
@@ -307,10 +306,10 @@ pub(crate) async fn establish_over(
     // `Error::HostKeyMismatch`（Fatal，不能自动重试）会被顺手裹成
     // `Error::SshTransport`（Network，无限退避重连）——把"连到一个
     // 冒充的 Gateway 应该立刻、永久地失败"变成"跟冒充者失联重试
-    // 到天荒地老"。`recorded_but_changed_host_key_is_fatal`
-    // （tests/ssh_tunnel.rs，以及 test_support 里跑在进程内假 Gateway
-    // 上的等价用例）钉住的就是这一条：谁把这行改回 `.map_err(...)`，
-    // 这条测试的 `assert_eq!(err.class(), ErrorClass::Fatal)` 立刻变红。
+    // 到天荒地老"。`tests::a_wrong_fingerprint_is_fatal_before_any_
+    // password_is_sent`（本文件）钉住的就是这一条：谁把这行改回
+    // `.map_err(...)`，那条测试的 `assert_eq!(err.class(), ErrorClass::
+    // Fatal)` 立刻变红。
     let mut session = russh::client::connect_stream(config, conn, handler).await?;
 
     // R41（第二轮评审发现，纠正上一轮写错的说法）：口令交给
@@ -336,27 +335,28 @@ pub(crate) async fn establish_over(
         return Err(Error::AuthRejected);
     }
 
-    let (fp, first_seen) = verdict
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| Error::SshTransport("握手未产生 host key 校验结果".into()))?;
+    // 握手阶段 `check_server_key` 已经核对过指纹（不一致会让上面那个
+    // `?` 直接短路返回 `Error::HostKeyMismatch`，走不到这一行）——这里
+    // 发出的就是那个已经验证过的指纹，不是另一份拷贝。
     let _ = tx
         .send(TunnelMsg::Authenticated {
-            host_key_fp: fp,
-            first_seen,
+            fingerprint: params.fingerprint,
         })
         .await;
 
-    session
-        .tcpip_forward("127.0.0.1", params.reverse_port as u32)
+    // Task 10：申请端口 0，端口由运维服务器按账号分配，客户端不知道也
+    // 不需要知道。`tcpip_forward` 返回值就是服务端回填的那个端口。
+    let port = session
+        .tcpip_forward("", 0)
         .await
-        .map_err(|e| map_tcpip_forward_error(e, params.reverse_port))?;
-    let _ = tx
-        .send(TunnelMsg::ForwardRegistered {
-            port: params.reverse_port,
-        })
-        .await;
+        .map_err(map_tcpip_forward_error)?;
+    let port = u16::try_from(port)
+        .map_err(|_| Error::SshTransport(format!("运维服务器回填的端口不合法：{port}")))?;
+    if port == 0 {
+        return Err(Error::SshTransport("运维服务器没有回填反向端口".into()));
+    }
+    registered_port.store(port, Ordering::SeqCst);
+    let _ = tx.send(TunnelMsg::ForwardRegistered { port }).await;
 
     let session = Arc::new(AsyncMutex::new(session));
     spawn_disconnect_watcher(session.clone(), tx);
@@ -404,50 +404,46 @@ impl TunnelHandle for SshTunnel {
 ///
 /// russh 的 `tcpip_forward` 只有两种失败形状（见其源码）：
 /// - `Error::RequestDenied`：服务端明确回了 SSH_MSG_REQUEST_FAILURE——
-///   这条全局请求真的被拒了，可能是端口没在这个账号的 `PermitListen`
-///   里，也可能是端口已经被同账号另一条会话占着（sshd 试图 bind 撞上
-///   EADDRINUSE，两种服务端拒绝在协议层是同一个消息，客户端天然
-///   分辨不出"为什么"被拒，见 tests/ssh_tunnel.rs 里两条
-///   `#[ignore]` 用例上的说明）——这种情况退避重连没有意义，等一小段
-///   固定时间再试才对，落 `ForwardPortBusy`（`PortBusy` 类）。
+///   这条全局请求真的被拒了，比如同账号已经有一条隧道在线（Task 10：
+///   端口本身已经不是客户端能指定的了，"端口没在 PermitListen 里"这类
+///   旧世界的成因跟着申请端口 0 一起消失，但"账号上一条隧道的监听尚未
+///   回收"这条依然会让服务端拒绝这次注册）——这种情况退避重连没有
+///   意义，等一小段固定时间再试才对，落 `ForwardPortBusy`（`PortBusy`
+///   类，Task 10 起不再带端口号——客户端申请的是 0，从不知道具体端口）。
 /// - 其他任何变体（`SendError`——请求都没发出去，会话早已经死了；
 ///   `Disconnect`——等回复的过程中连接断了）：这是链路层面的问题，跟
 ///   "端口是不是被占用"毫无关系，必须走退避重连（`Network` 类），不能
 ///   套用端口占用那套"固定 5 秒、最长 120 秒"的重试节奏——一次网络
 ///   抖动被误判成端口占用，最坏情况是重试 120 秒后放弃，比正常的
 ///   无限退避重连更差。
-fn map_tcpip_forward_error(e: russh::Error, port: u16) -> Error {
+fn map_tcpip_forward_error(e: russh::Error) -> Error {
     match e {
-        russh::Error::RequestDenied => Error::ForwardPortBusy(port),
-        other => Error::SshTransport(format!("反向端口 {port} 注册失败：{other}")),
+        russh::Error::RequestDenied => Error::ForwardPortBusy,
+        other => Error::SshTransport(format!("注册反向端口失败：{other}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code::ServerFingerprint;
     use crate::error::ErrorClass;
 
     // 这条不需要 docker 环境，任何 `cargo test -p rmc-core` 都会跑到——
-    // 它是 R9 真正的证据来源：tests/ssh_tunnel.rs 里
-    // `port_outside_permitlisten_is_port_busy_class` 和
-    // `second_tunnel_on_the_same_port_is_port_busy` 两条都只能观察到
-    // 服务端真的把请求拒了（两种成因在协议层不可分辨，见上面的文档
-    // 注释），没法在集成测试里证明"网络抖动不会被误判成端口占用"这条
-    // 反向命题；这里直接摆事实：给这个函数喂 `SendError`/`Disconnect`，
-    // 断言它们绝不会被判成 PortBusy。
+    // 它直接摆事实：给这个函数喂 `SendError`/`Disconnect`，断言它们
+    // 绝不会被判成 PortBusy。
     //
     // 会让这条测试变红的改法：把 `other => Error::SshTransport(...)`
     // 这个分支删掉，换成跟 `RequestDenied` 一样的 `ForwardPortBusy`
     // （也就是 brief 原文那种"一切失败都算端口占用"的写法）。
     #[test]
     fn request_denied_is_port_busy_but_disconnect_and_send_error_are_network() {
-        let denied = map_tcpip_forward_error(russh::Error::RequestDenied, 22001);
+        let denied = map_tcpip_forward_error(russh::Error::RequestDenied);
         assert_eq!(denied.class(), ErrorClass::PortBusy);
-        assert!(matches!(denied, Error::ForwardPortBusy(22001)));
+        assert!(matches!(denied, Error::ForwardPortBusy));
 
         for e in [russh::Error::Disconnect, russh::Error::SendError] {
-            let mapped = map_tcpip_forward_error(e, 22001);
+            let mapped = map_tcpip_forward_error(e);
             assert_eq!(
                 mapped.class(),
                 ErrorClass::Network,
@@ -479,21 +475,17 @@ mod tests {
     // 预算耗尽后 panic。
 
     use crate::ssh::test_support::{
-        drain_authenticated_and_forward_registered, next_msg, spawn_gateway, test_params,
-        tmp_known_hosts, with_timeout, GatewayConfig,
+        drain_authenticated_and_forward_registered, expect_err, expected_fingerprint, next_msg,
+        spawn_gateway, test_params, test_params_with_fingerprint, with_timeout, GatewayConfig,
     };
 
     #[tokio::test]
     async fn session_close_is_reported_as_a_disconnected_message() {
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(32);
-        let handle = with_timeout(
-            "establish_over",
-            establish_over(conn, &known_hosts, test_params(22001), tx),
-        )
-        .await
-        .unwrap();
+        let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
+            .await
+            .unwrap();
         drain_authenticated_and_forward_registered(&mut rx).await;
 
         handle.shutdown().await;
@@ -503,6 +495,88 @@ mod tests {
             other => panic!("会话结束后应该收到 Disconnected，实际 {other:?}"),
         }
         drop(pending);
+    }
+
+    // --- Task 10：host key 比对连接码指纹、申请端口 0 由服务端回填 ---
+
+    /// 指纹对：认证通过、Authenticated 带指纹、ForwardRegistered 带的是
+    /// 服务端回填的端口。
+    ///
+    /// 改红：`establish_over` 里把 `tcpip_forward("", 0)` 的返回值丢掉、
+    /// `ForwardRegistered` 填 0——第三格红。
+    #[tokio::test]
+    async fn pinned_fingerprint_matches_and_the_port_comes_back_from_the_server() {
+        let (_reads, _pending, conn) = spawn_gateway(GatewayConfig {
+            permitted_port: 22007,
+            ..Default::default()
+        });
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
+            .await
+            .unwrap();
+        match next_msg(&mut rx).await {
+            TunnelMsg::Authenticated { fingerprint } => {
+                assert_eq!(fingerprint, expected_fingerprint())
+            }
+            other => panic!("{other:?}"),
+        }
+        match next_msg(&mut rx).await {
+            TunnelMsg::ForwardRegistered { port } => assert_eq!(port, 22007),
+            other => panic!("{other:?}"),
+        }
+        handle.shutdown().await;
+    }
+
+    /// 指纹错：握手阶段就拒绝，Fatal，**不发 Authenticated**，口令根本
+    /// 没送出去。
+    ///
+    /// 改红：`check_server_key` 里把 `!=` 改成 `==`——第一格红（而且上一
+    /// 条也红）。
+    #[tokio::test]
+    async fn a_wrong_fingerprint_is_fatal_before_any_password_is_sent() {
+        let (reads, _pending, conn) = spawn_gateway(GatewayConfig::default());
+        let (tx, mut rx) = mpsc::channel(32);
+        let wrong = ServerFingerprint::of_ed25519_public(&[3u8; 32]);
+        let err = expect_err(
+            with_timeout(
+                "establish_over",
+                establish_over(conn, test_params_with_fingerprint(wrong), tx),
+            )
+            .await,
+        );
+        assert!(matches!(err, Error::HostKeyMismatch { .. }), "{err:?}");
+        assert_eq!(err.class(), ErrorClass::Fatal);
+        assert!(err.to_string().contains("连接码"), "{err}");
+        assert!(rx.try_recv().is_err(), "不该有任何隧道消息");
+        // 服务端没读到过 USERAUTH：`Sniff` 只数"读到过字节的时间戳"，
+        // 不解密协议，没法直接断言"这批字节到底是不是 USERAUTH"——
+        // 实测过：这里只能确认服务端确实读到过字节（KEX 那几拍），不能
+        // 断言"之后再没有任何读取"，因为 KEX 本身就是多轮的。这条
+        // 断言没带载，删掉比留一条测不出名字声称的事的断言更诚实（见
+        // GLOBAL.md 关于「测试通过但没验证名字声称的事」的规矩）。
+        let _ = reads;
+    }
+
+    /// 服务端拒绝转发（比如同账号已在线）→ PortBusy，不带端口号也说
+    /// 得清。
+    ///
+    /// brief 没有给这条的「改红」，这里自己补：把
+    /// `map_tcpip_forward_error` 里 `russh::Error::RequestDenied =>
+    /// Error::ForwardPortBusy` 换成 `Error::SshTransport(...)`——**已实测**，
+    /// `assert!(matches!(err, Error::ForwardPortBusy), ...)` 当场红
+    /// （实际输出：`SshTransport("MUTATED")`）。
+    #[tokio::test]
+    async fn a_denied_forward_is_port_busy_class() {
+        let (_r, _p, conn) = spawn_gateway(GatewayConfig {
+            accept_forward: false,
+            ..Default::default()
+        });
+        let (tx, _rx) = mpsc::channel(32);
+        let err = expect_err(
+            with_timeout("establish_over", establish_over(conn, test_params(), tx)).await,
+        );
+        assert!(matches!(err, Error::ForwardPortBusy), "{err:?}");
+        assert_eq!(err.class(), ErrorClass::PortBusy);
     }
 
     // R76（第四轮评审，纵深防御）：句柄被**直接丢弃**、完全没有调用
@@ -524,14 +598,10 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_handle_without_shutdown_still_disconnects_the_session() {
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(32);
-        let handle = with_timeout(
-            "establish_over",
-            establish_over(conn, &known_hosts, test_params(22001), tx),
-        )
-        .await
-        .unwrap();
+        let handle = with_timeout("establish_over", establish_over(conn, test_params(), tx))
+            .await
+            .unwrap();
         drain_authenticated_and_forward_registered(&mut rx).await;
 
         // 注意：不是 `handle.shutdown().await`，就是直接丢掉。

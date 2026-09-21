@@ -81,7 +81,13 @@ pub struct Model {
     pub state: State,
     pub sessions: Vec<RemoteSessionInfo>,
     pub preflight: Option<PreflightReport>,
-    pub host_key: Option<(String, bool)>,
+    /// SSH host key 与连接码里的指纹核对一致后的展示值（Task 10：换掉
+    /// 了带 `first_seen` 的 `(String, bool)`——没有「首次记录」这一说，
+    /// 见 `rmc_core::tunnel::TunnelMsg::Authenticated` 上的说明）。
+    pub server_fingerprint: Option<String>,
+    /// 反向端口——由运维服务器按账号回填，客户端从不自己指定
+    /// （Task 10）。
+    pub forward_port: Option<u16>,
     pub connected_since: Option<SystemTime>,
     /// 系统代理与代理认证的现况，诊断页那三行画的就是它。
     ///
@@ -98,7 +104,8 @@ impl Default for Model {
             state: State::Idle,
             sessions: Vec::new(),
             preflight: None,
-            host_key: None,
+            server_fingerprint: None,
+            forward_port: None,
             connected_since: None,
             proxy: None,
         }
@@ -119,16 +126,23 @@ impl Model {
                     self.sessions.clear();
                     self.connected_since = None;
                 }
+                // Task 10：反向端口这一行只在隧道确实还注册着的时候才
+                // 有意义——回到 Idle 或者 Failed 都意味着上一条隧道（如果
+                // 有过）已经不在了，留着旧端口号会让界面显示一个已经
+                // 失效的数字。跟 `sessions`/`connected_since` 不同的是
+                // 这里也在 Failed 清：一次预检失败或者握手失败根本没到
+                // 注册反向端口那一步，不该显示上一轮成功时留下的端口。
+                if matches!(s, State::Idle | State::Failed { .. }) {
+                    self.forward_port = None;
+                }
                 self.state = s;
             }
             TunnelEvent::Preflight(r) => self.preflight = Some(r),
             TunnelEvent::RemoteSessions(list) => self.sessions = list,
-            TunnelEvent::HostKey {
-                fingerprint,
-                first_seen,
-            } => {
-                self.host_key = Some((fingerprint, first_seen));
+            TunnelEvent::ServerVerified { fingerprint } => {
+                self.server_fingerprint = Some(fingerprint);
             }
+            TunnelEvent::ForwardPort(p) => self.forward_port = Some(p),
             TunnelEvent::ConnectedSince(t) => self.connected_since = Some(t),
             // W152/W173：诊断页那三行的唯一来路。**界面不得自己去查**，
             // 理由见 [`crate::diag`] 的 W160 一节与 rmc-core 的
@@ -650,7 +664,7 @@ mod tests {
         })
         .status_card();
         assert_eq!(c.subtitle, e.to_string(), "副标题必须是原样的错误文案");
-        assert!(c.subtitle.contains("host key"), "{}", c.subtitle);
+        assert!(c.subtitle.contains("SSH 身份"), "{}", c.subtitle);
         assert!(c.subtitle.contains("SHA256:bbb"), "{}", c.subtitle);
     }
 
@@ -905,21 +919,57 @@ mod tests {
     }
 
     #[test]
-    fn host_key_first_seen_is_recorded_for_the_diagnostics_page() {
+    fn server_verified_is_recorded_for_the_diagnostics_page() {
         let mut m = Model::default();
-        m.apply(TunnelEvent::HostKey {
+        assert!(m.server_fingerprint.is_none());
+        m.apply(TunnelEvent::ServerVerified {
             fingerprint: "SHA256:aaa".into(),
-            first_seen: true,
         });
-        assert_eq!(m.host_key, Some(("SHA256:aaa".to_string(), true)));
+        assert_eq!(m.server_fingerprint, Some("SHA256:aaa".to_string()));
 
-        // `first_seen = false` 这一格也得走一遍：只测 true 的话，把
-        // `first_seen` 写死成 `true`（诊断页于是永远说"首次记录"）不会红。
-        m.apply(TunnelEvent::HostKey {
+        // 换一个不同的值也得走一遍：只测一次的话，把字段写死成某个固定
+        // 值不会红。
+        m.apply(TunnelEvent::ServerVerified {
             fingerprint: "SHA256:bbb".into(),
-            first_seen: false,
         });
-        assert_eq!(m.host_key, Some(("SHA256:bbb".to_string(), false)));
+        assert_eq!(m.server_fingerprint, Some("SHA256:bbb".to_string()));
+    }
+
+    /// Task 10：反向端口来自服务端回填，回到 `Idle`/`Failed` 时必须清掉
+    /// ——否则界面会显示一个已经失效的端口号（上一轮成功时留下的）。
+    ///
+    /// 改红：把 `apply` 里 `matches!(s, State::Idle | State::Failed { .. })`
+    /// 那个守卫删掉——第二、第三组断言会各自红。
+    #[test]
+    fn forward_port_is_cleared_when_the_session_really_ends() {
+        let mut m = Model::default();
+        assert!(m.forward_port.is_none());
+        m.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        m.apply(TunnelEvent::ForwardPort(22001));
+        assert_eq!(m.forward_port, Some(22001));
+
+        m.apply(TunnelEvent::State(State::Idle));
+        assert!(m.forward_port.is_none(), "回到 Idle 应该清掉上一轮的端口");
+
+        m.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        m.apply(TunnelEvent::ForwardPort(22002));
+        assert_eq!(m.forward_port, Some(22002));
+        m.apply(TunnelEvent::State(State::Failed {
+            class: ErrorClass::Fatal,
+            message: "x".into(),
+        }));
+        assert!(m.forward_port.is_none(), "连接失败也应该清掉上一轮的端口");
+
+        // 反向自证：Backoff（隧道还在等重连，不是"这一轮结束了"）不该
+        // 清——不然一次自动重连过程中，界面上的端口号会先消失再重新
+        // 出现，观感上跟真的断开重连没有区别。
+        m.apply(TunnelEvent::State(State::Connected { degraded: false }));
+        m.apply(TunnelEvent::ForwardPort(22003));
+        m.apply(TunnelEvent::State(State::Backoff {
+            attempt: 1,
+            delay: Duration::from_secs(1),
+        }));
+        assert_eq!(m.forward_port, Some(22003), "Backoff 不该清掉端口");
     }
 
     /// 预检报告是诊断页（Task 9）唯一的数据来源。brief 一个字都没测它——

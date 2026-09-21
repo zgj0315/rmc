@@ -983,18 +983,19 @@ fn both_diagnostics_buttons_work_even_when_the_form_is_not_ready() {
 /// 整棵诊断页树的禁用词扫描，把几种会改变树形状的输入都走一遍。
 #[test]
 fn nothing_the_diagnostics_page_draws_is_banned() {
-    /// 一种会改变诊断页树形状的输入组合：说明、预检结果、代理、host key。
+    /// 一种会改变诊断页树形状的输入组合：说明、预检结果、代理、运维
+    /// 服务器指纹。
     struct Case {
         why: &'static str,
         report: Option<rmc_core::preflight::PreflightReport>,
         proxy: Option<ProxyStatus>,
-        host_key: Option<(String, bool)>,
+        server_fingerprint: Option<String>,
     }
-    let case = |why, report, proxy, host_key| Case {
+    let case = |why, report, proxy, server_fingerprint| Case {
         why,
         report,
         proxy,
-        host_key,
+        server_fingerprint,
     };
     let cases: [Case; 5] = [
         case("还没跑过预检", None, None, None),
@@ -1004,13 +1005,13 @@ fn nothing_the_diagnostics_page_draws_is_banned() {
             "经代理且 CONNECT 建立",
             Some(all_pass()),
             Some(proxy_status(ConnectOutcome::Established)),
-            Some(("SHA256:kM9v7bQe".to_string(), true)),
+            Some("SHA256:kM9v7bQe".to_string()),
         ),
         case(
             "经代理但 CONNECT 没建立",
             Some(tls_intercepted()),
             Some(proxy_status(ConnectOutcome::Failed)),
-            Some(("SHA256:kM9v7bQe".to_string(), false)),
+            Some("SHA256:kM9v7bQe".to_string()),
         ),
     ];
 
@@ -1018,7 +1019,7 @@ fn nothing_the_diagnostics_page_draws_is_banned() {
         let why = c.why;
         let mut model = model_in(State::Idle);
         model.preflight = c.report;
-        model.host_key = c.host_key;
+        model.server_fingerprint = c.server_fingerprint;
         let mut ui = simulator(diagnostics::view(
             &model,
             c.proxy.as_ref(),

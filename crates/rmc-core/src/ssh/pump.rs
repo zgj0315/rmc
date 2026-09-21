@@ -214,10 +214,9 @@ mod tests {
         TunnelParams {
             username: TEST_USER.into(),
             password: Zeroizing::new(TEST_PASSWORD.to_string()),
-            reverse_port: 22001,
             gateway: test_gateway_hostport(),
             appliance,
-            fingerprint: crate::code::ServerFingerprint::of_ed25519_public(&[9u8; 32]),
+            fingerprint: expected_fingerprint(),
         }
     }
 
@@ -238,11 +237,10 @@ mod tests {
         let appliance = HostPort::new("127.0.0.1", appliance_addr.port()).unwrap();
 
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
-            establish_over(conn, &known_hosts, params_with_appliance(appliance), tx),
+            establish_over(conn, params_with_appliance(appliance), tx),
         )
         .await
         .unwrap();
@@ -367,11 +365,10 @@ mod tests {
         let appliance = HostPort::new("127.0.0.1", dead_addr.port()).unwrap();
 
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
-            establish_over(conn, &known_hosts, params_with_appliance(appliance), tx),
+            establish_over(conn, params_with_appliance(appliance), tx),
         )
         .await
         .unwrap();
@@ -447,11 +444,10 @@ mod tests {
             HostPort::new("127.0.0.1", appliance_listener.local_addr().unwrap().port()).unwrap();
 
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
-            establish_over(conn, &known_hosts, params_with_appliance(appliance), tx),
+            establish_over(conn, params_with_appliance(appliance), tx),
         )
         .await
         .unwrap();
@@ -582,6 +578,20 @@ mod tests {
     /// `tracing::warn!`（端口不匹配的 forwarded-tcpip 请求），断言 capture
     /// 机制确实拦到了这一条——证明"日志里没有特征字节"不是在一个从未
     /// 真正捕获过任何事件的空缓冲区上自证。
+    ///
+    /// **控制者补充第 4 条（Task 10）**：这条测试先开一条端口
+    /// 22002（被拒）的通道、再开 22001（接受）的通道，断言只出现一次
+    /// `RemoteSessionOpened`——假 Gateway（`GatewayConfig::default()`）
+    /// 回填的就是 22001（客户端申请端口 0，服务端按账号回填），所以它
+    /// 现在验的是"按服务端回填的 `registered_port` 过滤"，不再是"按
+    /// 客户端写死的 `reverse_port` 过滤"。
+    ///
+    /// 改红：`handler.rs` 的 `server_channel_open_forwarded_tcpip` 里把
+    /// 与 `registered_port` 的比较删掉（比如把 `if want == 0 ||
+    /// connected_port != u32::from(want)` 换成 `if false`）——22002 那次
+    /// `channel_open_forwarded_tcpip` 调用不再被拒绝，
+    /// `assert!(rejected.is_err(), ...)` 当场红。**已实打一枪，见
+    /// task-10-report.md。**
     #[tokio::test]
     async fn forwarded_payload_bytes_never_reach_a_tracing_event() {
         const TO_APPLIANCE_MARKER: &str = "RMC-TO-APPLIANCE-89f2a1c7-DO-NOT-LOG";
@@ -601,11 +611,10 @@ mod tests {
         let appliance = HostPort::new("127.0.0.1", appliance_addr.port()).unwrap();
 
         let (_reads, pending, conn) = spawn_gateway(GatewayConfig::default());
-        let known_hosts = Arc::new(tmp_known_hosts());
         let (tx, mut rx) = mpsc::channel(64);
         let handle = with_timeout(
             "establish_over",
-            establish_over(conn, &known_hosts, params_with_appliance(appliance), tx),
+            establish_over(conn, params_with_appliance(appliance), tx),
         )
         .await
         .unwrap();
