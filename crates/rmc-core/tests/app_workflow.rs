@@ -66,8 +66,21 @@ const STEP_UPLOAD: &str = "上传便携包";
 // Transport / TLS 指纹钉扣 / russh / pump / Supervisor）与真运维服务器
 // 接在一起跑；被它驱动的那一半代码最终交付在 Windows 上，而原来那套
 // docker 集成测试只在 Linux 容器里跑过——这条链路在 Windows 的 socket
-// 与文件系统语义下从来没有被端到端验证过一次。`core.yml` 的 unit job
-// 在 Linux 上跑同一批，两边都跑不是重复：它们验的是两个不同的平台。
+// 与文件系统语义下从来没有被端到端验证过一次。**只有 `windows-build`
+// 那一侧是这个理由。**
+//
+// **修复轮 1/5（复审 R12-6）订正一句假话。** 上一版这里写的是"两边都跑
+// 不是重复：它们验的是两个不同的平台"——这句话对 `linux-checks` **不
+// 成立**：它跑在 ubuntu-24.04，跟 `core.yml` 的 `unit` job 同平台、
+// 同一批 e2e，就是在同一个操作系统上把同样的 15 条又跑了一遍，是**真的
+// 冗余**。
+//
+// 那为什么还留着（brief 要求两个 job 都加，本轮不改行为）：这条命令是
+// **两个 job 共用的同一个常量**，让它们一致，"Windows 上跑的跟 Linux 上
+// 跑的是同一条命令"这件事就由类型/常量保证，不靠人记。真要给
+// `linux-checks` 单开一条窄一点的命令，就多出一个会各自漂移的真相来源，
+// 而省下的只是一台便宜 runner 上的三秒钟。代价与收益不对等，所以保持
+// 冗余，但**不再把它说成"两个平台"**。
 const TEST_COMMAND: &str = "cargo test -p rmc-win -p rmc-app -p rmc-gateway --no-fail-fast";
 const CLIPPY_COMMAND: &str = "cargo clippy -p rmc-win -p rmc-app --all-targets -- -D warnings";
 

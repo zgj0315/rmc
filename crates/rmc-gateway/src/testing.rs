@@ -181,15 +181,50 @@ impl TestGateway {
     pub fn add_account(&self, name: &str) -> (ConnectionCode, Zeroizing<String>) {
         let name = AccountName::parse(name).expect("测试里的账号名应当合法");
         let store = AccountStore::open(&self.data, &self.cfg, self.addr().port());
-        let pw = (0..5)
-            .find_map(|_| {
-                let free = {
-                    let l = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-                    l.local_addr().ok()?.port()
-                };
-                store.add(&name, Some(free), "").map(|(_, pw)| pw).ok()
-            })
-            .expect("5 次都没探到一个能用的反向端口");
+        // 改红（实测过）：把 `accounts.rs` 里
+        // `            if file.accounts.iter().any(|a| &a.name == name) {`
+        // 换成 `            if true {`（`store.add` 稳定失败），下面这个
+        // panic 的文案现在说得出真正的原因：
+        // ```text
+        // 给账号 zhang 挑反向端口试了 5 次都没成；最后一次的失败是：
+        // 端口 57224：账号库：账号 zhang 已存在（吊销过的账号名不能复用，换一个名字）
+        // ```
+        // 上一版同样的注入只会报一句"5 次都没探到一个能用的反向端口"。
+        //
+        // 修复轮 1/5（复审 R12-8）：上一版是 `(0..5).find_map(...).expect(
+        // "5 次都没探到一个能用的反向端口")`——它把 `store.add` 的**每一种**
+        // 失败都吞掉：账号重名、账号表 TOML 损坏、磁盘满、数据目录没权限，
+        // 一律被报成「端口探测失败」。重试机制本身是对的（挑号是 TOCTOU，
+        // 见下面），但诊断不该被它吃掉。现在把最后一次的 `Err` 原文带进
+        // panic 文案，重试几次也照样说得清到底败在哪。
+        let mut last_err: Option<String> = None;
+        let mut pw = None;
+        for _ in 0..5 {
+            let free = match std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr().map(|a| a.port()))
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = Some(format!("探空闲端口失败：{e}"));
+                    continue;
+                }
+            };
+            match store.add(&name, Some(free), "") {
+                Ok((_, p)) => {
+                    pw = Some(p);
+                    break;
+                }
+                Err(e) => last_err = Some(format!("端口 {free}：{e}")),
+            }
+        }
+        let pw = pw.unwrap_or_else(|| {
+            panic!(
+                "给账号 {name} 挑反向端口试了 5 次都没成；最后一次的失败是：{}",
+                last_err
+                    .as_deref()
+                    .unwrap_or("（没记到错误，这本身就不正常）")
+            )
+        });
         // `.expect`：`addr()` 是 `TcpListener::local_addr()` 的返回值，
         // 一个真的绑上了的监听地址端口不可能是 0，而 `ConnectionCode::new`
         // 只在端口为 0 时才拒绝。
@@ -303,15 +338,25 @@ impl russh::server::Handler for ApplianceHandler {
 }
 
 impl FakeAppliance {
-    /// 监听 `127.0.0.1:0`。大多数用例用这个——它们直接调
-    /// `SshTunnelFactory`，不经过 `Command::Start` 的地址关系校验。
+    /// **只监听 `127.0.0.1:0`，永远不绑别的地址。**
+    ///
+    /// 修复轮 1/5（复审 R12-4）：上一版为了让走 `Command::Start` 的那两条
+    /// 用例过得了「一体机不能是本机回环」那道校验，提供过一个
+    /// `start_at(ip)` 并在那两条里传 `0.0.0.0`——于是测试跑的那几秒里，
+    /// 一台认 `root`/`appliance-pw`、任何 `exec` 都照回 `ok:<命令>` 的
+    /// SSH 服务端对**整个局域网**可见。在共享的 CI runner 上这是一个不该
+    /// 存在的暴露面，而且它对测试本身一点用都没有。
+    ///
+    /// 现在的做法：监听**只**绑回环，客户端那一侧仍然拨 `0.0.0.0`
+    /// ——`0.0.0.0` 在 `HostPort::is_loopback()` 眼里不是回环写法（过得了
+    /// 校验），而内核会把「连到 INADDR_ANY」落到本机上，于是字节实际走的
+    /// 就是回环。实测取到的服务端 accept 到的对端地址是 `127.0.0.1:…`，
+    /// 见 [`non_loopback_self_ip`] 的文档。暴露面整个消失，别的一个字没改。
     pub async fn start() -> Self {
         Self::start_at(IpAddr::V4(Ipv4Addr::LOCALHOST)).await
     }
 
-    /// 监听指定地址。走 `Supervisor` + `Command::Start` 的那两条用例必须
-    /// 用一个**不是回环写法**的地址——见 [`non_loopback_self_ip`]。
-    pub async fn start_at(ip: IpAddr) -> Self {
+    async fn start_at(ip: IpAddr) -> Self {
         // host key 走跟 `Identity` 同一条路。**不要**用
         // `PrivateKey::random(&mut rand::rngs::OsRng, ...)`：`ssh-key`
         // 那个 `random` 要 `rand_core` 0.10 的 `CryptoRng`，本 workspace
@@ -463,8 +508,8 @@ pub async fn engineer_exec(
 
 // ------------------------------------------------- 非回环的本机可达地址
 
-/// 找一个**本机自己连得上、但 `HostPort::is_loopback()` 判定为"不是回环"**
-/// 的地址。
+/// 一个**在 `HostPort::is_loopback()` 眼里不是回环写法、但拨过去真的能打到
+/// 本机回环监听**的地址。今天它就是 `0.0.0.0`，而且是探测核实过的那一个。
 ///
 /// # 为什么需要这么一个别扭的东西
 ///
@@ -472,72 +517,86 @@ pub async fn engineer_exec(
 /// （方案 §3.1：一体机在客户内网、运维服务器在公网，两者永不重合），
 /// 而它是公开的 `Command::Start` 的必经之路——`ValidatedAddresses::for_test`
 /// 那条旁路是 `#[cfg(test)] pub(crate)`，`tests/e2e.rs` 是外部 crate，
-/// 看不见它。于是走 `Supervisor` 的那两条端到端用例没法把假一体机放在
-/// `127.0.0.1` 上。（不走 supervisor 的用例直接调 `SshTunnelFactory`，
-/// 不经过这道校验，照常用 `127.0.0.1`。）
+/// 看不见它。于是走 `Supervisor` 的那两条端到端用例没法把一体机地址**写成**
+/// `127.0.0.1`。（不走 supervisor 的用例直接调 `SshTunnelFactory`，不经过
+/// 这道校验，照常用 `127.0.0.1`。）
 ///
-/// # 为什么是"探测 + 核实"，不是直接挑一个地址
+/// # 字节其实走的是回环——这里绕开的只是那道**输入校验**
 ///
-/// 第一版打算用"UDP socket connect 到一个外部地址、读回本地 IP"这个常见
-/// 技巧。**在开发这台机器上当场被证伪**：它返回 `198.18.0.1`（一条 VPN
-/// 的 utun 地址），往那个地址上 bind 成功、connect 却永远挂着——20 秒
-/// 超时杀掉。所以这里对每一个候选都**真的做一次 bind + accept + connect
-/// 往返**，往返成功才用它。探测本身就是证据，不需要相信任何一条关于
-/// "这台机器的网络长什么样"的假设。
+/// 修复轮 1/5（复审 R12-4）订正了上一版的做法。要分清两件事：
 ///
-/// 候选顺序：
-/// 1. `0.0.0.0` —— Linux/macOS 上 connect 到 INADDR_ANY 会落到本机，
-///    而 `Ipv4Addr::UNSPECIFIED.is_loopback()` 是 `false`。本机实测通过。
-/// 2. UDP 技巧探出来的本机地址 —— Windows 上 (1) 的行为没有保证，这一条
-///    兜底（GitHub 的 runner 都有一块私网网卡）。
+/// - **`0.0.0.0` 只是写给 `ValidatedAddresses::validate` 看的那个字符串。**
+///   `Ipv4Addr::UNSPECIFIED.to_canonical().is_loopback()` 是 `false`，所以
+///   它过得了那道「一体机不能是本机回环」的校验。这道校验防的是"把隧道接回
+///   客户端自己身上"这类**配置错误**，它看的是地址的**书写形式**
+///   （`is_loopback` 的文档自己写明了这一点：纯字符串/数值判断，不做解析）。
+/// - **真正的数据路径仍然是回环。** [`FakeAppliance`] 只绑 `127.0.0.1`；
+///   内核把"连到 INADDR_ANY"落到本机，连接就打在那个回环监听上。
+///   实测（探针原文记在 task-12-fix-1-report.md）：拨 `0.0.0.0:56642`，
+///   只绑 `127.0.0.1` 的那个监听 accept 到的对端是 `127.0.0.1:56643`。
 ///
-/// 一个都不通时 **panic**，不是静默跳过：一条"环境不满足就悄悄不验"的
-/// 测试，跟一条假绿的区别只在措辞上。
+/// 所以这里**没有**把任何东西暴露到局域网上。上一版是真暴露过——它让假
+/// 一体机自己去绑 `0.0.0.0`，那台认 `root`/`appliance-pw`、任何 `exec`
+/// 都照回 `ok:<命令>` 的 SSH 服务端在测试期间对整个局域网可见。
+///
+/// # 为什么是"探测 + 核实"，不是直接写死一个地址
+///
+/// 探测本身就是证据，不需要相信任何一条关于"这台机器的网络长什么样"的假设。
+/// 这不是洁癖：第一版打算用"UDP socket connect 到一个外部地址、读回本地
+/// IP"这个常见技巧当候选，**在开发这台机器上当场被证伪**——它返回
+/// `198.18.0.1`（一条 VPN 的 utun 地址），bind 上去成功、connect 却永远挂着。
+///
+/// # 为什么候选只剩一个（复审 R12-4 的第二半，如实订正）
+///
+/// 复审要求把"第二候选（UDP 探出的网卡地址）是 Windows 兜底、在这台机器上
+/// 从没被验证过"写进文档。照做的时候发现一件更要紧的事：**换成"监听只绑
+/// 回环"之后，那个候选在任何平台上都不可能成立**，不只是"Linux/macOS 上
+/// 执行不到"。理由是纯粹的：监听只在 `127.0.0.1` 上，拨网卡地址的包不会
+/// 落到它身上，连接必然被拒——跟操作系统无关。实测也是这个结果（拨
+/// `198.18.0.1:<回环监听的端口>` 挂死，30 秒 alarm 杀掉）。
+///
+/// 留着一个**注定过不了自己那道核实**的候选，只会让读代码的人以为
+/// Windows 上有兜底。所以删掉了，并把话说清楚：
+///
+/// **如果哪天 Windows 上 `0.0.0.0` 这个候选真的探不通**，这个函数会
+/// panic，panic 文案里写明了该怎么办。不要退回"让假一体机去绑网卡地址"
+/// ——那是把 R12-4 修掉的暴露面又加回来。
+///
+/// 一个候选都不通时 **panic，不是静默跳过**：一条"环境不满足就悄悄不验"
+/// 的测试，跟一条假绿的区别只在措辞上。
 pub async fn non_loopback_self_ip() -> IpAddr {
-    let mut tried = Vec::new();
-    for candidate in candidates() {
-        if round_trips(candidate).await {
-            return candidate;
-        }
-        tried.push(candidate.to_string());
+    let candidate = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    if reaches_a_loopback_listener(candidate).await {
+        return candidate;
     }
     panic!(
-        "找不到一个「本机连得上、又不是回环写法」的地址（试过：{}）。\
-         走 Supervisor 的端到端用例需要它，因为 Command::Start 会拒绝回环的一体机地址。",
-        tried.join("、")
+        "拨 {candidate} 打不到一个只绑 127.0.0.1 的监听，这台机器上没有可用的\
+         「不是回环写法、又真的能连到本机」的地址。走 Supervisor 的那两条端到端\
+         用例需要它，因为 Command::Start 会拒绝写成回环的一体机地址。\n\
+         要修的话：给这台机器的 hosts 加一个解析到 127.0.0.1 的名字（`is_loopback`\
+         只特判字面量 `localhost`），或者在 rmc-core 里给测试开一条受控的旁路。\n\
+         **不要**改成让 FakeAppliance 去绑网卡地址——那会把一台认得出口令的\
+         SSH 服务端暴露到局域网上，正是修复轮 1/5 的 R12-4 刚拆掉的东西。"
     );
 }
 
-fn candidates() -> Vec<IpAddr> {
-    let mut v = vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)];
-    // UDP 的 `connect` 不发任何数据包，只是给 socket 定一个默认对端，
-    // 顺带让内核挑好出口网卡——拿的就是那块网卡的地址。TEST-NET-1
-    // （192.0.2.0/24，RFC 5737）永远不会被真的路由到。
-    if let Ok(s) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
-        if s.connect(("192.0.2.1", 9)).is_ok() {
-            if let Ok(local) = s.local_addr() {
-                if !local.ip().is_unspecified() {
-                    v.push(local.ip());
-                }
-            }
-        }
-    }
-    v
-}
-
-/// 在 `ip` 上绑一个监听，从本机连回去，确认真的能建立连接。
-async fn round_trips(ip: IpAddr) -> bool {
-    let Ok(listener) = tokio::net::TcpListener::bind((ip, 0)).await else {
+/// 绑一个**只在回环上**的监听，从 `via` 这个地址拨过去，确认连得上而且
+/// 服务端真的 accept 到了。两头都确认，少一头都可能是假信号。
+async fn reaches_a_loopback_listener(via: IpAddr) -> bool {
+    let Ok(listener) = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await else {
         return false;
     };
-    let Ok(addr) = listener.local_addr() else {
+    let Ok(local) = listener.local_addr() else {
         return false;
     };
+    let target = SocketAddr::new(via, local.port());
     let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
-    let connected =
-        tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
-            .await
-            .is_ok_and(|r| r.is_ok());
+    let connected = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(target),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok());
     let accepted = tokio::time::timeout(Duration::from_secs(3), accept)
         .await
         .is_ok_and(|j| matches!(j, Ok(Ok(()))));

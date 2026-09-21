@@ -97,15 +97,23 @@ const STEP_STATIC_CHECK: &str = "确认是静态链接";
 const STEP_UPLOAD_GATEWAY: &str = "上传运维服务器二进制";
 const STEP_CARGO_DENY: &str = "cargo-deny";
 
-/// 运维服务器的发布目标与产物名。三处（构建命令、静态性检查、上传
-/// 路径）必须说的是同一个三元组，否则会出现"构建了 A、检查了 B、
-/// 上传了 C"这种各自为政、每一步单看都对的退化。
 /// `unit` job 的测试命令，一个字都不能多、不能少。见
 /// `unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset`。
+/// `-p rmc-gateway` 是那 15 条进程内端到端在 CI 里唯一的运行处。
 const UNIT_TEST_COMMAND: &str = "cargo test -p rmc-core -p rmc-gateway";
 
+/// 运维服务器的发布目标与产物名。下面三个常量必须说的是同一个三元组
+/// （构建命令的 `--target`、静态性检查读的那个路径、上传的 `path`/`name`），
+/// 否则会出现"构建了 A、检查了 B、上传了 C"这种各自为政、每一步单看都对、
+/// 合起来毫无意义的退化——`gateway_release_job_builds_a_static_musl_binary_
+/// and_uploads_it` 拿这三个常量把三步焊在一起。
+///
+/// （修复轮 1/5，复审 R12-5：这段注释上一版误挂在 `UNIT_TEST_COMMAND`
+/// 头上，而下面这三个常量一条注释都没有。）
 const MUSL_TARGET: &str = "x86_64-unknown-linux-musl";
+/// 见 [`MUSL_TARGET`]。`--target` 决定了产物落在这个路径下。
 const GATEWAY_BINARY: &str = "target/x86_64-unknown-linux-musl/release/rmc-gateway";
+/// 见 [`MUSL_TARGET`]。下载发布产物的人按这个名字找它。
 const GATEWAY_ARTIFACT: &str = "rmc-gateway-linux-x86_64";
 
 #[test]
@@ -508,6 +516,61 @@ fn no_step_in_any_job_is_silently_disabled_with_if_false() {
             assert!(
                 !step_is_disabled(step),
                 "job {job_name} 的 step {name:?} 带 if: false，会被静默跳过"
+            );
+        }
+    }
+}
+
+// **修复轮 1/5，复审 R12-2，must-fix。**
+//
+// 上一版随那 9 条 `integration` 断言一起，把 core.yml 的 **step 级**
+// `continue-on-error` 守卫也丢掉了（原来它只以一条
+// `ignored_tests_step_really_runs_the_ignored_tests_and_can_fail_the_build`
+// 里的单点检查存在，跟着那一步一起没了）。复审实测：给「单元与端到端
+// 测试」这一步加一行 `continue-on-error: true`，`ci_workflow.rs` **16 条
+// 一条不红**——也就是说新写的那 15 条端到端在 CI 里失败也不会让 job 变红。
+// 「确认是静态链接」那一步同理：核不过也照样上传、照样绿。
+//
+// `no_job_has_a_continue_on_error_or_a_top_level_conditional` 守的是
+// **job 级**那个同名字段，管不到 step 级——这是两个独立的字段、两个
+// 独立的洞。`tests/app_workflow.rs` 早就对 app.yml 的每个 step 查了这一
+// 条（它那段注释里记着同一次实测：加上它，14 条全绿），这里补齐。
+//
+// 这个洞的成本**是随时间涨的**：工作流的步骤只会越加越多。
+//
+// 改红（**两处都实测过**）：
+//
+// 1. 给 `unit` job 的「单元与端到端测试」加一行 `continue-on-error: true`：
+//    ```text
+//    test no_step_in_any_job_has_continue_on_error ... FAILED
+//    job unit 的 step "单元与端到端测试" 带 continue-on-error：它失败了
+//    job 还是绿的。这一步如果是跑测试或核对产物，等于把它整个关掉了
+//    ```
+// 2. 给 `gateway-release` job 的「确认是静态链接」加同一行：
+//    ```text
+//    job gateway-release 的 step "确认是静态链接" 带 continue-on-error：…
+//    ```
+//
+// 两次都是 `16 passed; 1 failed`——也就是说这个洞**只**被这一条拦住，
+// 原有的 16 条一条都不红。值是 `false` 也一样红：这里要求的是这个字段
+// **根本不出现**，见下面的说明。
+#[test]
+fn no_step_in_any_job_has_continue_on_error() {
+    let doc = doc();
+    for job_name in ALL_JOBS {
+        for step in steps(job(&doc, job_name)) {
+            let name = step["name"].as_str().unwrap_or("<unnamed>");
+            // 要求字段**不存在**，而不是"值不能是 true"：`continue-on-error`
+            // 接受表达式（`${{ ... }}`），按值判真假会漏掉表达式写法，
+            // 那正是 `step_is_disabled` 在 `if: ${{ false }}` 上栽过的同一
+            // 个形状。今天这三个 job 的 step 一个都没有这个字段；将来真要
+            // 加，来改这条断言的人必须显式想一遍「这一步失败了该不该让
+            // 整条工作流变红」。
+            assert!(
+                step["continue-on-error"].is_badvalue(),
+                "job {job_name} 的 step {name:?} 带 continue-on-error：\
+                 它失败了 job 还是绿的。这一步如果是跑测试或核对产物，\
+                 等于把它整个关掉了"
             );
         }
     }

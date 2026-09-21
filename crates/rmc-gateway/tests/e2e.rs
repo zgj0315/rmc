@@ -77,6 +77,38 @@ fn hostport(addr: SocketAddr) -> HostPort {
     HostPort::new(&addr.ip().to_string(), addr.port()).expect("真实监听地址必定合法")
 }
 
+/// 把一个**回环上的**监听地址，写成一个 `ValidatedAddresses::validate`
+/// 不会拒绝的形式——今天是 `0.0.0.0:<同一个端口>`。
+///
+/// 只有走 `Supervisor` + `Command::Start` 的那两条用例需要它：那条公开
+/// 入口会拒绝"一体机地址指向本机回环"，而它唯一的旁路
+/// （`ValidatedAddresses::for_test`）是 `#[cfg(test)] pub(crate)`，这个
+/// 外部测试 crate 看不见。
+///
+/// **换掉的只是写法，不是数据路径**：[`FakeAppliance`] 只绑 `127.0.0.1`，
+/// 内核把"连到 INADDR_ANY"落到本机，字节实际走的仍然是回环。
+/// 详见 `rmc_gateway::testing::non_loopback_self_ip` 的文档——那个函数会
+/// 先**实测核实**这条路真的通，再把地址交出来。
+/// 改红（实测过）：把 `testing.rs` 里 `FakeAppliance::start()` 的
+/// `        Self::start_at(IpAddr::V4(Ipv4Addr::LOCALHOST)).await` 换成
+/// `        Self::start_at(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).await`
+/// （假一体机又去绑 `0.0.0.0` 了，也就是 R12-4 拆掉的那个暴露面）：
+/// ```text
+/// 这个夹具的前提是假一体机只绑在回环上，实际 0.0.0.0:57226
+/// ```
+/// 下面这条 `assert!` 不是装饰：它是"假一体机绝不绑到回环以外"这条
+/// 不变式在测试里唯一的钉子。
+async fn dialable_as_non_loopback(appliance: SocketAddr) -> HostPort {
+    assert!(
+        appliance.ip().is_loopback(),
+        "这个夹具的前提是假一体机只绑在回环上，实际 {appliance}"
+    );
+    hostport(SocketAddr::new(
+        non_loopback_self_ip().await,
+        appliance.port(),
+    ))
+}
+
 /// 同一台服务器、同一个账号，但把连接码里的指纹换成另一把钥匙的。
 /// 用在"指纹不符"那两条上——除了指纹，其它一切都是对的，所以失败只可能
 /// 来自指纹比对本身。
@@ -136,19 +168,41 @@ async fn msgs_until(
     seen
 }
 
+/// 等一个满足 `pred` 的状态。
+///
+/// 修复轮 1/5（复审 R12-3）改了两件事，它们都是**诊断**问题，不是正确性
+/// 问题——但这条流水线上，一条在 CI 上红掉却说不出原因的测试，下一个人
+/// 多半是去把它关掉，而不是来查。
+///
+/// 1. **超时那条路原来会把唯一的线索整个丢掉。** `seen` 是在传给
+///    `within` 的那个 async 块里攒的，只有 `Err(e)` 分支打印它；走超时
+///    时整个 future 被丢弃，`seen` 跟着没了。于是第 13 条在 CI 上红掉
+///    只给一句"重启之后重新连上 超过 30s 没有结果"，而真相（状态早就
+///    进了 `Failed{Fatal, 指纹不一致}`）两秒钟就有了。现在 `seen` 活在
+///    函数自己的栈上，超时的 panic 文案会把这一路看到的状态全列出来。
+/// 2. **路上出现 `State::Failed` 立刻炸，不再干等满 30 秒。**
+///    `Failed` 是 `ErrorClass::Fatal` 的终态，Supervisor 不会再自己走出
+///    去——继续等只是在浪费那 30 秒，然后给一句没有信息量的超时。
+///    这两条用例里 `Failed` 从来不是期望值；真要等它的话 `pred` 会先
+///    命中并直接返回，所以这道检查不会挡住任何正当用法。
 async fn wait_state(
     rx: &mut broadcast::Receiver<TunnelEvent>,
     what: &str,
     pred: impl Fn(&State) -> bool,
 ) -> State {
     let mut seen: Vec<State> = Vec::new();
-    within(what, async {
+    let outcome = tokio::time::timeout(STEP_TIMEOUT, async {
         loop {
             match rx.recv().await {
                 Ok(TunnelEvent::State(s)) => {
                     if pred(&s) {
                         return s;
                     }
+                    assert!(
+                        !matches!(s, State::Failed { .. }),
+                        "等 {what} 的路上进了终态 {s:?}——Fatal 类不会自己走出去，\
+                         再等下去只会白等一个没有信息量的超时。这一路看到的是：{seen:?}"
+                    );
                     seen.push(s);
                 }
                 Ok(_) => {}
@@ -156,7 +210,13 @@ async fn wait_state(
             }
         }
     })
-    .await
+    .await;
+    match outcome {
+        Ok(s) => s,
+        Err(_) => {
+            panic!("{what} 超过 {STEP_TIMEOUT:?} 没有结果；这一路上看到的状态依次是：{seen:?}")
+        }
+    }
 }
 
 /// 一个"确实没人监听"的本机端口：绑一个、记下号、放掉，再回连一次确认
@@ -939,16 +999,29 @@ fn detail_of(r: &preflight::PreflightReport, name: &str) -> String {
 
 /// `Timings::fast()` 的 `sweep` 是 200ms，所以一个扫描周期之内就该被踢掉。
 ///
-/// 改红（实测过）：`crates/rmc-gateway/src/server.rs` 的
+/// 改红：**两个方向各打了一枪，都实测过**——这条测试从修复轮 1/5 起
+/// 有正反两半（见下面那段反事实对照的说明），两半都得带载。
+///
+/// **正向（踢不动人）**：`crates/rmc-gateway/src/server.rs` 的
 /// `revocation_sweep` 里 `                for (name, handle, port) in doomed {`
 /// 换成 `                for (name, handle, port) in doomed.into_iter().take(0) {`
 /// ——扫描照跑、名单照算，就是一个都不踢：
 /// ```text
-/// panicked at crates/rmc-gateway/tests/e2e.rs:
-/// 吊销之后一个扫描周期内（这里放宽到 1 秒）必须收到 Disconnected
+/// 吊销之后一个扫描周期内（这里放宽到 1 秒）必须收到 Disconnected: Elapsed(())
 /// ```
 /// （用 `.take(0)` 而不是逐字删掉那句 `handle.disconnect(...)`：后者跨
 /// 三行，单行注入改不动；`.take(0)` 是同一个效果的干净单行注入。）
+///
+/// **反向（见谁踢谁）**：把同一个函数里
+/// `                    .filter(|(name, _)| !shared.accounts.is_active(name.as_str()))`
+/// 换成 `                    .filter(|(name, _)| { let _ = name; true })`
+/// ——扫描不再看账号还启不启用，见到隧道就踢：
+/// ```text
+/// 对照组：账号还启用着的时候，隧道不该在这 1 秒里自己断掉——它一断，
+/// 下面那条「吊销之后 1 秒内断开」就跟吊销没关系了。实际收到了 "SSH 会话已断开"
+/// ```
+/// 这一枪恰好落在反事实对照上，也正是它存在的理由：**光有正向那一半，
+/// 这个注入是绿的**（隧道确实在吊销后 1 秒内断了，只是跟吊销无关）。
 #[tokio::test]
 async fn a_revoked_account_is_disconnected_within_one_sweep() {
     let gw = TestGateway::start().await;
@@ -963,6 +1036,45 @@ async fn a_revoked_account_is_disconnected_within_one_sweep() {
     .await
     .expect("建隧道");
     forwarded_port(&mut rx).await;
+    assert_eq!(
+        gw.running().tunnels_snapshot().len(),
+        1,
+        "夹具自检：吊销之前服务端这一侧应当正有一条隧道"
+    );
+
+    // **反事实对照（修复轮 1/5，复审 R12-7 的落实）。**
+    //
+    // 复审的判断是对的：只断言"1 秒内收到了 Disconnected"，分不开
+    // 「被吊销扫描踢掉」与「这 1 秒里因为别的原因断了」（心跳失联、
+    // 服务端崩掉、隧道自己出错）。
+    //
+    // 复审给的办法是断言 `reason.contains("吊销")`。**那条做不到，实测
+    // 过**：客户端 `TunnelMsg::Disconnected.reason` 是
+    // `ssh/mod.rs::spawn_disconnect_watcher` **本地造的**一个固定字符串
+    // "SSH 会话已断开"——服务端 `handle.disconnect(ByApplication,
+    // "账号已吊销", ..)` 里那句描述根本没被带到这个字段上；服务端审计
+    // 日志那条 `TunnelDown` 的 reason 同样是固定的"会话结束"
+    // （`TunnelGuard::drop`）。整条路径上没有任何一处"因为吊销"的凭据
+    // 可供断言。实测原文见 task-12-fix-1-report.md。
+    //
+    // 改用**反事实对照**拿同一个结论，而且比字符串匹配更硬：同一条隧道、
+    // 同一个 1 秒预算，先在账号**仍然启用**的状态下等一次，确认它**不会**
+    // 自己断；再吊销，确认它断了。两次之间唯一的差别就是那一次 `revoke`。
+    // 真有"这 1 秒里碰巧会断"的毛病，下面这一等会先红。
+    let spontaneous = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let TunnelMsg::Disconnected { reason } = next_msg(&mut rx).await {
+                return reason;
+            }
+        }
+    })
+    .await;
+    assert!(
+        spontaneous.is_err(),
+        "对照组：账号还启用着的时候，隧道不该在这 1 秒里自己断掉——它一断，\
+         下面那条「吊销之后 1 秒内断开」就跟吊销没关系了。实际收到了 {:?}",
+        spontaneous.unwrap_or_default()
+    );
 
     gw.revoke("zhang");
 
@@ -974,9 +1086,14 @@ async fn a_revoked_account_is_disconnected_within_one_sweep() {
         }
     })
     .await;
+    disconnected.expect("吊销之后一个扫描周期内（这里放宽到 1 秒）必须收到 Disconnected");
+
+    // 再加一条服务端侧的证据：隧道条目真的被摘掉了。只看客户端收到
+    // `Disconnected` 不够——那只说明客户端这一侧察觉到会话没了。
+    let after = gw.running().tunnels_snapshot();
     assert!(
-        disconnected.is_ok(),
-        "吊销之后一个扫描周期内（这里放宽到 1 秒）必须收到 Disconnected"
+        after.is_empty(),
+        "吊销之后服务端的隧道表应当空了，实际还有：{after:?}"
     );
 
     handle.shutdown().await;
@@ -1014,20 +1131,27 @@ async fn a_revoked_account_is_disconnected_within_one_sweep() {
 /// `        let cfg = GatewayConfig::load(&data)` 之前插一行
 /// `{ let _ = std::fs::remove_file(data.identity_key()); Identity::create_in(&data).unwrap(); }`
 /// ——同一个数据目录、同一份账号表与端口，**只换掉身份密钥**，服务端照常
-/// 起来：
+/// 起来。修复轮 1/5（复审 R12-3）给 [`wait_state`] 补了诊断之后，这一枪的
+/// 实测输出是：
 /// ```text
-/// panicked at crates/rmc-gateway/tests/e2e.rs:
-/// 重启之后重新连上 超过 30s 没有结果
+/// test the_supervisor_reconnects_… ... FAILED（1.92 秒）
+/// 等 重启之后重新连上 的路上进了终态 Failed { class: Fatal, message:
+/// "运维服务器的身份与连接码里的指纹不一致：invalid peer certificate:
+/// ApplicationVerificationFailure" }——Fatal 类不会自己走出去，再等下去
+/// 只会白等一个没有信息量的超时。这一路看到的是：[Connecting]
 /// ```
 /// 新身份 = 新指纹，客户端手里那份凭据的指纹对不上，永远回不到
 /// `Connected`。这才是这条测试真正钉住的东西。
+///
+/// **对比修复前同一枪的输出**：`31.15 秒`，一句
+/// `重启之后重新连上 超过 30s 没有结果`，没有任何原因。两者都是红，
+/// 但只有后者能让人在 CI 日志上直接看懂发生了什么——这就是 R12-3 要修的
+/// 东西。
 #[tokio::test]
 async fn the_supervisor_reconnects_after_the_server_restarts_with_the_credentials_it_kept() {
     let logs = tempfile::tempdir().unwrap();
     let gw = TestGateway::start().await;
-    // 一体机地址不能是回环写法：`Command::Start` 会调
-    // `ValidatedAddresses::validate`，它拒绝回环的一体机。
-    let app = FakeAppliance::start_at(non_loopback_self_ip().await).await;
+    let app = FakeAppliance::start().await;
     let (code, pw) = gw.add_account("zhang");
     let gw_addr = gw.addr();
 
@@ -1035,7 +1159,7 @@ async fn the_supervisor_reconnects_after_the_server_restarts_with_the_credential
     cmd.send(Command::Start {
         code,
         password: Zeroizing::new(pw.to_string()),
-        appliance: hostport(app.addr()),
+        appliance: dialable_as_non_loopback(app.addr()).await,
     })
     .await
     .expect("Supervisor 还活着");
@@ -1084,14 +1208,14 @@ async fn the_supervisor_reconnects_after_the_server_restarts_with_the_credential
 async fn the_supervisor_stops_cleanly_and_the_server_frees_the_port() {
     let logs = tempfile::tempdir().unwrap();
     let gw = TestGateway::start().await;
-    let app = FakeAppliance::start_at(non_loopback_self_ip().await).await;
+    let app = FakeAppliance::start().await;
     let (code, pw) = gw.add_account("zhang");
 
     let (cmd, mut ev) = Supervisor::spawn(supervisor_config(&logs), real_deps());
     cmd.send(Command::Start {
         code,
         password: Zeroizing::new(pw.to_string()),
-        appliance: hostport(app.addr()),
+        appliance: dialable_as_non_loopback(app.addr()).await,
     })
     .await
     .expect("Supervisor 还活着");
