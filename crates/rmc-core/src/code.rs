@@ -129,13 +129,16 @@ impl ConnectionCode {
         ip: IpAddr,
         port: u16,
         fingerprint: ServerFingerprint,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CodeError> {
+        if port == 0 {
+            return Err(CodeError::Address("端口不能是 0".into()));
+        }
+        Ok(Self {
             account,
             ip,
             port,
             fingerprint,
-        }
+        })
     }
 
     pub fn parse(s: &str) -> Result<Self, CodeError> {
@@ -189,7 +192,13 @@ impl ConnectionCode {
         &self.fingerprint
     }
 
-    /// 客户端拨号用的地址。IP 字面量必定通过 `HostPort` 的校验。
+    /// 客户端拨号用的地址。
+    ///
+    /// `expect` 在这里够不着：构造 `ConnectionCode` 只有两个口——`new`
+    /// 与 `parse`——都已经在构造那一刻排除了 `HostPort::new` 会拒绝的
+    /// 两种情况：端口 0（`new` 直接检查；`parse` 靠 `.filter(|p| *p != 0)`）
+    /// 与非 IP 主机（`ip` 字段的类型就是 `std::net::IpAddr`，不可能装进
+    /// 一个解析失败的字符串）。字段私有挡住了绕开这两个构造口直接拼字面量。
     pub fn server(&self) -> HostPort {
         HostPort::new(&self.ip.to_string(), self.port).expect("IP 字面量必定是合法主机")
     }
@@ -248,6 +257,7 @@ mod tests {
             22000,
             fp(),
         )
+        .expect("夹具必须合法")
     }
 
     /// 指纹就是公钥的 SHA-256，base64url、不带填充、43 个字符。
@@ -307,7 +317,8 @@ mod tests {
             IpAddr::V6(Ipv6Addr::LOCALHOST),
             22000,
             fp(),
-        );
+        )
+        .expect("夹具必须合法");
         let s = c.to_string();
         assert!(s.contains("@[::1]:22000:"), "{s}");
         assert_eq!(ConnectionCode::parse(&s).unwrap(), c);
@@ -326,7 +337,8 @@ mod tests {
             IpAddr::V6(Ipv6Addr::LOCALHOST),
             22000,
             fp(),
-        );
+        )
+        .expect("夹具必须合法");
         let hp = c.server();
         assert_eq!(hp, HostPort::new("::1", 22000).unwrap());
         // Display 往返也要成立：拼出来的字符串本身能被 HostPort 的
@@ -366,6 +378,24 @@ mod tests {
             Err(CodeError::Domain(d)) => assert_eq!(d, "ops.example.com"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `new` 是构造 `ConnectionCode` 的两个口之一，必须自己挡住端口 0——
+    /// 不能指望调用方先走一遍 `parse` 那条路径的 `.filter(|p| *p != 0)`。
+    /// 少了这道校验，`server()` 会在 `HostPort::new` 里因为「端口不能为
+    /// 0」而返回 `Err`，被 `server()` 的 `.expect(...)` 当场 panic。
+    ///
+    /// 改红：把 `new` 里 `if port == 0 { return Err(...); }` 那两行删掉——
+    /// 这条测试立刻红（`new` 返回 `Ok`，`assert!(matches!(.., Err(..)))` 落空）。
+    #[test]
+    fn new_rejects_port_zero() {
+        let err = ConnectionCode::new(
+            AccountName::parse("a1").unwrap(),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            0,
+            fp(),
+        );
+        assert!(matches!(err, Err(CodeError::Address(_))), "{err:?}");
     }
 
     #[test]
