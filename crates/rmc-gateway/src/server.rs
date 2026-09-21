@@ -955,23 +955,33 @@ mod tests {
         );
     }
 
-    /// **修复轮 1/5，评审 Important 的另一半：`TunnelGuard::drop` 里锁跨
-    /// 磁盘写的那个修法，配的回归网**。
+    /// **语义锚点测试，不是回归网**——修复轮 2/5 按复审的判断改写这条
+    /// 文档注释：这条测试**不检测 `TunnelGuard::drop` 的回归**。它测的
+    /// 是另一个文件里、跟 `TunnelGuard`/`AuditLog` 完全无关的一把独立
+    /// `std::sync::Mutex`；有人把 `TunnelGuard::drop` 悄悄改回危险写法，
+    /// 这条测试**不会**变红——它没有能力检测那件事，读者不该把它读成
+    /// 「这里有保护」。
     ///
-    /// **如实记录这条测试的局限**：它验证的是`TunnelGuard::drop`
-    /// 实际采用的**写法形状**（`let removed = lock(...).remove(...); if
-    /// let Some(x) = removed { ... }`）本身会不会释放锁，**不是**端到端
-    /// 跑一遍 `TunnelGuard::drop` 再去测「锁有没有被占着」——那需要让
-    /// `AuditLog::record` 里那次真实的磁盘写变得可观测地慢（比如注入
-    /// 延迟钩子），而现在的 `AuditLog` 没有这种测试专用的接缝，专门为这
-    /// 一条测试给生产代码加一个可注入延迟的假后端是过度设计。这里退一步，
-    /// 用一把独立的 `std::sync::Mutex` 复现同样的写法形状：body 内
-    /// `try_lock()` 能不能成功，直接说明 scrutinee 的临时 `MutexGuard`
-    /// 有没有活过 `if let` 判断本身。
+    /// 它真正的价值：**证明 `TunnelGuard::drop` 上方那段"为什么不能把
+    /// 两行合并回去"的注释是可执行的、不是空口白话**——`if let` 的
+    /// scrutinee 里放一个 `MutexGuard` 确实会让锁活到 body 结束，先
+    /// `let` 绑定确实能让锁提前释放，这是 Rust 语言语义本身，跟具体在哪
+    /// 个函数里用无关，所以这里选了一把跟生产代码解耦的 `Mutex` 来钉住
+    /// 这个语义事实，而不是拿 `TunnelGuard` 本身当夹具。
     ///
-    /// 改红：把「安全写法」那两行换成 `if let Some(_v) =
-    /// m.lock().unwrap().remove(&1) { ... }`（`TunnelGuard::drop` 修复
-    /// 前的写法）——**实测过**：`try_lock()` 在 body 里失败
+    /// **`TunnelGuard::drop` 真实回归现在由谁负责检测**：`lib.rs` 顶部
+    /// 开的 `#![warn(clippy::significant_drop_in_scrutinee)]`——这条
+    /// clippy lint 直接扫 `if let`/`match` 的 scrutinee 里有没有生命周期
+    /// 显著的 `Drop` 类型（`MutexGuard` 正是典型），有人把
+    /// `TunnelGuard::drop` 改回 `if let Some(info) =
+    /// lock(...).remove(...) { ... }`，`cargo clippy` 会精确报出来（见
+    /// `lib.rs` 上那条 lint 的文档注释）。这条测试与那条 lint 分工：
+    /// lint 守生产代码里的这一类写法，这条测试守"为什么这么改是对的"这个
+    /// 语言事实。
+    ///
+    /// 改红（钉的是这条测试自己，不是 `TunnelGuard::drop`）：把「安全
+    /// 写法」那两行换成 `if let Some(_v) = m.lock().unwrap().remove(&1)
+    /// { ... }`——**实测过**：`try_lock()` 在 body 里失败
     /// （`Err(WouldBlock)`），下面 `assert!(m.try_lock().is_ok(), ...)`
     /// 红：
     /// ```text
@@ -1002,6 +1012,11 @@ mod tests {
         // 生命周期的语义变了，需要重新核实 `TunnelGuard::drop` 的修法
         // 是不是还站得住，而不是这条测试本身写错了。
         m.lock().unwrap().insert(2, 200);
+        // 这一句故意示范 `clippy::significant_drop_in_scrutinee` 想抓的
+        // 那个反模式（`TunnelGuard::drop` 修复前的写法）——这条测试的
+        // 整个意义就是拿它当对照组，所以就地 `#[allow]`，不是绕过真的
+        // 生产代码问题。
+        #[allow(clippy::significant_drop_in_scrutinee)]
         if let Some(v) = m.lock().unwrap().remove(&2) {
             assert_eq!(v, 200);
             assert!(m.try_lock().is_err(), "对照组：这种写法里锁应当还没释放");
