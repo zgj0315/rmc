@@ -40,7 +40,18 @@ impl Default for Timings {
         Self {
             keepalive: Duration::from_secs(10),
             keepalive_max: 3,
-            sweep: Duration::from_secs(10),
+            // **修复轮 1/5，评审 Important，已裁决**：spec 要求吊销
+            // 「最迟 10 秒内」踢掉在线会话。`sweep` 是 `revocation_sweep`
+            // 的 tick 周期——**它必须严格小于 SLA 本身，否则 SLA 不成立**：
+            // 最坏情况是吊销恰好发生在一次 tick 刚扫完之后，要等满一个
+            // `sweep` 周期才会被下一次 tick 扫到，再加上
+            // `handle.disconnect(...).await` 与内部消息循环任务收尾的
+            // 时间。原来这里也是 10 秒，跟 SLA 数值相等——最坏情况必然
+            // 越过 10 秒，不是接近，是确定超。改成 5 秒：最坏情况
+            // ≈ 5 秒 + 断线收尾的时间（毫秒级），稳稳落在 10 秒 SLA 内。
+            // 这条规则（严格小于 SLA）比这个具体数值本身更重要：以后要调
+            // 这个默认值，先想清楚它跟 SLA 的关系，不要只看数字大小。
+            sweep: Duration::from_secs(5),
             handshake: Duration::from_secs(20),
             max_engineers_per_tunnel: 16,
         }
@@ -127,7 +138,26 @@ pub(crate) struct TunnelGuard {
 
 impl Drop for TunnelGuard {
     fn drop(&mut self) {
-        if let Some(info) = lock(&self.shared.tunnels).remove(&self.account) {
+        // **修复轮 1/5，评审 Important，已实测确认并修**：`if let Some(info)
+        // = lock(&self.shared.tunnels).remove(&self.account) { ... }`——
+        // edition 2021 下 `if let` 的 scrutinee 临时值（这里是
+        // `lock(...)` 产生的 `MutexGuard`）活到整个 body 结束，不是
+        // `remove()` 调用完就释放。也就是说下面 `audit.record(...)`
+        // 那次同步磁盘写，是在**仍然持有 `tunnels` 这张表的锁**的情况下
+        // 做的——`tcpip_forward`（建新隧道）与 `revocation_sweep`（每个
+        // 周期收集待踢账号）都要抢这把锁，磁盘变慢时它们都会被这次写
+        // 卡住，不只是这一次 `TunnelDown` 事件慢。`clippy::await_holding_lock`
+        // 抓不到（这里没有 `.await`，`Drop::drop` 也不能是 async），八道
+        // 闸门都是绿的。
+        //
+        // 这里先把 `.remove(...)` 的结果绑到 `removed`，让那个
+        // `MutexGuard` 临时值在这条 `let` 语句结束时就被丢弃——锁在
+        // `audit.record` 之前已经释放，`if let` 的 body 只处理已经拿到手
+        // 的 `Option<TunnelInfo>`，跟锁再无关系。**别把这两行合并回
+        // `if let Some(info) = lock(...).remove(...) { ... }`**——那正是
+        // 锁跨磁盘写的根源。
+        let removed = lock(&self.shared.tunnels).remove(&self.account);
+        if let Some(info) = removed {
             let _ = info.stop.send(true);
             self.shared.audit.record(AuditEvent::TunnelDown {
                 account: self.account.as_str().to_string(),
@@ -901,6 +931,84 @@ mod tests {
     use crate::testing_verifier::{ssh_connect, ssh_connect_echo};
     use rmc_core::code::AccountName;
     use std::time::Duration;
+
+    /// **修复轮 1/5，评审 Important 的裁决，配的这一枪变异**：spec 要求
+    /// 吊销 SLA 是 10 秒，`sweep` 是扫描周期，必须严格小于这个数，否则
+    /// 最坏情况（吊销恰好发生在一次 tick 刚扫完之后）必然越过 SLA——不是
+    /// 概率问题，是确定超时。这条钉的是这个不变式本身，不是随便挑一个
+    /// 数字：哪怕以后有人把默认值从 5 秒改成别的值，只要仍然严格小于
+    /// 10 秒，这条测试还是绿；改回 `>= 10` 秒才会红。
+    ///
+    /// 改红：**实测过**——把 `Timings::default()` 里的 `sweep` 从
+    /// `Duration::from_secs(5)` 改回 `Duration::from_secs(10)`：
+    /// ```text
+    /// assertion failed: Timings::default().sweep < REVOCATION_SLA
+    /// ```
+    #[test]
+    fn the_default_sweep_period_is_strictly_shorter_than_the_ten_second_revocation_sla() {
+        const REVOCATION_SLA: Duration = Duration::from_secs(10);
+        let sweep = Timings::default().sweep;
+        assert!(
+            sweep < REVOCATION_SLA,
+            "sweep（{sweep:?}）必须严格小于吊销 SLA（{REVOCATION_SLA:?}），\
+             否则「吊销恰好发生在一次 tick 刚扫完之后」这个最坏情况必然超时"
+        );
+    }
+
+    /// **修复轮 1/5，评审 Important 的另一半：`TunnelGuard::drop` 里锁跨
+    /// 磁盘写的那个修法，配的回归网**。
+    ///
+    /// **如实记录这条测试的局限**：它验证的是`TunnelGuard::drop`
+    /// 实际采用的**写法形状**（`let removed = lock(...).remove(...); if
+    /// let Some(x) = removed { ... }`）本身会不会释放锁，**不是**端到端
+    /// 跑一遍 `TunnelGuard::drop` 再去测「锁有没有被占着」——那需要让
+    /// `AuditLog::record` 里那次真实的磁盘写变得可观测地慢（比如注入
+    /// 延迟钩子），而现在的 `AuditLog` 没有这种测试专用的接缝，专门为这
+    /// 一条测试给生产代码加一个可注入延迟的假后端是过度设计。这里退一步，
+    /// 用一把独立的 `std::sync::Mutex` 复现同样的写法形状：body 内
+    /// `try_lock()` 能不能成功，直接说明 scrutinee 的临时 `MutexGuard`
+    /// 有没有活过 `if let` 判断本身。
+    ///
+    /// 改红：把「安全写法」那两行换成 `if let Some(_v) =
+    /// m.lock().unwrap().remove(&1) { ... }`（`TunnelGuard::drop` 修复
+    /// 前的写法）——**实测过**：`try_lock()` 在 body 里失败
+    /// （`Err(WouldBlock)`），下面 `assert!(m.try_lock().is_ok(), ...)`
+    /// 红：
+    /// ```text
+    /// assertion failed: m.try_lock().is_ok()
+    /// : 锁没有在 if let body 之前释放
+    /// ```
+    #[test]
+    fn binding_the_removed_value_first_releases_the_lock_before_the_if_let_body() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        let m: Mutex<HashMap<u32, u32>> = Mutex::new(HashMap::from([(1, 100)]));
+
+        // `TunnelGuard::drop` 实际采用的写法：先绑定，再 `if let`。
+        let removed = m.lock().unwrap().remove(&1);
+        if let Some(v) = removed {
+            assert_eq!(v, 100);
+            // 锁应该已经在上一条语句结束时释放：同一线程再 `try_lock`
+            // 应当成功。
+            assert!(m.try_lock().is_ok(), "锁没有在 if let body 之前释放");
+        } else {
+            panic!("没拿到应该在的值");
+        }
+
+        // 对照组：`if let Some(v) = m.lock().unwrap().remove(&k) { ... }`
+        // 这种写法（`TunnelGuard::drop` 修复前用的正是这个形状）——
+        // scrutinee 的 `MutexGuard` 活到 body 结束，body 内 `try_lock`
+        // 应当失败。如果这条对照断言也失败，说明这个 Rust 版本上临时值
+        // 生命周期的语义变了，需要重新核实 `TunnelGuard::drop` 的修法
+        // 是不是还站得住，而不是这条测试本身写错了。
+        m.lock().unwrap().insert(2, 200);
+        if let Some(v) = m.lock().unwrap().remove(&2) {
+            assert_eq!(v, 200);
+            assert!(m.try_lock().is_err(), "对照组：这种写法里锁应当还没释放");
+        } else {
+            panic!("没拿到应该在的值");
+        };
+    }
 
     /// 一个带一个账号的服务端。返回 (running, 口令, 临时目录)。
     ///
