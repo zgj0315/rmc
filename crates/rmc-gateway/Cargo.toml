@@ -50,6 +50,12 @@ tempfile = "3"
 testing = []
 
 [dev-dependencies]
+# crate 自引用开 feature 的标准写法：集成测试（`tests/*.rs`）是独立的
+# crate，它 `use rmc_gateway::testing::…` 时链接的是这一条 dev-dependency
+# 声明的 rmc-gateway，`testing` 因此在 `cargo test` 里默认点亮，不需要
+# 命令行上带 `--features testing`；而 `cargo build --release` 根本不解析
+# dev-dependencies，`testing` 在发布二进制里是关的。
+rmc-gateway = { path = ".", features = ["testing"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 # 修复轮 2/5：只给本 crate 自己的测试编译单元多开一个 `tls12`——Cargo

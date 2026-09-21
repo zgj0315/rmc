@@ -54,36 +54,22 @@ platform...)` 把这条路径收进 core 自己（反向端口范围校验也归
 ## 测试
 
 ```bash
-cargo test -p rmc-core                    # 单元与假隧道测试，不碰网络
-cd ../../gateway/test-env && docker compose up -d --build
-../../crates/rmc-core/tests/fetch-harness-cert.sh
-cargo test -p rmc-core -- --ignored --test-threads=1   # 真实链路，17 条
+cargo test -p rmc-core                    # 单元与假隧道测试，不碰外部网络
+cargo test -p rmc-gateway                 # 含 tests/e2e.rs：真客户端内核 ↔ 真运维服务器
 ```
 
-`--test-threads=1` 是必须的：多个集成用例会争抢同一个反向端口。
+**没有 `#[ignore]` 的那一档了，也不需要 docker。** 这一节原来写的是
+「起 `gateway/test-env` 的 docker compose、跑 `fetch-harness-cert.sh`、
+再 `cargo test -p rmc-core -- --ignored --test-threads=1` 那 17 条」。
+那 17 条在 Task 10 随着「客户端 TLS 改成核对连接码指纹」一起删掉了
+（它们描述的是旧的公共 CA / known_hosts 世界），`fetch-harness-cert.sh`
+也不在了；Task 12 又把 CI 里那个 `integration` job 整个拿掉。
 
-17 条里有 15 条按主机名拨 `gateway.test:8443`（`tests/common/mod.rs`
-与 `tests/transport.rs`/`tests/preflight.rs` 各自的
-`gateway_tls()`/`gateway()`），需要这台机器能把 `"gateway.test"`
-解析到 `127.0.0.1`——本机手动跑上面最后一行，最直接的办法是在
-`/etc/hosts` 里加一行 `127.0.0.1 gateway.test`（需要能写这个文件的
-权限）。只有另外 2 条（`tests/transport.rs` 里的
-`wrap_tls_accepts_the_harness_cert_when_the_extra_root_is_trusted`/
-`wrap_tls_rejects_the_harness_cert_without_the_extra_root`）按 IP
-拨号、只把 `"gateway.test"` 当 TLS SNI 传，不摸 DNS，这两条在没有
-`/etc/hosts` 权限的机器上也能跑。
-
-CI（`.github/workflows/core.yml`）不写宿主的 `/etc/hosts`：跑这 17
-条测试的进程本身在一个临时容器里（`--network host` + `--add-host
-gateway.test:127.0.0.1`），`--add-host` 只给这一个容器自己的
-`/etc/hosts` 加一行、容器退出即消失。**需要它的原因是"要把
-`gateway.test` 解析到一个地址"这件事本身，跟这个容器用
-`--network host` 还是别的网络模式无关**——哪怕换成加入 docker
-compose 的隔离网络，一样需要给 `gateway.test` 一个主机名映射，只是
-映射到的地址不同（发布端口那台机器的 IP，而不是 `127.0.0.1`）。这台
-开发机没有 `/etc/hosts` 写权限时，最直接的本机复现方式就是照抄 CI
-那一步：起一个 `--network host --add-host gateway.test:127.0.0.1`
-的容器，在容器里跑 `cargo test`，不需要碰宿主的 `/etc/hosts`。
+顶替它们的是 `crates/rmc-gateway/tests/e2e.rs`：同一条链路（Transport →
+TLS 指纹钉扣 → russh → 反向端口 → pump → Supervisor）对着一台**进程内
+起起来的真运维服务器**跑，不需要 docker、不需要 `/etc/hosts` 里那行
+`gateway.test`、也不需要任何人记得传 `--ignored`。它跑在每一次
+`cargo test` 里，CI 的 `core.yml`（Linux）与 `app.yml`（Windows）都会执行。
 
 ## 口令处理
 

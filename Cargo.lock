@@ -2890,6 +2890,7 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "rmc-core",
+ "rmc-gateway",
  "russh",
  "rustls",
  "rustls-pki-types",

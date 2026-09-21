@@ -73,7 +73,7 @@ jobs:
       # 假绿形态是「不是绿，是永不结束」，卡死时要有一条清楚的「超时被杀」，
       # 而不是干等到 job 级超时、什么诊断都没有。
       - name: 界面与平台层测试
-        run: timeout 900 cargo test -p rmc-win -p rmc-app --no-fail-fast
+        run: timeout 900 cargo test -p rmc-win -p rmc-app -p rmc-gateway --no-fail-fast
 
   # 395 条 Windows 专属测试的唯一出口，也是唯一会产出便携包的地方。
   #
@@ -99,8 +99,15 @@ jobs:
       - name: clippy
         run: cargo clippy -p rmc-win -p rmc-app --all-targets -- -D warnings
 
+      # Task 12 加了 `-p rmc-gateway`：**这一行就是"端到端在 Windows 上
+      # 真的跑过"的全部实物**。现场客户端跑在 Windows 上，而
+      # `crates/rmc-gateway/tests/e2e.rs` 里被端到端驱动的那一半
+      # （rmc-core 的 Transport/TLS/SSH/pump/supervisor）在 Windows 的
+      # socket 与文件系统语义下才是真正要交付的那份。原来的 docker 集成
+      # 测试只在 Linux 容器里跑过，这条链路在 Windows 上从来没有被端到端
+      # 验证过一次。
       - name: 界面与平台层测试
-        run: cargo test -p rmc-win -p rmc-app --no-fail-fast
+        run: cargo test -p rmc-win -p rmc-app -p rmc-gateway --no-fail-fast
 
       - name: 构建发布二进制
         run: cargo build --release -p rmc-app

@@ -6,13 +6,13 @@ name: core
 # `crates/**`、workspace 级 `Cargo.*`、`deny.toml`、`rust-toolchain.toml`
 # 与这份文件自己。
 #
-# R（复审发现，中）：`integration` job 的整套夹具（docker-compose.yml、
-# sshd_tunnel_config、haproxy.cfg 等）都住在 `gateway/test-env/` 与
-# `gateway/` 下——原来的过滤器漏了 `gateway/**`，改这套夹具（哪怕只是
-# 端口映射或 sshd 配置）只会触发 `gateway.yml`（不跑 cargo），17 条
-# 集成测试根本不会执行验证到这处改动，破坏要等到某次无关的
-# `crates/**` 提交才显形，现场看起来还像是 rmc-core 自己的回归——跟
-# 这个任务本身要还的债是同一个形状，`gateway/**` 也必须加进来。
+# `gateway/**`（Task 12 说明）：这一条原本是为了让 `integration` job 的
+# docker 夹具（docker-compose.yml、sshd_tunnel_config、haproxy.cfg）改动
+# 也能触发 CI。**那个 job 在 Task 12 被整个删掉了**——网关不再是
+# sshd/haproxy/docker 拼出来的，集成测试换成了 `crates/rmc-gateway/tests/
+# e2e.rs` 那 15 条进程内端到端。`gateway/` 那个目录连同里面的东西由
+# Task 13 一并删除，**这一条 paths 也留给 Task 13 一起拿掉**：现在就删
+# 会让"那个目录还在、改它却不触发任何 CI"多存在一个提交的窗口。
 #
 # R（复审发现，中低）：`rust-toolchain.toml` 决定 CI 实际用的编译器
 # （目录级 override，优先级比 `dtolnay/rust-toolchain` 那一步的
@@ -37,9 +37,10 @@ on:
     paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml", ".github/workflows/app.yml"]
 
 jobs:
-  # 普通 `cargo test -p rmc-core` 覆盖的部分：格式、clippy（-D
-  # warnings，本 crate 一贯的验证标准）、lib 单元测试与不需要 docker
-  # 的假隧道集成测试。213 条非 ignored 测试全部在这里跑。
+  # 格式、clippy（-D warnings，本仓库一贯的验证标准）、rmc-core 与
+  # rmc-gateway 两个 crate 的全部测试——包括 Task 12 那 15 条进程内端到端
+  # （`crates/rmc-gateway/tests/e2e.rs`）。没有一条挂 `#[ignore]`，也不
+  # 需要 docker，所以"跑没跑"这件事不再取决于有没有人记得传 `--ignored`。
   unit:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -58,154 +59,78 @@ jobs:
       - name: 格式检查
         run: cargo fmt --all -- --check
 
+      # Task 12 起多了 `-p rmc-gateway`。**rmc-gateway 到这一刻为止一次
+      # 都没进过 CI**：这两条命令原来都只点名 rmc-core，只有上面的
+      # `cargo fmt --all` 覆盖全工作区。Task 2-9 写出来的那七批代码从来
+      # 没有在 CI 里被 `-D warnings` 过一遍（本地闸门有 `--workspace`，
+      # 所以实际上是干净的，见 task-12-report.md 里贴的首次完整输出，
+      # 但"靠本地纪律"与"CI 会拦"是两回事）。
       - name: clippy
-        run: cargo clippy -p rmc-core --all-targets -- -D warnings
+        run: cargo clippy -p rmc-core -p rmc-gateway --all-targets -- -D warnings
 
-      - name: 单元与假隧道测试
+      - name: 单元与端到端测试
         # 这个 crate 已经被"失败路径报不出错、只会一直挂着"坑过不止一次
         # （见 ssh::test_support 模块文档、Task 7 报告）——外层 timeout
         # 保证卡死时报一条清楚的"超时被杀"，而不是干等到 GitHub Actions
         # 自己的 job 级超时、什么诊断信息都没有。
-        run: timeout 600 cargo test -p rmc-core
+        #
+        # `-p rmc-gateway` 把 `crates/rmc-gateway/tests/e2e.rs` 那 15 条
+        # 进程内端到端也带进来——它们不需要 docker、不带 `#[ignore]`，
+        # 所以这一步就是它们的运行处，不再有单独的 integration job。
+        run: timeout 600 cargo test -p rmc-core -p rmc-gateway
 
-  # 17 条 `#[ignore]` 集成测试，需要 gateway/test-env 这套 docker 夹具。
+  # Task 12 新增：运维服务器的发布产物。
   #
-  # 用容器内跑测试进程 + `--network host` + `--add-host` 绕开
-  # "gateway.test 需要能解析"这个前提，不用 sudo、不用写宿主的
-  # /etc/hosts：
+  # 它替掉的是原来那个 `integration` job（docker compose 起 sshd+haproxy，
+  # 再在容器里跑 17 条 `#[ignore]` 测试）。那套东西连同它验证的目标一起
+  # 消失了：网关不再是 sshd/haproxy/docker 拼出来的，而是这一个二进制。
+  # 所以这里要证的事情也换了——不是"那套拼装还能跑起来"，而是
+  # **"这一个二进制真的能静态链接出来、真的可以丢到任意一台 Linux 上跑"**。
   #
-  # - `--network host` 让这个临时容器与宿主共享网络栈，docker compose
-  #   发布到 127.0.0.1 的端口（8443/2322/22001）在容器里原样可达，
-  #   `tests/*.rs` 里现有的地址字面量（`"127.0.0.1:8443"`、
-  #   `"127.0.0.1:2322"`、反向端口 22001）不用改一个字符。
-  # - `--add-host gateway.test:127.0.0.1` 只给这一个临时容器自己的
-  #   /etc/hosts 加一行别名——内核在容器创建那一刻写好，不影响宿主，
-  #   容器退出（`--rm`）后这行别名跟着消失，不留任何痕迹。
-  #
-  # 已经本地实测过这个组合成立：起 gateway/test-env 之后，一个
-  # `--network host --add-host gateway.test:127.0.0.1` 的临时容器能
-  # 用 SNI gateway.test 完成 TLS 握手（拿到自签证书 CN=gateway.test）、
-  # 也能连上发布出来的一体机端口——细节见 task-12-report.md。
-  integration:
+  # musl 而不是 glibc：运维服务器要能拷到客户那台不知道是什么发行版、
+  # glibc 什么版本的机器上直接跑。`file | grep -q 'statically linked'`
+  # 这一步不能省——`--target x86_64-unknown-linux-musl` 构建成功**不等于**
+  # 产物是静态的（任何一条走 build.rs 链了系统库的依赖都会让它退化成
+  # 动态链接），而那种退化不会让 `cargo build` 失败，只会在客户那台机器
+  # 上表现成一句 "No such file or directory"。
+  gateway-release:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 拉起测试环境
-        # --build 不能省：早于某个提交的缓存镜像里还是有问题的旧证书
-        # （见 fetch-harness-cert.sh 与 tests/transport.rs 顶部的说明）。
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@1.89
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 安装 musl 工具链
+        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+
+      - name: 构建 musl 静态二进制
+        run: cargo build --release -p rmc-gateway --target x86_64-unknown-linux-musl
+
+      # 三条断言合成一条命令：产物在、`file` 认得它、而且它说的是
+      # "statically linked"。`grep -q` 不匹配时退出码非零，这一步就红。
+      - name: 确认是静态链接
         run: |
-          cd gateway/test-env
-          docker compose up -d --build
+          bin=target/x86_64-unknown-linux-musl/release/rmc-gateway
+          test -f "$bin"
+          file "$bin"
+          file "$bin" | grep -q 'statically linked'
 
-      # R96（最终复审发现，低）：`docker compose up -d` 只保证容器被
-      # 创建并启动，不保证里面的 haproxy/sshd 已经开始监听；紧接着的
-      # 17 条测试会立刻去连 8443/2322。这一步原来不存在，靠的是下面
-      # 容器里那句 `apt-get install openssh-client` 偶然多花的十几秒
-      # 兜住——镜像层缓存命中、或者 runner 磁盘快一点，这个偶然就没了。
-      # 一个刚建起来、偶发变红的 integration job，最危险的地方是下一个
-      # 人会直接去把它关掉，而不是来查为什么。
-      #
-      # 探测必须是"真的说上话"，不能只是 TCP 连得上：docker 的 userland
-      # proxy 在容器创建那一刻就把宿主的 8443/2322 绑好了，容器里的
-      # haproxy/sshd 还没起来时它照样 accept 再立刻关掉，一个裸的 TCP
-      # connect 于是永远成功，等于没等。（同一件事 docker-compose.yml
-      # 里对 22001 的注释已经写过：“宿主能连上 22001 证明不了绑定
-      # 地址”。）所以 Gateway 这一侧做一次真实 TLS 握手——拿到证书才算
-      # haproxy 起来了；一体机这一侧读 SSH 版本横幅的前四个字节——
-      # 收到 "SSH-" 才算 sshd 起来了。
-      #
-      # 22001 不在这里等：那是隧道在线时才会有人听的反向端口，由测试
-      # 自己建立，不是环境该先准备好的东西。
-      #
-      # 等待上限 120 秒，到点 `exit 1` 让这一步失败——不是打印一句警告
-      # 然后继续：那样只会把"环境没起来"伪装成"测试自己连不上"，排查
-      # 的人要从 17 条测试的失败信息倒推回 docker。
-      #
-      # 说明一律写成 YAML 注释放在 `run:` **外面**，跟这份文件其它步骤
-      # 的写法一致，不写进脚本体内——`ci_workflow.rs` 是按 `run` 的字符
-      # 串内容做断言的，把 "exit 1" 这类关键词写进脚本里的注释，会让
-      # 「超时真的会失败」这条断言被一句注释满足。这不是假想：这一步
-      # 第一版就把上面那段说明写在 `run:` 里，实测把代码里的 `exit 1`
-      # 换成 `echo` 之后 `ci_workflow.rs` 照样全绿。`run_code()` 现在会
-      # 剥掉注释行兜住这一类，但源头上别把关键词写进脚本注释更省事。
-      - name: 等待测试环境就绪
-        run: |
-          probe_gateway_tls() {
-            timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername gateway.test \
-              </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE"
-          }
-          probe_appliance_ssh() {
-            timeout 10 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2322; head -c 4 <&3' 2>/dev/null \
-              | grep -q "^SSH-"
-          }
-          wait_for() {
-            what="$1"; probe="$2"
-            deadline=$((SECONDS + 120))
-            until "$probe"; do
-              if [ "$SECONDS" -ge "$deadline" ]; then
-                echo "等待 $what 超过 120 秒仍未就绪，判定测试环境没起来" >&2
-                docker compose -f gateway/test-env/docker-compose.yml ps
-                docker compose -f gateway/test-env/docker-compose.yml logs --no-color
-                exit 1
-              fi
-              sleep 2
-            done
-            echo "$what 已就绪"
-          }
-          wait_for "Gateway TLS 前端 127.0.0.1:8443" probe_gateway_tls
-          wait_for "一体机 sshd 127.0.0.1:2322" probe_appliance_ssh
-
-      - name: 生成 harness 证书
-        run: ./crates/rmc-core/tests/fetch-harness-cert.sh
-
-      - name: 运行 --ignored 集成测试
-        # 这一步必须显式传 --ignored 并且以非零退出让构建失败——普通的
-        # `cargo test -p rmc-core` 对这 17 条只会报一行 "17 ignored"、
-        # 以 0 退出收场，混在别的测试步骤里等于没跑。--test-threads=1
-        # 是必须的：establishes_and_reports_first_seen_host_key 之类的
-        # 用例会真的把反向端口 22001 绑起来，并发跑会互相抢占。
-        # `--no-fail-fast`：这 4 个测试二进制（forwarding/preflight/
-        # ssh_tunnel/transport）里任何一个失败，cargo test 默认会立刻
-        # 停下、不跑剩下的——本地验证过这个默认行为会把后面几个二进制
-        # 的真实结果盖住，一次只看得到一条失败。同一次 CI 跑出全部结果，
-        # 比"改一条、重跑、再改一条"来回更快。
-        #
-        # `RUSTUP_TOOLCHAIN=1.89.0`：`rust:1.89` 镜像预装的工具链叫
-        # `1.89.0-<triple>`，仓库根 `rust-toolchain.toml` 写的是
-        # `channel = "1.89"`（少一个 `.0`）——rustup 把这两个字符串当成
-        # 两个不同的工具链，每次 `docker run --rm` 都会为"1.89"这个
-        # 名字重新下载 cargo/rustc/rust-std/clippy/rustfmt 五个组件。
-        # 本地实测过：这一步能把 9 分钟的集成链路拖出将近 4 分钟的
-        # 纯下载耗时，而且这几个组件里有两个（clippy/rustfmt）这一步
-        # 根本用不上。显式钉死 `RUSTUP_TOOLCHAIN` 让 rustup 直接复用
-        # 镜像自带的那份，跳过 rust-toolchain.toml 的目录级 override，
-        # 零下载（本地实测：不设时这条命令跑 4 分钟，设了之后 0.02
-        # 秒）。这个值要跟 rust-toolchain.toml 的 channel 保持同一个
-        # MSRV，见 unit_job_pins_the_toolchain_to_the_documented_msrv。
-        run: |
-          timeout 1200 docker run --rm \
-            --network host \
-            --add-host gateway.test:127.0.0.1 \
-            -v "$PWD":/work -w /work \
-            -e CARGO_TERM_COLOR=always \
-            -e RUSTUP_TOOLCHAIN=1.89.0 \
-            rust:1.89 \
-            bash -euxc '
-              apt-get update -qq
-              apt-get install -y -qq --no-install-recommends openssh-client
-              cargo test -p rmc-core --no-fail-fast -- --ignored --test-threads=1
-            '
-
-      - name: 失败时导出容器日志
-        if: failure()
-        run: cd gateway/test-env && docker compose logs --no-color
-
-      - name: 清理测试环境
-        if: always()
-        run: cd gateway/test-env && docker compose down -v
+      # `if-no-files-found: error` 不能省：默认是 `warn`，二进制没产出时
+      # 会上传一个空产物并让这一步变绿（同 app.yml 里那条便携包的说明）。
+      - name: 上传运维服务器二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: rmc-gateway-linux-x86_64
+          path: target/x86_64-unknown-linux-musl/release/rmc-gateway
+          if-no-files-found: error
 
   # 依赖审计：许可证、安全公告、被禁止的 TLS 实现、多版本重复。裁定与
   # 理由见 deny.toml 本身的注释。

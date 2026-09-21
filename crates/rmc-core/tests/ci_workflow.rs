@@ -2,17 +2,24 @@
 //! GitHub Actions——写法与立意都照抄 `gateway/tests/test_ci_workflow.py`
 //! （见该文件顶部模块文档，那边有一次真实踩坑的完整记录）。
 //!
-//! # Task 12 的两处改动
+//! # Task 12 的改动
 //!
 //! 1. 辅助函数搬进了 `tests/workflow_yaml/`，跟守 `app.yml` 的
-//!    `tests/app_workflow.rs` 共用。只有 `env_assignment_value()` 与
-//!    `major_minor()` 留在本文件里（另一份用不上它们，搬过去就是
-//!    dead_code）——理由与实测记录见那份文件顶部。
+//!    `tests/app_workflow.rs` 共用。
 //! 2. 新增 `dependency_audit_triggers_on_every_file_that_can_change_the_
 //!    dependency_graph`：`deny` job 一直都在（W219 的「cargo deny 根本不在
 //!    CI 里」不成立，订正见 task-12-report.md），但**它的触发条件原来没被
 //!    钉住**——`Cargo.lock` 与 `deny.toml` 从 paths 过滤器里掉出去，
 //!    依赖审计就会对一次 `cargo update` 视而不见。
+//! 3. **`integration` job 连同守它的那 8 条断言一起删掉了**。它跑的是
+//!    docker compose 起 sshd+haproxy、再在容器里执行 17 条 `#[ignore]`
+//!    测试；Task 12 把网关换成一个自研二进制之后，那套夹具描述的世界
+//!    已经不存在，17 条用例也随之删除（Task 10/13）。顶替它的位置的是
+//!    `gateway-release` job（musl 静态二进制 + 产物上传），以及 `unit`
+//!    job 里多出来的 `-p rmc-gateway`——15 条进程内端到端从此跑在每一次
+//!    `cargo test` 里，不再需要任何人记得传 `--ignored`。
+//!    `env_assignment_value()`/`major_minor()` 两个只服务于容器内工具链
+//!    断言的辅助函数跟着删了，留着会被 `-D warnings` 判成 dead_code。
 //!
 //! Task 12 要还的债是"本仓库至今没有任何 CI 会构建 Rust"，这份工作流
 //! 是还债的实物。但工作流本身是一份不会被 `cargo check` 校验的 YAML：
@@ -39,7 +46,7 @@
 //! # 静默关掉"
 //!
 //! 第一版的断言全部停在"这个 step 的 `run`/`if`/`uses` 内容对不对"这
-//! 一层——复审用探针实测过：给 `integration` job 加
+//! 一层——复审用探针实测过（当时 `integration` job 还在）：给它加
 //! `continue-on-error: true`、给某个 step 加 `if: false`、给 `unit`
 //! job 加 `if: false`、把单测命令悄悄收窄成 `--lib`、给单测命令接
 //! `|| true`、把 `cargo-deny` 的检查范围收窄成只查 licenses——原来的
@@ -53,10 +60,10 @@
 //! MSRV 的漂移是另一类没堵住的洞：`dtolnay/rust-toolchain` 那一步的
 //! 版本号字面量不是 CI 实际用的编译器版本——`rust-toolchain.toml` 的
 //! 目录级 override 优先级更高，而它原来不在 paths 过滤器里，改它不
-//! 触发这份工作流。`unit_job_pins_the_toolchain_to_the_documented_
-//! msrv`/`integration_job_container_toolchain_matches_the_documented_
-//! msrv` 现在直接读 `rust-toolchain.toml` 的 `channel` 字段做交叉
-//! 校验，不是把同一个版本号分别硬编码在两处。
+//! 触发这份工作流。`unit_job_pins_the_toolchain_to_the_documented_msrv`
+//! 与 `gateway_release_job_pins_the_toolchain_to_the_documented_msrv`
+//! 现在直接读 `rust-toolchain.toml` 的 `channel` 字段做交叉校验，不是
+//! 把同一个版本号分别硬编码在两处。
 
 mod workflow_yaml;
 use workflow_yaml::*;
@@ -70,49 +77,36 @@ fn doc() -> Yaml {
     load_workflow(WORKFLOW)
 }
 
-/// 在一段 shell 脚本文本里找 `NAME=value` 这种环境变量赋值，取 `value`
-/// （到下一个空白字符或 `\` 续行符为止）。用于从 `docker run` 命令里挖出
-/// `-e RUSTUP_TOOLCHAIN=1.89.0` 这类参数的值。
-///
-/// **没有搬进 `workflow_yaml`**：只有这份文件用得上（`app.yml` 里没有
-/// 容器），搬过去会在 `app_workflow.rs` 那个二进制里变成 dead_code，
-/// `cargo clippy --all-targets -- -D warnings` 当场变红。
-fn env_assignment_value<'a>(shell_text: &'a str, name: &str) -> Option<&'a str> {
-    let needle = format!("{name}=");
-    let start = shell_text.find(&needle)? + needle.len();
-    let rest = &shell_text[start..];
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '\\')
-        .unwrap_or(rest.len());
-    Some(&rest[..end])
-}
-
-/// 取字符串版本号的 `major.minor` 前缀（`"1.89.0"` -> `"1.89"`）——比较
-/// 镜像标签/`RUSTUP_TOOLCHAIN` 的值跟 `rust-toolchain.toml` 的 `channel`
-/// 是不是同一个 MSRV 时，只关心 major.minor，不关心具体 patch 号（patch
-/// 号会随镜像更新而变，不是这里要盯住的漂移）。同上，不搬。
-fn major_minor(version: &str) -> String {
-    let mut parts = version.split('.');
-    let major = parts.next().unwrap_or("");
-    let minor = parts.next().unwrap_or("");
-    format!("{major}.{minor}")
-}
-
 const UNIT_JOB: &str = "unit";
-const INTEGRATION_JOB: &str = "integration";
+const GATEWAY_RELEASE_JOB: &str = "gateway-release";
 const DENY_JOB: &str = "deny";
+
+/// 本工作流里全部的 job。上面这三个常量之外再加一个 job 而不更新这张
+/// 表，`workflow_file_parses_as_yaml_with_exactly_three_jobs` 会红；
+/// 那些"对所有 job 扫一遍"的断言（`if: false`、`continue-on-error`、
+/// step 有没有 name）也都遍历它，不会漏掉新 job。
+const ALL_JOBS: [&str; 3] = [UNIT_JOB, GATEWAY_RELEASE_JOB, DENY_JOB];
 
 const STEP_INSTALL_TOOLCHAIN: &str = "安装 Rust 工具链";
 const STEP_FMT: &str = "格式检查";
 const STEP_CLIPPY: &str = "clippy";
-const STEP_UNIT_TESTS: &str = "单元与假隧道测试";
-const STEP_COMPOSE_UP: &str = "拉起测试环境";
-const STEP_WAIT_READY: &str = "等待测试环境就绪";
-const STEP_HARNESS_CERT: &str = "生成 harness 证书";
-const STEP_IGNORED_TESTS: &str = "运行 --ignored 集成测试";
-const STEP_LOG_EXPORT: &str = "失败时导出容器日志";
-const STEP_CLEANUP: &str = "清理测试环境";
+const STEP_UNIT_TESTS: &str = "单元与端到端测试";
+const STEP_MUSL_TOOLS: &str = "安装 musl 工具链";
+const STEP_MUSL_BUILD: &str = "构建 musl 静态二进制";
+const STEP_STATIC_CHECK: &str = "确认是静态链接";
+const STEP_UPLOAD_GATEWAY: &str = "上传运维服务器二进制";
 const STEP_CARGO_DENY: &str = "cargo-deny";
+
+/// 运维服务器的发布目标与产物名。三处（构建命令、静态性检查、上传
+/// 路径）必须说的是同一个三元组，否则会出现"构建了 A、检查了 B、
+/// 上传了 C"这种各自为政、每一步单看都对的退化。
+/// `unit` job 的测试命令，一个字都不能多、不能少。见
+/// `unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset`。
+const UNIT_TEST_COMMAND: &str = "cargo test -p rmc-core -p rmc-gateway";
+
+const MUSL_TARGET: &str = "x86_64-unknown-linux-musl";
+const GATEWAY_BINARY: &str = "target/x86_64-unknown-linux-musl/release/rmc-gateway";
+const GATEWAY_ARTIFACT: &str = "rmc-gateway-linux-x86_64";
 
 #[test]
 fn workflow_file_parses_as_yaml_with_exactly_three_jobs() {
@@ -120,20 +114,21 @@ fn workflow_file_parses_as_yaml_with_exactly_three_jobs() {
         job_names(&doc()),
         vec![
             DENY_JOB.to_string(),
-            INTEGRATION_JOB.to_string(),
+            GATEWAY_RELEASE_JOB.to_string(),
             UNIT_JOB.to_string()
         ],
-        "工作流应该正好三个 job：unit/integration/deny"
+        "工作流应该正好三个 job：unit/gateway-release/deny"
     );
 }
 
 // 这是整个任务要还的债的根：`gateway.yml` 的 paths 过滤器从来没覆盖过
 // `crates/**`，改 rmc-core 一个字都不会触发任何工作流。
 //
-// `gateway/**` 与 `rust-toolchain.toml` 是复审加的两条：`integration`
-// job 的整套夹具（docker-compose.yml、sshd_tunnel_config 等）住在
-// `gateway/test-env/` 与 `gateway/` 下，漏了这条路径，改夹具只会触发
-// `gateway.yml`（不跑 cargo），17 条集成测试根本验证不到这处改动；
+// `gateway/**` 原本是为了让 `integration` job 的 docker 夹具改动也触发
+// CI。Task 12 删掉了那个 job，但**这一条 paths 仍然留着**：`gateway/`
+// 那个目录还在仓库里，由 Task 13 连同这一条一起删。现在就拿掉会多出一个
+// "目录还在、改它却不触发任何 CI"的提交窗口，那正是这份文件通篇在防的
+// 那种"安静地不跑"。
 // `rust-toolchain.toml` 决定 CI 实际用的编译器（见下面
 // `unit_job_pins_the_toolchain_to_the_documented_msrv`），漏了这条
 // 路径，改工具链版本不会触发任何验证。
@@ -200,8 +195,14 @@ fn dependency_audit_triggers_on_every_file_that_can_change_the_dependency_graph(
     );
 }
 
-// 会让这条测试变红的实现改法：删掉 `-D warnings`（clippy 又能悄悄放行
-// 新告警了），或者把这一步的 `run` 换成别的命令。
+// `-p rmc-gateway` 那一半是 Task 12 加的，而且是这条测试现在最要紧的
+// 部分：rmc-gateway 在此之前**一次都没进过 CI 的 clippy**（原命令只点名
+// rmc-core，只有 `cargo fmt --all` 覆盖全工作区）。只查 `cargo clippy` +
+// `-D warnings` 挡不住"有人把 `-p rmc-gateway` 顺手删掉"——那会让整个
+// crate 重新退回到零 lint 强制，而 CI 面板上仍然是绿的。
+//
+// 会让这条测试变红的实现改法：删掉 `-D warnings`、删掉 `-p rmc-core` 或
+// `-p rmc-gateway` 中的任意一个、或者把这一步的 `run` 换成别的命令。
 #[test]
 fn unit_job_runs_clippy_with_deny_warnings_and_fmt_check() {
     let doc = doc();
@@ -217,6 +218,11 @@ fn unit_job_runs_clippy_with_deny_warnings_and_fmt_check() {
     assert!(
         clippy.contains("cargo clippy") && clippy.contains("-D warnings"),
         "clippy 步骤必须带 -D warnings，实际 {clippy:?}"
+    );
+    assert_eq!(
+        clippy.trim(),
+        "cargo clippy -p rmc-core -p rmc-gateway --all-targets -- -D warnings",
+        "clippy 必须同时覆盖 rmc-core 与 rmc-gateway，一个都不能少，实际 {clippy:?}"
     );
 }
 
@@ -246,43 +252,6 @@ fn unit_job_pins_the_toolchain_to_the_documented_msrv() {
     );
 }
 
-// `integration` job 的 17 条 --ignored 测试跑在 `rust:<channel>`
-// 镜像的一个临时容器里，不是走 `dtolnay/rust-toolchain`——它自己的
-// MSRV 一致性要单独钉住，跟上一条测试是两个独立的漂移点。
-//
-// `RUSTUP_TOOLCHAIN` 那个环境变量存在的唯一理由是绕开 rust-toolchain.
-// toml 的 `channel = "1.89"` 与镜像预装工具链名 `1.89.0-<triple>` 之间
-// 因为少写一个 `.0` 而对不上号、导致每次都重新下载的问题（见该处注释
-// 与 task-12-report.md）——它的 major.minor 必须跟 `channel` 一致，
-// 否则这个环境变量本身就会指向一个镜像里不存在的工具链，`cargo test`
-// 直接失败；镜像标签的 major.minor 也要跟 `channel` 一致，否则是在用
-// 一个跟声明的 MSRV 不一样的编译器验证代码。
-//
-// 会让这条测试变红的实现改法：只改 `rust-toolchain.toml` 的
-// `channel`，不同步改这一步的镜像标签或 `RUSTUP_TOOLCHAIN`（复审发现
-// 的原始问题——今天两者都是 1.89 所以看不出来，但 CI 从不会因为这个
-// 漂移而变红）。
-#[test]
-fn integration_job_container_toolchain_matches_the_documented_msrv() {
-    let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
-    let channel = toolchain_channel();
-
-    assert!(
-        run.contains(&format!("rust:{channel}")),
-        "容器镜像标签必须跟 rust-toolchain.toml 的 channel（{channel}）一致，实际 run={run:?}"
-    );
-
-    let rustup_toolchain = env_assignment_value(&run, "RUSTUP_TOOLCHAIN")
-        .unwrap_or_else(|| panic!("run 里没找到 RUSTUP_TOOLCHAIN= 这个环境变量赋值：{run:?}"));
-    assert_eq!(
-        major_minor(rustup_toolchain),
-        channel,
-        "RUSTUP_TOOLCHAIN（{rustup_toolchain}）的 major.minor 必须跟 channel（{channel}）一致"
-    );
-}
-
 // 这个 crate 已经被"失败路径报不出错、只会一直挂着"坑过不止一次——
 // 单元测试步骤必须有一层外部 timeout，卡死时给出清楚的诊断，而不是
 // 干等到 GitHub Actions 自己的 job 级超时（没有任何输出）。
@@ -298,19 +267,24 @@ fn unit_test_step_has_an_inner_timeout_wrapper() {
         run.trim_start().starts_with("timeout "),
         "单元测试步骤必须用 timeout 包一层，实际 {run:?}"
     );
-    assert!(run.contains("cargo test -p rmc-core"), "{run:?}");
+    assert!(run.contains(UNIT_TEST_COMMAND), "{run:?}");
 }
 
 // 复审发现：只查 `contains("cargo test -p rmc-core")` 挡不住"悄悄
 // 缩小范围"这类退化——把命令改成 `cargo test -p rmc-core --lib`
-// （少跑 35 条非 ignored 集成测试，包含 connect.rs 那 9 条代理用例）、
-// 或者在命令后面接 `|| true`，`contains` 对这两种改法都仍然是
-// `true`。这条测试要求 `timeout <N>` 之后的内容跟
-// `"cargo test -p rmc-core"` 完全相等，不多不少。
+// （少跑一批集成测试，包含 connect.rs 那些代理用例）、或者在命令后面接
+// `|| true`，`contains` 对这两种改法都仍然是 `true`。这条测试要求
+// `timeout <N>` 之后的内容跟 [`UNIT_TEST_COMMAND`] 完全相等，不多不少。
 //
-// 会让这条测试变红的实现改法：在 `cargo test -p rmc-core` 后面追加
-// 任何内容（`--lib`、`--test connect`、`-- --ignored`、`|| true` 等），
-// 或者在前面插入任何内容。
+// Task 12：`-p rmc-gateway` 进了这个常量。**它是那 15 条进程内端到端在
+// CI 里唯一的运行处**——删掉它，`crates/rmc-gateway/tests/e2e.rs` 会
+// 安静地一条都不跑，而 CI 面板照样全绿。这正是原来那个 `integration`
+// job 的失效形态（17 条 `#[ignore]` 挂在一个没人触发的工作流后面），
+// 这条断言就是不让它换个样子再来一次。
+//
+// 会让这条测试变红的实现改法：在命令后面追加任何内容（`--lib`、
+// `--test e2e`、`-- --ignored`、`|| true` 等），在前面插入任何内容，
+// 或者删掉 `-p rmc-core`/`-p rmc-gateway` 中的任意一个。
 #[test]
 fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
     let doc = doc();
@@ -324,218 +298,136 @@ fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
         .trim_start_matches(|c: char| c.is_ascii_digit())
         .trim_start();
     assert_eq!(
-        after_seconds, "cargo test -p rmc-core",
-        "单元测试步骤必须是完整的 `cargo test -p rmc-core`，不能带 --lib、\
+        after_seconds, UNIT_TEST_COMMAND,
+        "单元测试步骤必须是完整的 `{UNIT_TEST_COMMAND}`，不能带 --lib、\
          额外的 --test 过滤器，也不能接 || true 之类的尾巴，实际命令是 {trimmed:?}"
     );
 }
 
-// --build 不能省：早于某个提交的缓存镜像里还是有问题的旧证书（见
-// fetch-harness-cert.sh 与 tests/transport.rs 顶部的说明）。
+// ---------------------------------------------------- gateway-release job
+
+// `gateway-release` 顶替了被删掉的 `integration`。它要证的事情换了：不是
+// "那套 docker 拼装还跑得起来"，而是"运维服务器这一个二进制真的能静态
+// 链接出来、真的可以丢到任意一台 Linux 上跑"。
 //
-// 会让这条测试变红的实现改法：把 `docker compose up -d --build` 里的
-// `--build` 删掉。
+// 四件事必须说的是**同一个**三元组（target / 产物路径 / 产物名），
+// 分开各自断言挡不住"构建了 A、检查了 B、上传了 C"这种每一步单看都对、
+// 合起来毫无意义的退化——那正是这份文件通篇在防的形状。
+//
+// `file ... | grep -q 'statically linked'` 这一条尤其不能省：
+// `--target x86_64-unknown-linux-musl` 构建成功**不等于**产物是静态的
+// （任何一条走 build.rs 链了系统库的依赖都会让它退化成动态链接），而
+// 那种退化不会让 `cargo build` 失败，只会在客户那台机器上表现成一句
+// "No such file or directory"。
+//
+// 会让这条测试变红的实现改法：从构建命令里删掉 `--target
+// x86_64-unknown-linux-musl`（产出就成了 glibc 动态链接的）；删掉
+// "确认是静态链接"这一步，或者把里面的 `grep -q 'statically linked'`
+// 换成只 `file` 一下不判断；把上传的 `path` 改成别的路径；改掉产物名；
+// 或者删掉 `if-no-files-found: error`（二进制没产出时会上传一个空产物
+// 并让这一步变绿）。
 #[test]
-fn compose_up_step_always_rebuilds_the_images() {
+fn gateway_release_job_builds_a_static_musl_binary_and_uploads_it() {
     let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let run = run_code(step_by_name(steps, STEP_COMPOSE_UP));
+    let steps = steps(job(&doc, GATEWAY_RELEASE_JOB));
+
+    let musl = run_code(step_by_name(steps, STEP_MUSL_TOOLS));
     assert!(
-        run.contains("docker compose up") && run.contains("--build"),
-        "拉起测试环境必须带 --build，实际 {run:?}"
+        musl.contains("musl-tools"),
+        "musl 目标需要 musl-gcc 当链接器，实际 {musl:?}"
+    );
+
+    let build = run_code(step_by_name(steps, STEP_MUSL_BUILD));
+    assert!(
+        build.contains("cargo build") && build.contains("--release"),
+        "必须是 release 构建，实际 {build:?}"
+    );
+    assert!(
+        build.contains("-p rmc-gateway"),
+        "构建的必须是 rmc-gateway，实际 {build:?}"
+    );
+    assert!(
+        build.contains(&format!("--target {MUSL_TARGET}")),
+        "必须构建 musl 目标，否则产物是 glibc 动态链接的，实际 {build:?}"
+    );
+
+    let check = run_code(step_by_name(steps, STEP_STATIC_CHECK));
+    assert!(
+        check.contains(GATEWAY_BINARY),
+        "静态性检查必须针对构建出来的那一个产物，实际 {check:?}"
+    );
+    assert!(
+        check.contains("statically linked"),
+        "必须真的核对 file 的输出说了 statically linked，实际 {check:?}"
+    );
+    assert!(
+        check.contains("grep -q"),
+        "核对必须以非零退出让这一步失败，不能只打印一行 file 输出，实际 {check:?}"
+    );
+    assert!(
+        !check.contains("|| true"),
+        "这一步不能用 || true 吞掉失败，实际 {check:?}"
+    );
+
+    let upload = step_by_name(steps, STEP_UPLOAD_GATEWAY);
+    assert!(
+        uses_text(upload).is_some_and(|u| u.starts_with("actions/upload-artifact@")),
+        "{upload:?}"
+    );
+    assert_eq!(upload["with"]["name"].as_str(), Some(GATEWAY_ARTIFACT));
+    assert_eq!(upload["with"]["path"].as_str(), Some(GATEWAY_BINARY));
+    assert_eq!(
+        upload["with"]["if-no-files-found"].as_str(),
+        Some("error"),
+        "默认的 warn 会在二进制没产出时上传一个空产物并让这一步变绿"
     );
 }
 
-// 四步顺序必须是：拉起环境 → 等就绪 → 生成证书 → 跑 --ignored 测试。
+// 顺序：装工具链 → 装 musl-tools → 构建 → 核对静态性 → 上传。
 //
-// 会让这条测试变红的实现改法：把"生成 harness 证书"挪到"拉起测试
-// 环境"前面（容器还没起，`docker compose exec` 会对着不存在的服务
-// 报错），或者把"运行 --ignored 集成测试"挪到"生成 harness 证书"
-// 前面（读不到证书文件，两条需要真实 TLS 的用例会连不上/验不过），
-// 或者把"等待测试环境就绪"挪到"拉起测试环境"前面 / "运行 --ignored
-// 集成测试"后面（等的时机不对，等于没等）。
+// 会让这条测试变红的实现改法：把"确认是静态链接"挪到"构建 musl 静态
+// 二进制"前面（对着还不存在的文件跑 `file`），把"上传"挪到"核对"前面
+// （没核对过的产物就被发出去了），或者把"安装 musl 工具链"挪到构建
+// 之后（`cargo build` 会因为找不到 musl-gcc 链接器失败）。
 #[test]
-fn integration_steps_run_in_the_documented_order() {
+fn gateway_release_steps_run_in_the_documented_order() {
     let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let compose_up = step_index_by_name(steps, STEP_COMPOSE_UP);
-    let ready = step_index_by_name(steps, STEP_WAIT_READY);
-    let cert = step_index_by_name(steps, STEP_HARNESS_CERT);
-    let ignored = step_index_by_name(steps, STEP_IGNORED_TESTS);
-    assert!(compose_up < ready, "等待就绪必须排在拉起测试环境之后");
-    assert!(ready < cert, "等待就绪必须排在生成证书之前");
-    assert!(cert < ignored, "生成证书必须排在运行 --ignored 测试之前");
+    let steps = steps(job(&doc, GATEWAY_RELEASE_JOB));
+    let toolchain = step_index_by_name(steps, STEP_INSTALL_TOOLCHAIN);
+    let musl = step_index_by_name(steps, STEP_MUSL_TOOLS);
+    let build = step_index_by_name(steps, STEP_MUSL_BUILD);
+    let check = step_index_by_name(steps, STEP_STATIC_CHECK);
+    let upload = step_index_by_name(steps, STEP_UPLOAD_GATEWAY);
+    assert!(toolchain < musl, "Rust 工具链要先装");
+    assert!(musl < build, "musl-gcc 必须在 cargo build 之前就位");
+    assert!(build < check, "先构建才有东西可核对");
+    assert!(check < upload, "核对过静态性才能上传");
 }
 
-// R96（最终复审发现，低）：`docker compose up -d` 只保证容器被创建并
-// 启动，不保证里面的 haproxy/sshd 已经在监听——随后 17 条测试立刻就去
-// 连 8443/2322。这一步原来根本不存在，靠的是容器里那句 `apt-get
-// install openssh-client` 偶然多花的十几秒兜住；一个刚建起来、偶发变红
-// 的 integration job，最危险的地方是下一个人会直接去把它关掉。
+// 这个 job 的编译器也得是声明的那个 MSRV——它跟 `unit` job 是两个独立的
+// 漂移点（各自一条 `dtolnay/rust-toolchain@<版本>`）。同上一条测试的
+// 做法：直接读 `rust-toolchain.toml` 的 `channel` 做交叉校验，不把同一个
+// 版本号硬编码第三份。
 //
-// 三件事各自钉住：
+// `targets:` 那个输入同样要钉：少了它，`dtolnay/rust-toolchain` 不会装
+// musl 的 std，`cargo build --target x86_64-unknown-linux-musl` 会失败
+// ——这一条不是防静默退化，是防一次"看起来无关的清理"把它删掉。
 //
-// 1. 等的是 8443（Gateway 的 TLS 前端，17 条里 15 条第一步要连的端口）
-//    与 2322（一体机 sshd）。
-// 2. 等法是"真的说上话"，不是裸 TCP connect——docker 的 userland proxy
-//    在容器创建那一刻就把宿主端口绑好了，容器里的服务还没起来时它照样
-//    accept 再立刻关掉，裸连接永远成功、等于没等（docker-compose.yml
-//    里对 22001 的注释写的是同一件事）。所以必须看到真实 TLS 握手
-//    （`openssl s_client`）与 SSH 版本横幅（`SSH-`）。
-// 3. 等待有上限，且超时要让这一步**失败**（`exit 1`），不是打印一句
-//    警告继续往下走——那样只会把"环境没起来"伪装成"测试自己连不上"。
-//
-// 三条断言全部走 `run_code`（剥掉脚本里的整行注释）而不是 `run_text`
-// ——理由见 `run_code` 上的说明：这条测试的第一版栽在这里，把代码里的
-// `exit 1` 换成 `echo` 之后，断言被脚本注释里那句"到点 exit 1 让这一步
-// 失败"喂饱了，测试照样全绿。
-//
-// 会让这条测试变红的实现改法（四个探针，逐一实测过）：删掉这一步；把
-// 探测换成裸的 `/dev/tcp/127.0.0.1/8443` 连通性判断（拿掉
-// `openssl s_client`）；把超时分支的 `exit 1` 换成 `echo` 之后继续；
-// 或者把 `until` 循环换成一句无上限的死等。
+// 会让这条测试变红的实现改法：把版本号改成跟 `rust-toolchain.toml` 的
+// `channel` 不一致的任何值，或者删掉 `with.targets`。
 #[test]
-fn readiness_gate_really_waits_for_the_services_and_fails_on_timeout() {
+fn gateway_release_job_pins_the_toolchain_to_the_documented_msrv() {
     let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let step = step_by_name(steps, STEP_WAIT_READY);
-    let run = run_code(step);
-
-    for port in ["8443", "2322"] {
-        assert!(
-            run.contains(port),
-            "就绪探测必须覆盖端口 {port}，实际 {run:?}"
-        );
-    }
-    assert!(
-        run.contains("openssl s_client"),
-        "Gateway 侧必须做真实 TLS 握手，裸 TCP connect 会被 docker 的 \
-         userland proxy 永远放行、等于没等，实际 {run:?}"
+    let steps = steps(job(&doc, GATEWAY_RELEASE_JOB));
+    let step = step_by_name(steps, STEP_INSTALL_TOOLCHAIN);
+    let uses = uses_text(step).unwrap_or_else(|| panic!("{STEP_INSTALL_TOOLCHAIN} 没有 uses 字段"));
+    let channel = toolchain_channel();
+    assert_eq!(uses, format!("dtolnay/rust-toolchain@{channel}"));
+    assert_eq!(
+        step["with"]["targets"].as_str(),
+        Some(MUSL_TARGET),
+        "不装 musl 的 std，构建那一步会失败"
     );
-    assert!(
-        run.contains("SSH-"),
-        "一体机侧必须读到 SSH 版本横幅才算就绪，实际 {run:?}"
-    );
-    assert!(
-        run.contains("until "),
-        "必须是轮询等待，不是一次性探测，实际 {run:?}"
-    );
-    assert!(
-        run.contains("exit 1"),
-        "等待超时必须让这一步失败，不能打印警告继续，实际 {run:?}"
-    );
-    assert!(
-        !run.contains("|| true"),
-        "这一步不能用 || true 吞掉失败，实际 {run:?}"
-    );
-    assert!(
-        step["continue-on-error"].is_badvalue(),
-        "这一步不能带 continue-on-error，否则等待失败也不会让 job 变红"
-    );
-}
-
-// 这一步必须显式传 --ignored 并且以非零退出让构建失败——普通的
-// `cargo test -p rmc-core` 对这 17 条只会报一行 "17 ignored"、以 0
-// 退出收场，混在别的测试步骤里等于没跑；`--test-threads=1` 是必须的，
-// 几条用例会真的把反向端口 22001 绑起来，并发跑会互相抢占；这一步也
-// 不能带 `continue-on-error: true`，否则失败了也不会让 job 变红。
-//
-// 会让这条测试变红的实现改法：删掉 `-- --ignored`、删掉
-// `--test-threads=1`、或者给这一步加上 `continue-on-error: true`
-// （或者在 run 里把命令接上 `|| true`）。
-#[test]
-fn ignored_tests_step_really_runs_the_ignored_tests_and_can_fail_the_build() {
-    let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let step = step_by_name(steps, STEP_IGNORED_TESTS);
-    let run = run_code(step);
-    assert!(run.contains("-- --ignored"), "{run:?}");
-    assert!(run.contains("--test-threads=1"), "{run:?}");
-    assert!(!run.contains("|| true"), "{run:?}");
-    assert!(
-        step["continue-on-error"].is_badvalue(),
-        "这一步不能带 continue-on-error，否则失败也不会让 job 变红"
-    );
-}
-
-// 用容器内跑测试进程 + --network host + --add-host 绕开"gateway.test
-// 需要能解析"这个前提，不需要 sudo、不需要改宿主的 /etc/hosts——见
-// task-12-report.md 里对这个组合的本地验证。MSRV 一致性单独由
-// `integration_job_container_toolchain_matches_the_documented_msrv`
-// 盯住，这里不重复硬编码版本号。
-//
-// 会让这条测试变红的实现改法：把 `--network host` 或
-// `--add-host gateway.test:127.0.0.1` 删掉（改回写宿主 /etc/hosts 之类
-// 需要特权的步骤）。
-#[test]
-fn ignored_tests_run_inside_a_container_with_network_host_and_add_host() {
-    let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
-    assert!(run.contains("--network host"), "{run:?}");
-    assert!(run.contains("--add-host gateway.test:127.0.0.1"), "{run:?}");
-}
-
-// 卡死时要有清楚的诊断，理由与 unit_test_step_has_an_inner_timeout_
-// wrapper 相同。
-//
-// 会让这条测试变红的实现改法：把 run 里的 `timeout 1200` 删掉。
-#[test]
-fn ignored_tests_step_has_an_inner_timeout_wrapper() {
-    let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let run = run_code(step_by_name(steps, STEP_IGNORED_TESTS));
-    assert!(
-        run.contains("timeout 1200"),
-        "运行 --ignored 集成测试必须用 timeout 包一层，实际 {run:?}"
-    );
-}
-
-// 失败时导出容器日志：必须带 if: failure()，且真的在导出日志，且排在
-// 跑测试的步骤之后（对着还没起来的环境导出不出任何东西）。
-//
-// 会让这条测试变红的实现改法：删掉 `if: failure()`（改成无条件执行，
-// 或者干脆不设条件）、把 run 换成不含 "logs" 的命令、或者把这一步
-// 挪到"运行 --ignored 集成测试"前面。
-#[test]
-fn log_export_step_runs_only_on_failure_after_the_tests() {
-    let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let idx = step_index_by_name(steps, STEP_LOG_EXPORT);
-    let ignored_idx = step_index_by_name(steps, STEP_IGNORED_TESTS);
-    assert_eq!(steps[idx]["if"].as_str(), Some("failure()"));
-    assert!(run_code(&steps[idx]).contains("logs"), "{:?}", steps[idx]);
-    assert!(idx > ignored_idx, "日志导出必须排在测试步骤之后");
-}
-
-// 清理步骤：必须带 if: always()，真的执行 docker compose down -v，且
-// 排在所有测试相关步骤之后——提前清理会让"运行 --ignored 集成测试"
-// 对着已经被拆掉的环境执行。
-//
-// 会让这条测试变红的实现改法：删掉 `if: always()`（环境会在失败时永远
-// 留在 runner 上）、把 run 换成不含 "down -v" 的命令、或者把这一步挪到
-// "运行 --ignored 集成测试"前面。
-#[test]
-fn cleanup_step_always_tears_down_after_every_test_related_step() {
-    let doc = doc();
-    let steps = steps(job(&doc, INTEGRATION_JOB));
-    let idx = step_index_by_name(steps, STEP_CLEANUP);
-    assert_eq!(steps[idx]["if"].as_str(), Some("always()"));
-    assert!(
-        run_code(&steps[idx]).contains("down -v"),
-        "{:?}",
-        steps[idx]
-    );
-    for other in [
-        STEP_COMPOSE_UP,
-        STEP_WAIT_READY,
-        STEP_HARNESS_CERT,
-        STEP_IGNORED_TESTS,
-        STEP_LOG_EXPORT,
-    ] {
-        let other_idx = step_index_by_name(steps, other);
-        assert!(idx > other_idx, "清理步骤必须排在 {other:?} 之后");
-    }
 }
 
 // 会让这条测试变红的实现改法：把 deny job 换成别的 action，或者删掉
@@ -577,14 +469,14 @@ fn cargo_deny_step_checks_all_four_categories_not_a_narrowed_subset() {
 // `ci_workflow.rs` 原来的 15 条断言一条都不红——它们全部在 step 内容
 // 层面盯 run/if/uses，没有一条管到"整个 job 被静默关掉"这件事本身。
 //
-// 会让这条测试变红的实现改法：给 unit/integration/deny 任意一个 job
+// 会让这条测试变红的实现改法：给 unit/gateway-release/deny 任意一个 job
 // 加上 `continue-on-error` 或 `if` 字段（哪怕值是 `true`——job 级
 // `if` 本来就不该出现在这三个 job 上，它们该始终按 paths 过滤器的
 // 结果无条件运行）。
 #[test]
 fn no_job_has_a_continue_on_error_or_a_top_level_conditional() {
     let doc = doc();
-    for name in [UNIT_JOB, INTEGRATION_JOB, DENY_JOB] {
+    for name in ALL_JOBS {
         let j = job(&doc, name);
         assert!(
             j["continue-on-error"].is_badvalue(),
@@ -610,7 +502,7 @@ fn no_job_has_a_continue_on_error_or_a_top_level_conditional() {
 #[test]
 fn no_step_in_any_job_is_silently_disabled_with_if_false() {
     let doc = doc();
-    for job_name in [UNIT_JOB, INTEGRATION_JOB, DENY_JOB] {
+    for job_name in ALL_JOBS {
         for step in steps(job(&doc, job_name)) {
             let name = step["name"].as_str().unwrap_or("<unnamed>");
             assert!(
@@ -630,7 +522,7 @@ fn no_step_in_any_job_is_silently_disabled_with_if_false() {
 #[test]
 fn every_job_has_a_bounded_timeout() {
     let doc = doc();
-    for (name, at_most) in [(UNIT_JOB, 20), (INTEGRATION_JOB, 30), (DENY_JOB, 10)] {
+    for (name, at_most) in [(UNIT_JOB, 20), (GATEWAY_RELEASE_JOB, 20), (DENY_JOB, 10)] {
         let minutes = job(&doc, name)["timeout-minutes"]
             .as_i64()
             .unwrap_or_else(|| panic!("job {name} 没有 timeout-minutes"));
@@ -646,7 +538,7 @@ fn every_job_has_a_bounded_timeout() {
 #[test]
 fn every_step_in_every_job_has_a_name() {
     let doc = doc();
-    for job_name in [UNIT_JOB, INTEGRATION_JOB, DENY_JOB] {
+    for job_name in ALL_JOBS {
         for (i, name) in step_names(job(&doc, job_name)).iter().enumerate() {
             assert!(name.is_some(), "job {job_name} 的第 {i} 个 step 没有 name");
         }

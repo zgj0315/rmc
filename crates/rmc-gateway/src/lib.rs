@@ -50,6 +50,9 @@ pub mod server;
 pub mod status;
 pub mod throttle;
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
 #[cfg(test)]
 mod testing_verifier;
 

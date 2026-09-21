@@ -61,7 +61,14 @@ const STEP_UPLOAD: &str = "上传便携包";
 // DPAPI、托盘、电源事件；它验的是同一批逻辑在 Windows 的 std 与文件系统
 // 语义下成不成立。）每暴露一个问题就是一轮 20 分钟。它不削弱任何东西：
 // 有失败时退出码仍然非零，只是把所有测试目标跑完、一次把失败报全。
-const TEST_COMMAND: &str = "cargo test -p rmc-win -p rmc-app --no-fail-fast";
+// Task 12：多了 `-p rmc-gateway`。**加它是为了让 Windows 真跑端到端。**
+// `crates/rmc-gateway/tests/e2e.rs` 那 15 条把真客户端内核（rmc-core 的
+// Transport / TLS 指纹钉扣 / russh / pump / Supervisor）与真运维服务器
+// 接在一起跑；被它驱动的那一半代码最终交付在 Windows 上，而原来那套
+// docker 集成测试只在 Linux 容器里跑过——这条链路在 Windows 的 socket
+// 与文件系统语义下从来没有被端到端验证过一次。`core.yml` 的 unit job
+// 在 Linux 上跑同一批，两边都跑不是重复：它们验的是两个不同的平台。
+const TEST_COMMAND: &str = "cargo test -p rmc-win -p rmc-app -p rmc-gateway --no-fail-fast";
 const CLIPPY_COMMAND: &str = "cargo clippy -p rmc-win -p rmc-app --all-targets -- -D warnings";
 
 // 会让这条测试变红的实现改法：删掉两个 job 里的任意一个、改名、或者再加
