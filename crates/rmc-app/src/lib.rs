@@ -446,11 +446,26 @@ impl App {
 
     /// W200 第 2、3 条：启动时取回记住的密码，填进表单；取回失败时把
     /// Task 4 那四种分类的诊断话留在 [`Self::password_note`] 里。
+    ///
+    /// Task 11：连接码那半份跟密码存储无关——`self.secrets()` 两样都要
+    /// （落点 + 存储）才给 `Some`，而一台没有密码存储的机器（非 Windows，
+    /// 或者装配失败）**仍然应该记得上次连的是哪台**。没有存储时改走
+    /// [`remember::recall_code`]，只填 `form.code`，不产出
+    /// `password_note`（没有密文，没什么好解释的）。
     fn recall_password(&mut self) {
-        let Some((paths, store)) = self.secrets() else {
+        let Some(paths) = self.paths().cloned() else {
             return;
         };
-        self.password_note = remember::recall(&paths, store.as_ref()).fill(&mut self.form);
+        match self.secrets() {
+            Some((paths, store)) => {
+                self.password_note = remember::recall(&paths, store.as_ref()).fill(&mut self.form);
+            }
+            None => {
+                if let Some(code) = remember::recall_code(&paths) {
+                    self.form.code = code;
+                }
+            }
+        }
     }
 
     /// W200 第 1 条：连接成功之后按「记住密码」的勾存或清。
@@ -467,6 +482,23 @@ impl App {
             remember::SaveOutcome::Failed(e) => {
                 tracing::error!(error = %e, "记住密码失败");
             }
+        }
+    }
+
+    /// Task 11：连接成功之后把连接码落盘——**跟「记住密码」的勾无关**，
+    /// 也**不需要密码存储**（不像 [`Self::remember_password`]，这里只
+    /// 用 [`Self::paths`]）。没接上内核、或者连接码解析不出来（表单还
+    /// 没填完就走到了 `Connected`，理论上不该发生，但不假设）时什么
+    /// 都不做。
+    fn persist_connection_code(&self) {
+        let Some(paths) = self.paths() else {
+            return;
+        };
+        if self.form.parsed_code().is_none() {
+            return;
+        }
+        if let Err(e) = remember::persist_code(paths, &self.form) {
+            tracing::warn!(error = %e, "连接码落盘失败");
         }
     }
 
@@ -642,7 +674,12 @@ impl App {
         // W200 第 1 条：**连上了**才谈得上记住密码——口令没被运维服务器
         // 验过就存下来，等于把一个打错的口令记一年。
         if !matches!(before, State::Connected { .. }) && matches!(after, State::Connected { .. }) {
+            // 顺序要紧：`remember_password` 里的 `previous_key` 读的是
+            // 「上一次」那份连接码记录（W202 的孤儿密文清理靠它）——
+            // 必须在 `persist_connection_code` 把它覆盖成**这一次**的
+            // 连接码之前读到。
             self.remember_password();
+            self.persist_connection_code();
         }
 
         // W192：托盘跟着走。通知在前、重画在后——两者互不影响，但先算
@@ -1706,6 +1743,43 @@ mod tests {
             "{messages:?}"
         );
     }
+
+    /// **Task 11：连接成功那一拍连接码落盘；启动时预填。**
+    ///
+    /// 用的是 [`app_with_fake_core`]，接的 `Core::secrets` 是 `None`
+    /// （见它自己的实现，第 4 个参数）——这条测试因此顺带证明了
+    /// [`App::persist_connection_code`] 不依赖密码存储，跟
+    /// [`without_a_secret_store_nothing_is_remembered_but_the_code_still_persists`]
+    /// 是同一件事的两次验证，一次走假线、一次走真的 `Core::new`。
+    ///
+    /// 改红：把 `App::apply` 里 `self.persist_connection_code();` 那一行
+    /// 删掉——第一条断言（落盘）当场红；连带地第二个 `App` 也读不到
+    /// 连接码，第二组断言一起红。
+    #[test]
+    fn reaching_connected_persists_the_code_and_a_fresh_app_prefills_it() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let (mut app, _cmd, _ev) = app_with_fake_core(dir.path());
+        app.form = filled_form();
+        app.form.remember = false;
+
+        app.apply(TunnelEvent::State(State::Connected { degraded: false }));
+
+        assert!(
+            wiring::AppPaths::at(dir.path().to_path_buf())
+                .connection_code()
+                .exists(),
+            "连接成功却没有把连接码落盘"
+        );
+
+        // 新起一个 App，同一个落点——这就是「下一次启动」。
+        let (app2, _cmd2, _ev2) = app_with_fake_core(dir.path());
+        assert_eq!(
+            app2.form().code.trim(),
+            filled_form().code.trim(),
+            "连接码没有预填回来"
+        );
+        assert!(app2.form().password.is_empty(), "没勾记住密码，口令不回来");
+    }
 }
 
 /// Task 11 的接线：托盘（W192）与记住密码（W200）。
@@ -2130,10 +2204,22 @@ mod task11_tests {
         assert!(!app.form().remember);
     }
 
-    /// 没有密码存储（非 Windows，或者装配失败）时，这一整块**什么都不做**
-    /// ——尤其不许退回明文存盘。
+    /// 没有密码存储（非 Windows，或者装配失败）时，「记住密码」这一整块
+    /// **什么都不做**——尤其不许退回明文存盘。
+    ///
+    /// **Task 11 改过这条测试的一处断言**：在这一轮之前，`App` 唯一往
+    /// `connection_code()` 写字的路径挂在密码存储这一块底下（`save` 记
+    /// 密码时顺手写账号记录），所以「没有密封器」曾经等价于「连接码
+    /// 也不会落盘」。Task 11 把连接码独立成 [`remember::persist_code`]，
+    /// 只靠 [`App::paths`]，跟密码存储完全无关——这份记录不是秘密，一台
+    /// 没有 DPAPI 的机器（甚至非 Windows）一样应该记得住「上次连的是
+    /// 哪台」。所以这里改成断言它**存在**；`secrets_dir()` 那一条不变
+    /// ——那才是真正需要密封器的地方。
+    ///
+    /// 改红：把 `App::apply` 里 `self.persist_connection_code();` 那一行
+    /// 删掉——第一条断言（连接码该存在）当场红。
     #[test]
-    fn without_a_secret_store_nothing_is_remembered_and_nothing_is_written() {
+    fn without_a_secret_store_nothing_is_remembered_but_the_code_still_persists() {
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = wiring::AppPaths::at(dir.path().to_path_buf());
         let (cmd_tx, _cmd_rx) = mpsc::channel(4);
@@ -2148,8 +2234,8 @@ mod task11_tests {
 
         assert!(app.password_note().is_none());
         assert!(
-            !paths.connection_code().exists(),
-            "没有密封器却写了账号记录"
+            paths.connection_code().exists(),
+            "Task 11：连接码不该被「没有密封器」挡住——它不需要密封器"
         );
         assert!(!paths.secrets_dir().exists(), "没有密封器却建了密文目录");
         // 整个应用目录里不许出现明文口令。

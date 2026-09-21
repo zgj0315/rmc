@@ -26,7 +26,22 @@ use crate::theme::{color, input_border};
 use crate::Message;
 use iced::widget::{button, checkbox, column, container, row, space, text, text_input, Space};
 use iced::{Alignment, Border, Element, Length};
+use rmc_core::code::ConnectionCode;
+use rmc_core::state::State;
 use zeroize::Zeroizing;
+
+/// 「远程工程师请连接 … 端口 …」这一行的文案（Task 11）。
+///
+/// 只说 IP 与反向端口，不提账号或指纹——这两样运维方那边已经通过连接码
+/// 知道了，这一行是讲给**现场人员念给工程师听**用的，越短越好。IPv6
+/// 带方括号，跟连接码本体、`HostPort` 的 `Display` 一个规矩。
+pub fn engineer_hint(code: &ConnectionCode, port: u16) -> String {
+    let ip = match code.ip() {
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+        v4 => v4.to_string(),
+    };
+    format!("远程工程师请连接 {ip} 端口 {port}")
+}
 
 /// 卡片里的一行。
 fn line(content: iced::widget::Row<'_, Message>) -> Element<'_, Message> {
@@ -292,22 +307,32 @@ pub fn view<'a>(
     let editable = model.addresses_editable();
     let credentials = model.credentials_visible();
 
-    let mut body = column![
-        status_card(model, elapsed),
-        section("维护目标"),
-        card(addr_row(
+    let mut body = column![status_card(model, elapsed)];
+
+    // Task 11：已连接、拿到反向端口、连接码解析得出，三样都有才画这
+    // 一行——少了任何一样都没有一个确定的端口号可念给工程师听。未连接
+    // 或还没拿到端口时**不画**（不是空行占位），见
+    // `the_hint_line_appears_only_when_connected_with_a_port`。
+    if let (State::Connected { .. }, Some(port), Some(code)) =
+        (&model.state, model.forward_port, form.parsed_code())
+    {
+        body = body.push(text(engineer_hint(&code, port)).size(13));
+    }
+
+    let mut body = body
+        .push(section("维护目标"))
+        .push(card(addr_row(
             "一体机",
             form,
             (&form.appliance_host, &form.appliance_port),
             (Field::ApplianceHost, Field::AppliancePort),
             (Message::ApplianceHostChanged, Message::AppliancePortChanged),
             editable,
-        )),
-        section("运维服务器"),
-        server_card(form, editable, credentials, password_note),
-    ]
-    .spacing(12)
-    .padding(14);
+        )))
+        .push(section("运维服务器"))
+        .push(server_card(form, editable, credentials, password_note))
+        .spacing(12)
+        .padding(14);
 
     if credentials {
         body = body.push(hints(form));
@@ -482,6 +507,110 @@ mod tests {
             !appliance_row_matches(&marked, &baseline),
             "标红的一体机地址框跟正常的框画出来逐字节相同——\
              input_border 的结果没有进到 Border.color 里"
+        );
+    }
+
+    /// `engineer_hint` 的用词与两种地址形态（Task 11）：IPv4 原样，IPv6
+    /// 带方括号——跟连接码本体、`HostPort` 的 `Display` 一个规矩。
+    #[test]
+    fn engineer_hint_names_ip_and_port() {
+        let c = ConnectionCode::new(
+            AccountName::parse("tunnel-zhang").unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            22000,
+            ServerFingerprint::of_ed25519_public(&[7u8; 32]),
+        )
+        .expect("夹具必须合法");
+        assert_eq!(
+            engineer_hint(&c, 22003),
+            "远程工程师请连接 203.0.113.10 端口 22003"
+        );
+
+        // IPv6：`.expect(...)`——`ConnectionCode::new` 只在端口 0 时才
+        // 拒绝，这里端口是 22000，合法。
+        let v6 = ConnectionCode::new(
+            AccountName::parse("a").unwrap(),
+            "::1".parse().unwrap(),
+            22000,
+            *c.fingerprint(),
+        )
+        .expect("夹具必须合法");
+        assert_eq!(
+            engineer_hint(&v6, 22003),
+            "远程工程师请连接 [::1] 端口 22003"
+        );
+    }
+
+    /// 整棵树里有没有一段文字**含有** `needle`——跟只认全字匹配的
+    /// `Simulator::find(&str)` 不同（`iced_selector-0.14.0/src/lib.rs:53`
+    /// 的 `&str` 实现是 `content == *self`，不是 `contains`）。这一行的
+    /// 完整文本里带着 IP 与端口号，在还没连上、拿不到具体端口号之前，
+    /// 没有一个能提前写死的全字符串可以拿来断言「不存在」，所以要用
+    /// 子串匹配——跟 `tests/ui.rs` 的 `banned_in_tree`/`has_input` 同一
+    /// 个写法（`Candidate::Text` 手动 `contains`）。
+    fn contains_text(ui: &mut iced_test::Simulator<'_, Message>, needle: &str) -> bool {
+        ui.find(|c: iced_test::selector::Candidate<'_>| match c {
+            iced_test::selector::Candidate::Text { content, .. } if content.contains(needle) => {
+                Some(())
+            }
+            _ => None,
+        })
+        .is_ok()
+    }
+
+    /// 已连接且拿到端口才画这一行；未连接、还没拿到端口、或者端口是
+    /// 「上一轮」留下的陈旧值（重连期间）都不画（Task 11）。
+    ///
+    /// 三枪各打在不同的判断上，都**真的验过**（见 task-11-report.md）：
+    ///
+    /// 1. 把 `Some(port)` 换成 `_`、端口写死成 `0`——第二组断言（应当
+    ///    画出「…端口 22003」）会红，因为画出来的是「…端口 0」；
+    /// 2. 单独把 `State::Connected { .. }` 换成 `_`（保留
+    ///    `Some(port)`）——**这一枪打不红任何一组**，因为前两组场景里
+    ///    「未连接」与「无端口」总是同时出现，状态判断从未被单独考验
+    ///    过。第三组（Backoff + 陈旧端口）就是补这个洞的：`Backoff`
+    ///    期间 `forward_port` 不清（Task 10 的语义），单独去掉状态判断
+    ///    会让这一组红。
+    #[test]
+    fn the_hint_line_appears_only_when_connected_with_a_port() {
+        let mut m = Model::default();
+        let f = form_with_server("203.0.113.10", 22000);
+
+        assert!(
+            !contains_text(
+                &mut iced_test::simulator(view(&m, &f, None, None)),
+                "远程工程师请连接"
+            ),
+            "还没连接却画出了这一行"
+        );
+
+        m.apply(rmc_core::TunnelEvent::State(State::Connected {
+            degraded: false,
+        }));
+        m.apply(rmc_core::TunnelEvent::ForwardPort(22003));
+        assert!(
+            contains_text(
+                &mut iced_test::simulator(view(&m, &f, None, None)),
+                "远程工程师请连接 203.0.113.10 端口 22003"
+            ),
+            "连上了、也拿到端口了，却没画出这一行"
+        );
+
+        // `forward_port` 在 `Backoff` 期间**不清**（Task 10 定的语义，
+        // 见 `model.rs` 的 `forward_port_is_cleared_when_the_session_
+        // really_ends`）——重连时它还留着上一轮那个端口号。这一行必须
+        // 核对 `state` 也是 `Connected`，否则会在还没真的连上时照样念
+        // 出一个可能已经失效的端口。
+        m.apply(rmc_core::TunnelEvent::State(State::Backoff {
+            attempt: 1,
+            delay: std::time::Duration::from_secs(1),
+        }));
+        assert!(
+            !contains_text(
+                &mut iced_test::simulator(view(&m, &f, None, None)),
+                "远程工程师请连接"
+            ),
+            "重连中（forward_port 还留着上一轮的值）却画出了这一行"
         );
     }
 
