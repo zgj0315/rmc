@@ -7,8 +7,14 @@
 //! 这里。这里权衡过，仍然决定不把 `ValidatedAddresses` 塞进
 //! `TunnelParams`：
 //!
+//! **Task 13 注**：下面这段权衡里作为论据出现的 `tests/ssh_tunnel.rs` 与
+//! `gateway/test-env`（docker 夹具）**都已经不存在了**——集成测试换成了
+//! `crates/rmc-gateway/tests/e2e.rs` 的进程内端到端。这段记录原样保留是
+//! 因为它说明的是**结论怎么来的**，不是"今天还能去哪儿核对"；要重新评估
+//! R20 这个决定，得按 e2e.rs 那套新证据重走一遍，不能直接照搬下面的论据。
+//!
 //! - `ValidatedAddresses::validate` 拒绝一体机地址是本机回环——但
-//!   `tests/ssh_tunnel.rs` 对着 gateway/test-env 跑真实链路，一体机在
+//!   `tests/ssh_tunnel.rs` 对着 gateway/test-env 跑真实链路（**已删**），一体机在
 //!   宿主上就是靠 docker 端口映射发布成 `127.0.0.1:2322`，对这套集成
 //!   测试来说这恰恰是"需要指向 127.0.0.1 假一体机的测试"该用的地址，
 //!   `config.rs` 早给这类测试留了后门——`ValidatedAddresses::for_test`。
@@ -210,9 +216,12 @@ mod tests {
 
     #[test]
     fn tunnel_params_debug_never_prints_the_password() {
-        // 见 tests/ssh_tunnel.rs 里 password_never_appears_in_debug_output
-        // 的对等单元测试版本：这条不需要 docker 环境，任何 `cargo test`
-        // 都会跑到，钉住这条全局约束不依赖 #[ignore] 之外还能被验证。
+        // 这一条原本是 `tests/ssh_tunnel.rs::password_never_appears_in_
+        // debug_output`（docker 版集成测试，`#[ignore]`）的对等单元测试
+        // 版本。那份集成测试已随旧 docker 夹具删除（Task 10/13），所以
+        // **现在这条就是唯一钉住 `TunnelParams` 这一半的地方**，不再是
+        // 谁的影子。`Command` 那一半由 `state.rs::command_start_debug_
+        // never_prints_the_password` 钉。
         let p = TunnelParams {
             username: "tunnel-zhang".into(),
             password: Zeroizing::new("super-secret-pw".to_string()),

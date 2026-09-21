@@ -169,15 +169,18 @@ mod tests {
     /// -lf` 肉眼核对"这条现实世界的性质却已经悄悄碎了，没有任何测试会
     /// 变红。
     ///
-    /// 这里的 blob 和期望指纹都不是本模块算出来的：blob 是
-    /// `gateway/test-env` 里 `tunnel_host_ed25519_key.pub` 的公钥字段
-    /// （原始 OpenSSH base64，标准填充），期望指纹是对着同一把 key 跑
-    /// `ssh-keygen -lf` 读出来的，两者都是从 harness 里复制出来的固定值，
-    /// 不经过本模块任何函数计算。
+    /// 这里的 blob 和期望指纹都不是本模块算出来的：blob 是旧 docker 夹具
+    /// （`gateway/test-env`，已随 `gateway/` 目录在 Task 13 删除）里
+    /// `tunnel_host_ed25519_key.pub` 的公钥字段（原始 OpenSSH base64，
+    /// 标准填充），期望指纹是当时对着同一把 key 跑 `ssh-keygen -lf` 读出来
+    /// 的。**夹具没了不影响这两个常量**——它们的全部价值就在于是外部工具
+    /// 算出来、抄进来的固定值，抄进来之后就跟夹具再无关系，不经过本模块
+    /// 任何函数计算。想重新生成一组的话，随便一把 ed25519 公钥 +
+    /// `ssh-keygen -lf` 就够了。
     #[test]
     fn fingerprint_of_matches_a_golden_vector_from_the_harness_host_key() {
         use base64::Engine;
-        // gateway/test-env 里 tunnel_host_ed25519_key.pub 的公钥字段：
+        // 旧 docker 夹具里 tunnel_host_ed25519_key.pub 的公钥字段：
         //   ssh-ed25519 <这一串> root@buildkitsandbox
         const HARNESS_HOST_KEY_BASE64: &str =
             "AAAAC3NzaC1lZDI1NTE5AAAAIBEJjzpvcneu1b/9vNy6VGfPT4e4fI3VuHI4ZmmMxCvl";

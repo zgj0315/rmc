@@ -1,9 +1,14 @@
 //! 进程内的最小 SSH 服务端，只给本 crate 自己的测试用（`#[cfg(test)]`，
 //! 不进生产构建）。
 //!
-//! R40（第二轮评审发现）：`.github/workflows/gateway.yml` 按
+//! R40（第二轮评审发现，**记的是当时的状态**）：
+//! `.github/workflows/gateway.yml` 按
 //! `paths: ["gateway/**", ...]` 过滤，`crates/**` 下的改动不会触发任何
-//! 工作流；这个仓库目前没有任何 CI 会跑 `cargo build`/`cargo test`。
+//! 工作流；这个仓库当时没有任何 CI 会跑 `cargo build`/`cargo test`。
+//! **订正（Task 12/13）**：`core.yml` 从 Task 12 起在每一次推送上跑
+//! `cargo test -p rmc-core -p rmc-gateway`，`gateway.yml` 与 `gateway/`
+//! 目录都已在 Task 13 删除。这段记录留着是因为它说明了这个夹具为什么
+//! 存在，不是对今天 CI 的描述。
 //! `tests/ssh_tunnel.rs` 那十条 `#[ignore]` 用例因此从未被自动化跑过，
 //! 评审用一处编译器完全不会拦的改动（把 `check_server_key` 里的
 //! `self.known_hosts.check(...)?` 改成 `Err(_) => Ok(false)`）证明了这

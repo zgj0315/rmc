@@ -63,7 +63,9 @@ cargo test -p rmc-gateway                 # 含 tests/e2e.rs：真客户端内�
 再 `cargo test -p rmc-core -- --ignored --test-threads=1` 那 17 条」。
 那 17 条在 Task 10 随着「客户端 TLS 改成核对连接码指纹」一起删掉了
 （它们描述的是旧的公共 CA / known_hosts 世界），`fetch-harness-cert.sh`
-也不在了；Task 12 又把 CI 里那个 `integration` job 整个拿掉。
+也不在了；Task 12 又把 CI 里那个 `integration` job 整个拿掉；**Task 13 把
+`gateway/` 整个目录（含 `test-env/` 的 docker compose 与那批 python 测试）
+`git rm -r` 掉了**，所以上面那句话里提到的东西现在一件都不在仓库里。
 
 顶替它们的是 `crates/rmc-gateway/tests/e2e.rs`：同一条链路（Transport →
 TLS 指纹钉扣 → russh → 反向端口 → pump → Supervisor）对着一台**进程内
@@ -74,6 +76,7 @@ TLS 指纹钉扣 → russh → 反向端口 → pump → Supervisor）对着一�
 ## 口令处理
 
 口令只以 `Zeroizing<String>` 存在于内存，`TunnelParams` 与 `Command` 的
-`Debug` 实现都把它替换为 `<redacted>`，`tests/ssh_tunnel.rs` 与
-`supervisor.rs` 的 `#[cfg(test)]` 里都有用例断言口令不会出现在审计日志
-或 `Debug` 输出中。
+`Debug` 实现都把它替换为 `<redacted>`，`supervisor.rs` 与 `tunnel.rs` 的
+`#[cfg(test)]` 里都有用例断言口令不会出现在审计日志或 `Debug` 输出中。
+（这里原来还点名 `tests/ssh_tunnel.rs`——那份集成测试已随旧 docker 夹具
+一起删除，见上一节。）

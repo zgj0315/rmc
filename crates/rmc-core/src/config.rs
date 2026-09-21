@@ -19,9 +19,12 @@ impl Default for Config {
             // （`地址 [ gateway.company.com ] : [ 443 ]`）。
             gateway: HostPort::new("gateway.company.com", 443).expect("内置默认值必须自解析通过"),
             // R13 / 方案设计.md §3.8：一体机 SSH 默认端口是 61001，不是
-            // 22——gateway/test-env/appliance/Dockerfile 明确警告过不要把
-            // 这个端口简化回 22，因为 22 恰恰是掩盖这整类错误的值。主机部分
-            // 同样只是占位符，现场必须按实际网络修改。
+            // 22。22 恰恰是掩盖这整类错误的值——写错成 22 时，任何一台开着
+            // 普通 sshd 的机器都会"连上"，于是"连上了"不再能证明连的是一体机。
+            // （Task 13 之前这条依据引的是 `gateway/test-env/appliance/
+            // Dockerfile` 里的一段警告；那套 docker 夹具已经删除，理由本身
+            // 不依赖它，原样留在这里。）主机部分同样只是占位符，现场必须按
+            // 实际网络修改。
             appliance: HostPort::new("192.168.1.1", 61001).expect("内置默认值必须自解析通过"),
             log_dir: PathBuf::from("logs"),
         }
@@ -53,9 +56,10 @@ fn validate_addresses(gateway: &HostPort, appliance: &HostPort) -> Result<()> {
 ///
 /// `Config::validate` 拒绝 loopback 一体机与"一体机等于 Gateway"，但
 /// Supervisor（Task 10）处理 `Command::Start` 时用的地址来自 UI 直接输入，
-/// 并不天然打包成一份 `Config`（`Config` 还带着 `reverse_port`、
-/// `known_hosts_path` 等和这两条地址规则无关的字段），于是这两条规则从来
-/// 没人调用过。
+/// 并不天然打包成一份 `Config`（当时 `Config` 还带着 `reverse_port`、
+/// `known_hosts_path` 等和这两条地址规则无关的字段——那两个字段在 Task 10
+/// 已经删掉了，端口改由服务端分配、host key 改成核对连接码里的指纹），
+/// 于是这两条规则从来没人调用过。
 ///
 /// 这个类型把"校验通过"做成了拿到值本身的前提，而不是一个可以被跳过的
 /// 步骤：字段是私有的，本模块之外没有办法用结构体字面量绕过 `validate`
@@ -139,8 +143,9 @@ mod tests {
     #[test]
     fn default_config_uses_appliance_ssh_port_61001_not_22() {
         // 方案设计.md §3.8 明确要求内置默认端口 61001；brief 给的所有夹具
-        // 都写 22，而 gateway/test-env/appliance/Dockerfile 专门警告过不要
-        // 把这个端口简化回 22——22 恰恰是掩盖这整类错误的值。
+        // 都写 22，而 22 恰恰是掩盖这整类错误的值：写错成 22 时，任何一台
+        // 开着普通 sshd 的机器都会"连上"。理由见 `Config::default` 里
+        // `appliance` 那一行上方的注释。
         assert_eq!(Config::default().appliance.port(), 61001);
     }
 

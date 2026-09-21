@@ -1,3 +1,0 @@
-pytest==8.3.4
-tomli; python_version < "3.11"
-PyYAML==6.0.2

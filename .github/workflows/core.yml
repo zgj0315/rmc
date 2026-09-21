@@ -1,18 +1,20 @@
 name: core
 
 # R——CI（Task 12）：这份工作流要还的债是"本仓库至今没有任何 CI 会构建
-# Rust"——`gateway.yml` 的 paths 过滤器从来没包含 `crates/**`，改
-# rmc-core 一个字都不会触发任何工作流。下面的过滤器必须覆盖
-# `crates/**`、workspace 级 `Cargo.*`、`deny.toml`、`rust-toolchain.toml`
-# 与这份文件自己。
+# Rust"——当时仓库里唯一的工作流是 `gateway.yml`，它的 paths 过滤器从来
+# 没包含 `crates/**`，改 rmc-core 一个字都不会触发任何工作流。下面的过滤器
+# 必须覆盖 `crates/**`、workspace 级 `Cargo.*`、`deny.toml`、
+# `rust-toolchain.toml` 与这份文件自己。
 #
-# `gateway/**`（Task 12 说明）：这一条原本是为了让 `integration` job 的
-# docker 夹具（docker-compose.yml、sshd_tunnel_config、haproxy.cfg）改动
-# 也能触发 CI。**那个 job 在 Task 12 被整个删掉了**——网关不再是
-# sshd/haproxy/docker 拼出来的，集成测试换成了 `crates/rmc-gateway/tests/
-# e2e.rs` 那 15 条进程内端到端。`gateway/` 那个目录连同里面的东西由
-# Task 13 一并删除，**这一条 paths 也留给 Task 13 一起拿掉**：现在就删
-# 会让"那个目录还在、改它却不触发任何 CI"多存在一个提交的窗口。
+# Task 13：`gateway/**` 已从下面两行里拿掉，`gateway/` 那个目录与
+# `gateway.yml` 也一起删了。那一条原本是为了让 `integration` job 的 docker
+# 夹具（docker-compose.yml、sshd_tunnel_config、haproxy.cfg）改动也能触发
+# CI；那个 job 在 Task 12 就被整个删掉了——运维服务器不再是 sshd/haproxy/
+# docker 拼出来的，集成测试换成了 `crates/rmc-gateway/tests/e2e.rs` 那
+# 15 条进程内端到端。**一条指向不存在目录的 paths 不会让任何东西变红**，
+# 所以 `crates/rmc-core/tests/ci_workflow.rs` 里
+# `paths_filter_has_no_entries_beyond_the_documented_seven` 用一条全等断言
+# 钉住"不多不少正好这七条"。
 #
 # R（复审发现，中低）：`rust-toolchain.toml` 决定 CI 实际用的编译器
 # （目录级 override，优先级比 `dtolnay/rust-toolchain` 那一步的
@@ -32,9 +34,9 @@ name: core
 # 钉住这一行。
 on:
   push:
-    paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml", ".github/workflows/app.yml"]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml", ".github/workflows/app.yml"]
   pull_request:
-    paths: ["crates/**", "gateway/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml", ".github/workflows/app.yml"]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", "deny.toml", "rust-toolchain.toml", ".github/workflows/core.yml", ".github/workflows/app.yml"]
 
 jobs:
   # 格式、clippy（-D warnings，本仓库一贯的验证标准）、rmc-core 与

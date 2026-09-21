@@ -1,6 +1,10 @@
 //! 对 `.github/workflows/core.yml` 的纯解析测试，不起 docker、不碰
-//! GitHub Actions——写法与立意都照抄 `gateway/tests/test_ci_workflow.py`
-//! （见该文件顶部模块文档，那边有一次真实踩坑的完整记录）。
+//! GitHub Actions。
+//!
+//! 写法与立意继承自一份 python 测试（`gateway/tests/test_ci_workflow.py`），
+//! **那份文件连同整个 `gateway/` 目录已在 Task 13 删除**。它带过来的两条
+//! 教训不再靠"去翻那个文件"传递，已经原地写在下面「定位 step 必须按 `name`
+//! 精确匹配」与「守得住整个 step/job 被静默关掉」两节里。
 //!
 //! # Task 12 的改动
 //!
@@ -26,8 +30,10 @@
 //! 路径过滤器漏写一个目录、`--ignored` 被删掉、`if: always()` 被误删、
 //! 清理步骤被挪到测试步骤前面——这些回归都不会让 `cargo build` 报错，
 //! 只会在下一次真的推到 GitHub 上时才现形，而且现形的方式往往是
-//! "安静地不跑"，不是一次响亮的失败（gateway 那条分支上的 `RMC_KEEP_
-//! ENV` 回归就是这种形状）。这份测试把工作流 YAML 解析成结构化数据，
+//! "安静地不跑"，不是一次响亮的失败（旧那套 docker 夹具上的
+//! `RMC_KEEP_ENV` 回归就是这种形状——那批测试已随 `gateway/` 一起删除，
+//! 这里留下的是失败的**形状**，不是一个还能去翻的出处）。
+//! 这份测试把工作流 YAML 解析成结构化数据，
 //! 逐条钉住"改哪一行会让这份工作流退化成什么样"。
 //!
 //! 用 `yaml-rust2` 而不是手写一个只覆盖当前文件形状的迷你解析器：这份
@@ -37,8 +43,10 @@
 //!
 //! # 定位 step 必须按 `name` 精确匹配，不能按关键字子串
 //!
-//! 同 `test_ci_workflow.py` 踩过的坑（该文件模块文档"定位 step 必须按
-//! name 精确匹配"一节）：`step_by_name` 找不到、或撞上不止一个同名
+//! 这是从那份已删除的 python 测试继承来的第一条教训，原地记在这里：
+//! 按关键字子串去找 step（"名字里带 test 的那个"）会在有人新增一个同样
+//! 带该关键字的 step 时**悄悄挑错对象**，断言照样通过。所以
+//! `step_by_name` 按 `name` 整串精确匹配，找不到、或撞上不止一个同名
 //! step，都直接 `panic`，不返回哨兵值——静默的查找失败会让后面的断言
 //! 在错误的 step 上稳定通过，等于没测。
 //!
@@ -54,8 +62,9 @@
 //! conditional`、`no_step_in_any_job_is_silently_disabled_with_if_
 //! false`、`unit_test_step_runs_the_complete_test_suite_not_a_
 //! narrowed_subset`、`cargo_deny_step_checks_all_four_categories_
-//! not_a_narrowed_subset` 四条补上这一层——跟 gateway 那次踩的坑
-//! （步骤排序对了，但"把它整个关掉"这条路没堵）是同一族退化。
+//! not_a_narrowed_subset` 四条补上这一层。这是从那份已删除的 python
+//! 测试继承来的第二条教训：它当年也只钉住了"步骤排序对不对"，
+//! "把它整个关掉"这条路一直没堵——同一族退化。
 //!
 //! MSRV 的漂移是另一类没堵住的洞：`dtolnay/rust-toolchain` 那一步的
 //! 版本号字面量不是 CI 实际用的编译器版本——`rust-toolchain.toml` 的
@@ -129,17 +138,37 @@ fn workflow_file_parses_as_yaml_with_exactly_three_jobs() {
     );
 }
 
-// 这是整个任务要还的债的根：`gateway.yml` 的 paths 过滤器从来没覆盖过
-// `crates/**`，改 rmc-core 一个字都不会触发任何工作流。
+// 这条过滤器守的是「改了什么，这份工作流就必须跑一遍」。今天它必须覆盖
+// 的是下面断言里那七条，每一条都对应一种"改了它、CI 却不跑"的静默失效：
 //
-// `gateway/**` 原本是为了让 `integration` job 的 docker 夹具改动也触发
-// CI。Task 12 删掉了那个 job，但**这一条 paths 仍然留着**：`gateway/`
-// 那个目录还在仓库里，由 Task 13 连同这一条一起删。现在就拿掉会多出一个
-// "目录还在、改它却不触发任何 CI"的提交窗口，那正是这份文件通篇在防的
-// 那种"安静地不跑"。
-// `rust-toolchain.toml` 决定 CI 实际用的编译器（见下面
-// `unit_job_pins_the_toolchain_to_the_documented_msrv`），漏了这条
-// 路径，改工具链版本不会触发任何验证。
+// - `crates/**`：全部 Rust 源码与测试，包括 `crates/rmc-gateway/tests/
+//   e2e.rs` 那 15 条进程内端到端。这是整份工作流当初要还的债的根——在它
+//   之前，本仓库唯一的工作流是 `gateway.yml`，那份过滤器从来没覆盖过
+//   `crates/**`，改 rmc-core 一个字都不会触发任何 CI；
+// - `Cargo.toml` / `Cargo.lock` / `deny.toml`：依赖图与审计规则，见下面
+//   `dependency_audit_triggers_on_every_file_that_can_change_the_
+//   dependency_graph`；
+// - `rust-toolchain.toml`：它决定 CI 实际用的编译器（目录级 override，
+//   优先级比 `dtolnay/rust-toolchain` 那一步更高），漏了它，改工具链版本
+//   不会触发任何验证，见 `unit_job_pins_the_toolchain_to_the_documented_msrv`；
+// - `.github/workflows/core.yml` 自己，以及 `.github/workflows/app.yml`
+//   （理由见 core.yml 顶部那段注释：守 app.yml 的那份测试跑在
+//   `cargo test -p rmc-core` 里，也就是**这份**工作流里）。
+//
+// **`"gateway/**"` 在 Task 13 从这份列表里去掉了**：它当年在这里是为了让
+// `integration` job 的 docker 夹具（docker-compose.yml、sshd_tunnel_config、
+// haproxy.cfg）改动也能触发 CI。那个 job 在 Task 12 被整个删掉，`gateway/`
+// 那个目录本身在 Task 13 被 `git rm -r` 删掉——**这条路径今天指向一个不存在的
+// 目录**，留着只会让人以为仓库里还有那么一块东西。留下这段说明而不是无声删掉，
+// 是因为"过滤器里少了一条"和"过滤器里多了一条死路径"是两种不同的问题，
+// 后者读代码的人看不出来。
+//
+// **这条断言只管"少了一条"**：`assert_paths_filter_covers` 做的是包含
+// 检查（它还要服务 `app_workflow.rs` 里一处只传一条路径的调用，所以不能
+// 改成全等）。"多了一条指向不存在目录的死路径"——也就是 Task 13 刚从
+// core.yml 里清掉的那种——它抓不到，由下面
+// `paths_filter_has_no_entries_beyond_the_documented_seven` 那条全等断言
+// 补上。两条合起来才是"不多不少正好这七条"。
 //
 // 会让这条测试变红的实现改法：把 `on.push.paths`/`on.pull_request.
 // paths` 里的任意一条删掉，或者只写在 push 里、漏了 pull_request
@@ -152,7 +181,8 @@ fn paths_filter_covers_the_directories_and_files_this_workflow_depends_on() {
         WORKFLOW,
         &[
             "crates/**",
-            "gateway/**",
+            // `"gateway/**"` 曾经在这里，Task 13 随 `gateway/` 目录一起删除，
+            // 理由见上面那段注释。
             "Cargo.toml",
             "Cargo.lock",
             "deny.toml",
@@ -161,6 +191,41 @@ fn paths_filter_covers_the_directories_and_files_this_workflow_depends_on() {
             ".github/workflows/app.yml",
         ],
     );
+}
+
+/// 上面那条断言的另一半：paths 里**只**有那七条，一条都不多。
+///
+/// Task 13 新增。动机是这一轮真实发生过的事：`"gateway/**"` 在
+/// `integration` job 被删（Task 12）之后又在过滤器里多活了一整轮，指向的
+/// 目录到 Task 13 才真的消失。一条指向不存在目录的路径不会让任何东西变红
+/// ——GitHub 不校验它，包含式断言也只问"该有的在不在"。它的害处不是让 CI
+/// 少跑，而是让读这份过滤器的人以为仓库里还有那么一块东西。
+///
+/// 会让这条测试变红的实现改法：往 `core.yml` 的 `on.push.paths` 或
+/// `on.pull_request.paths` 里加任意一条（比如把 `"gateway/**"` 加回去），
+/// 或者把两侧写成不一样的两套。
+#[test]
+fn paths_filter_has_no_entries_beyond_the_documented_seven() {
+    let doc = doc();
+    let expected = [
+        "crates/**",
+        "Cargo.toml",
+        "Cargo.lock",
+        "deny.toml",
+        "rust-toolchain.toml",
+        ".github/workflows/core.yml",
+        ".github/workflows/app.yml",
+    ];
+    for trigger in ["push", "pull_request"] {
+        let paths = doc["on"][trigger]["paths"]
+            .as_vec()
+            .unwrap_or_else(|| panic!("{WORKFLOW} 的 on.{trigger}.paths 应该是一个序列"));
+        let texts: Vec<&str> = paths.iter().filter_map(Yaml::as_str).collect();
+        assert_eq!(
+            texts, expected,
+            "{WORKFLOW} 的 on.{trigger}.paths 必须不多不少正好这七条"
+        );
+    }
 }
 
 // Task 12 追加。**这条测试是对 W219 的订正的落地。**
@@ -173,8 +238,8 @@ fn paths_filter_covers_the_directories_and_files_this_workflow_depends_on() {
 // 一步是 `uses: EmbarkStudios/cargo-deny-action@v2`。）
 //
 // 但顺着那条怀疑真查出来一个**小一号、真实存在**的洞：上面那条 paths 断言
-// 原来只要求 `crates/**`/`gateway/**`/`rust-toolchain.toml` 三条，
-// **`Cargo.lock` 与 `deny.toml` 谁都没钉**。一次只动 `Cargo.lock` 的
+// 原来只要求三条路径（`crates/**`、`rust-toolchain.toml`，以及当时还在的
+// `gateway/**`），**`Cargo.lock` 与 `deny.toml` 谁都没钉**。一次只动 `Cargo.lock` 的
 // `cargo update`（引进一条新的 RUSTSEC 公告、或者一个新的许可证），在
 // 「有人手滑把 `Cargo.lock` 从 paths 里删掉」之后就再也不会触发
 // `deny` job——形状跟 W219 担心的一模一样，只是范围小得多。

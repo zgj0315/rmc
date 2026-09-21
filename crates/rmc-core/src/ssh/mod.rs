@@ -245,14 +245,21 @@ impl TunnelFactory for SshTunnelFactory {
 /// 握手、host key 校验、认证、反向端口注册的核心逻辑，不关心 `conn`
 /// 从哪来。
 ///
-/// R40（第二轮评审发现）：这个 crate 唯一会跑 Rust 代码的 CI 工作流
+/// R40（第二轮评审发现，**下面这段描述的是当时的状态，见段末的订正**）：
+/// 这个 crate 唯一会跑 Rust 代码的 CI 工作流
 /// （`.github/workflows/gateway.yml`）按 `paths: ["gateway/**", ...]`
-/// 过滤，`crates/**` 下的改动根本不会触发它；这个仓库目前没有任何工作流
+/// 过滤，`crates/**` 下的改动根本不会触发它；这个仓库当时没有任何工作流
 /// 会跑 `cargo test`。`tests/ssh_tunnel.rs` 那十条 `#[ignore]` 用例因此
 /// 事实上从未被任何自动化跑过——评审把 `check_server_key` 里的错误
 /// 传播路径改写成"吞掉 Err、诚实地返回 `Ok(false)`"这种编译器完全不会
 /// 拦的写法之后，`cargo test -p rmc-core` 仍然 122/122 全绿，因为真正
 /// 会撞上这条路径的测试全都在那十条从不运行的 `#[ignore]` 里。
+///
+/// **订正（Task 12/13）**：`core.yml` 从 Task 12 起在每一次推送上跑
+/// `cargo test -p rmc-core -p rmc-gateway`；`gateway.yml`、`gateway/`
+/// 目录与 `tests/ssh_tunnel.rs` 那十条 `#[ignore]` 都已删除，同一条链路
+/// 改由 `crates/rmc-gateway/tests/e2e.rs` 在每一次 `cargo test` 里跑。
+/// 上面那段是 R40 当时的现场记录，不是对今天的描述。
 ///
 /// 把 `establish()` 拆成"拨号"（`Transport::connect`，需要真实网络）和
 /// `establish_over()`（握手往后的一切，只需要一条 `AsyncRead +

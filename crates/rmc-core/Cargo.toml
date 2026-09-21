@@ -41,14 +41,17 @@ rustls-pki-types = { version = "1", default-features = false, features = ["std"]
 # 真的选中其中一个并回一张 RSA host key，本 crate 到 `parse_public_
 # key` 那一步会因为缺 `rsa` feature 解析失败，这条失败经
 # `SshTransport` 归类到 `ErrorClass::Network`——对一台完全正常、只是
-# 恰好用 RSA host key 的 Gateway，客户端会无限退避重连，而不是报一条
-# "host key 类型不受支持"。**当前无害**：`gateway/sshd_tunnel_config`
-# 钉死 `HostKey /etc/ssh/tunnel_host_ed25519_key`，服务端只有这一个
-# host key，永远不会被协商选中 RSA。但这是 rmc-core 与 gateway 两个
-# repo 之间的隐性耦合，不是 rmc-core 自己能保证的性质——gateway 那边
-# 一旦改动 `sshd_tunnel_config` 加回 RSA host key（或者接了另一台
-# 用别的 sshd 实现的 Gateway），这里会在完全不知情的情况下从"能连"
-# 变成"无限重连"。
+# 恰好用 RSA host key 的运维服务器，客户端会无限退避重连，而不是报一条
+# "host key 类型不受支持"。**当前无害**：服务端是本仓库自己的
+# `rmc-gateway`，`crates/rmc-gateway/src/identity.rs` 里身份密钥只有
+# ed25519 一种，host key 就是它，永远不会被协商选中 RSA。
+# （Task 13 之前这句话的依据是 `gateway/sshd_tunnel_config` 里的
+# `HostKey /etc/ssh/tunnel_host_ed25519_key`；那份配置连同整个
+# `gateway/` 目录已经删除，依据换成了同一个 workspace 里的代码，
+# 耦合从"两个 repo 之间的口头约定"收紧成"`cargo test --workspace`
+# 覆盖得到的一处实现"。）但这仍然不是 rmc-core 自己能保证的性质：
+# 哪天把客户端指向另一台用别的 SSH 实现的服务器，这里会在完全不知情的
+# 情况下从"能连"变成"无限重连"。
 russh = { version = "0.63", default-features = false, features = ["ring"] }
 # 只开 local-offset：审计日志的时间戳想显示现场笔记本的本地时间，不是
 # UTC。不开 formatting/macros——本模块自己手写 format! 拼时间戳，不用
