@@ -41,6 +41,19 @@ pub(crate) struct Parsed {
 
 /// `--k v` 与 `--k=v` 两种写法；`FLAGS` 里的无值开关只认「出现」，值固定为
 /// `"true"`，不吃下一个参数；不带 `--` 的按顺序进 cmd。
+///
+/// **修复轮 1/5，评审 Blocking，已修**：`--allow-root=false` 原来会落进
+/// `split_once('=')` 那一支（它排在 `FLAGS` 检查之前，且不管 `k` 是不是
+/// 无值开关都直接收值），存成 `("allow-root", "false")`；`cmd_serve` 只查
+/// `p.opt("allow-root").is_some()`，`Some("false")` 一样是 `Some`——一个人
+/// 想显式**关掉**「允许 root」而写了 `--allow-root=false`，结果反而**放行**
+/// 了 root。这是一个安全开关上的静默相反行为，代价是一次拼写习惯上的误用
+/// 就能以 root 把服务跑起来，不能只按「影响面小」打 Minor。
+///
+/// 改法：`FLAGS` 里的名字**不允许**带 `=`，一旦出现 `--<flag>=<任何值>`，
+/// 直接拒绝成用法错误（退出码 2），错误信息说清「这是无值开关，不要带
+/// `=`」——明确报错比静默猜测使用者想要哪个值安全；`--allow-root` 本身
+/// （不带 `=`）继续按无值开关处理。
 pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut cmd = Vec::new();
     let mut opts = Vec::new();
@@ -49,6 +62,13 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         let a = &args[i];
         if let Some(k) = a.strip_prefix("--") {
             if let Some((k, v)) = k.split_once('=') {
+                if FLAGS.contains(&k) {
+                    return Err(format!(
+                        "--{k} 是一个无值开关，不要带 `=`：写 --{k} 本身就够了，\
+                         不要写成 --{k}={v}（这样写会被误当成给它赋了一个字符串值，\
+                         而不是真的关掉它）"
+                    ));
+                }
                 opts.push((k.to_string(), v.to_string()));
             } else if FLAGS.contains(&k) {
                 opts.push((k.to_string(), "true".to_string()));
@@ -396,6 +416,19 @@ fn cmd_serve(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         return 1;
     }
     let dir = p.data_dir();
+    // **修复轮 1/5，评审 Important，已修**：`serve` 是第一个用户真会敲的
+    // 命令。数据目录从来没被 `init` 建过时，下面 `owned_by_current_user`
+    // 的探针（往目录里建一个临时文件）会因为目录不存在而失败，原来直接把
+    // 那条裸 io 错误（"No such file or directory (os error 2)" 这种）
+    // 甩给用户——第一次用就撞上一条读不懂的系统错误，体验很差。这里先用
+    // `Identity::load_from` 探一下身份密钥是不是在（`init` 落盘的第一份
+    // 文件），它自己的错误文案已经带了「先运行 init」这句提示（见
+    // `identity.rs::load_from`），跟 `account` 系列子命令用的 `load()`
+    // helper 是同一套说法，不用在这里重新编一遍。
+    if let Err(e) = Identity::load_from(&dir) {
+        let _ = writeln!(err, "{e}");
+        return 1;
+    }
     match dir.owned_by_current_user() {
         Ok(true) => {}
         Ok(false) => {
@@ -511,23 +544,50 @@ fn cmd_status(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
+/// systemd 的 `ExecStart=`/`ReadWritePaths=` 都按空白切分成一串 token
+/// （`systemd.syntax(7)`「quoting」那一节），跟 shell 的分词规则很像但不
+/// 是同一套实现；一个 token 内部要是含空白，就必须用双引号包起来，双引号
+/// 与反斜杠本身也要转义，否则空白会被当成 token 分隔符。
+///
+/// **修复轮 1/5，评审 Blocking，已修**：这里原来直接把路径/选项值拼进
+/// 格式化字符串，一个字符都没转义。数据目录带空格（比如 `--data-dir
+/// "/srv/rmc gateway"`，或者二进制装在带空格的路径下）时，systemd 会把
+/// `--data-dir` 与 `ReadWritePaths=` 里的路径从空格处切成两段——服务照样
+/// 能起来，但 `--data-dir` 实际吃到的只是空格前那一半，指向一个错的（或
+/// 者不存在的）目录，而且**不报错**，运维很难查到这是路径拼接没加引号
+/// 造成的。
+fn quote_systemd_arg(s: &str) -> String {
+    if s.chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+    {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_string()
+    }
+}
+
 fn cmd_service_print(p: &Parsed, out: &mut dyn Write, _err: &mut dyn Write) -> i32 {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "rmc-gateway".into());
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "/usr/local/bin/rmc-gateway".into());
+    let exe = quote_systemd_arg(
+        &std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "/usr/local/bin/rmc-gateway".into()),
+    );
     let dir = p.data_dir();
-    let mut args = format!("serve --data-dir {}", dir.root().display());
+    let dir_display = dir.root().display().to_string();
+    let mut args = format!("serve --data-dir {}", quote_systemd_arg(&dir_display));
     if let Some(l) = p.opt("listen") {
-        args.push_str(&format!(" --listen {l}"));
+        args.push_str(&format!(" --listen {}", quote_systemd_arg(l)));
     }
     for (k, v) in &p.opts {
         if k == "engineer-allow" {
-            args.push_str(&format!(" --engineer-allow {v}"));
+            args.push_str(&format!(" --engineer-allow {}", quote_systemd_arg(v)));
         }
     }
+    let read_write_paths = quote_systemd_arg(&dir_display);
     // **只打印文本，不动系统**：本程序自己不建用户、不写 /etc、不调
     // systemctl。装不装这个单元、`useradd` 那个专用用户，都是管理员自己
     // 决定与执行的事——这里的注释与下面 systemd 单元里的注释是给管理员
@@ -553,12 +613,11 @@ RestartSec=2
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths={dir}
+ReadWritePaths={read_write_paths}
 
 [Install]
 WantedBy=multi-user.target
-",
-        dir = dir.root().display()
+"
     );
     0
 }
@@ -678,6 +737,13 @@ mod tests {
         assert!(err.contains("init"), "{err}");
     }
 
+    /// **修复轮 1/5，评审 Important，补的「改红」**：brief 原文没给这条测试
+    /// 配注释，评审逐条核实覆盖面后要求补齐。
+    ///
+    /// 改红：把 `refuse_root` 里 `if is_root && !allow_root` 的 `!allow_root`
+    /// 那个 `!` 删掉（变成 `if is_root && allow_root`）——`refuse_root(true,
+    /// false)` 这时候算出 `true && false = false`，函数返回 `None`，第一句
+    /// `assert!(refuse_root(true, false).is_some())` 红。
     #[test]
     fn refuse_root_is_a_pure_rule() {
         assert!(refuse_root(true, false).is_some());
@@ -702,6 +768,11 @@ mod tests {
         assert_eq!(p.opt("listen"), Some("0.0.0.0:22000"));
     }
 
+    /// **修复轮 1/5，评审 Important，补的「改红」**：同上，brief 没配，
+    /// 评审要求补齐。
+    ///
+    /// 改红：把 `cmd_status` 里 `Ok(None) => { ...; 3 }` 那一支的退出码
+    /// `3` 改成 `0`——`assert_eq!(code, 3)` 红。
     #[test]
     fn status_before_serve_says_not_running() {
         let tmp = tempfile::tempdir().unwrap();
@@ -710,6 +781,14 @@ mod tests {
         assert!(out.contains("没有在跑"), "{out}");
     }
 
+    /// **修复轮 1/5，评审 Important，补的「改红」**：同上，brief 没配，
+    /// 评审要求补齐。
+    ///
+    /// 改红：把 `cmd_service_print` 里 `for (k, v) in &p.opts { if k ==
+    /// "engineer-allow" { ... } }` 那一段整段删掉——输出里不再出现
+    /// `--engineer-allow 10.0.0.0/8` 这个片段，`for needle in [...]`
+    /// 循环里那一句 `assert!(out.contains(needle), ...)` 红（命中的是
+    /// `"--engineer-allow 10.0.0.0/8"` 这个 needle）。
     #[test]
     fn service_print_carries_the_data_dir_listen_and_allow_list() {
         let tmp = tempfile::tempdir().unwrap();
@@ -807,5 +886,116 @@ mod tests {
             .map(|v| v["action"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(actions, vec!["add", "passwd", "revoke"]);
+    }
+
+    /// **修复轮 1/5，评审 Blocking，新增**：`--allow-root=false` 这种写法
+    /// 曾经会被静默接受成"允许 root"（`split_once('=')` 那一支不管 `k`
+    /// 是不是无值开关都直接收值，`cmd_serve` 只看 `is_some()`），是安全
+    /// 开关上的静默相反行为。现在改成一律拒绝成用法错误。
+    ///
+    /// 改红：把 `parse` 里新加的 `if FLAGS.contains(&k) { return
+    /// Err(...) }` 那一支删掉（退回到修复前的行为）——`parse(...)` 不再
+    /// 报错，`assert!(parse(...).is_err())` 红；即使只看值，
+    /// `p.opt("allow-root")` 会变成 `Some("false")`，跟"应该报错、不该有
+    /// 这个值"这件事本身就矛盾。
+    #[test]
+    fn allow_root_with_equals_is_a_usage_error_not_a_silent_value() {
+        let err = match parse(&["serve".to_string(), "--allow-root=false".to_string()]) {
+            Err(e) => e,
+            Ok(_) => panic!("--allow-root=<任何值> 都该被拒绝，不该被当成一个正常选项接受"),
+        };
+        assert!(err.contains("allow-root"), "{err}");
+        assert!(err.contains('='), "{err}");
+    }
+
+    /// **修复轮 1/5，评审 Important，新增**：`serve` 是第一个用户真会敲的
+    /// 命令，从没 `init` 过的数据目录不该甩给用户一条读不懂的裸 io 错误。
+    ///
+    /// **这条测试专门用一个连目录本身都没建过的路径**（`base.path().join(
+    /// "brand-new")`，只拼路径字符串，从不 `create_dir`），不是随手
+    /// `tempfile::tempdir()` 给的那种"目录已经存在，只是没跑 init"的路径
+    /// ——这个区分是实测出来的，不是随便选的：如果目录已经存在，
+    /// `dir.owned_by_current_user()` 的探针（往目录里建一个临时文件）
+    /// 本身就会成功，不管有没有加 `Identity::load_from` 那道早检查，
+    /// 执行都会往下走到 `Server::bind` 内部才因为读不到 `identity.key`
+    /// 失败——错误文本里同样带"先运行 init"，两条路径殊途同归，那种
+    /// 写法测不出「加了早检查以后到底改变了什么」。**只有目录本身就不
+    /// 存在**这种场景才能分开两条路径：不加早检查会先撞上
+    /// `owned_by_current_user` 的裸 io 错误（"检查数据目录失败：{e}"，
+    /// 不含 "init"）。
+    ///
+    /// **「改红」实测记录，如实写下走过的两次弯路**（第二次是我自己的
+    /// 测试写错，不是"照 brief 字面注入"那种假支票，但同样是"字面上像
+    /// 改红、实测却全绿"，按同一条纪律处理）：
+    ///
+    /// 1. 最初这条测试用的是 `tempfile::tempdir().unwrap()` 给的、已经
+    ///    存在的目录，字面删掉 `cmd_serve` 里那段 `if let Err(e) =
+    ///    Identity::load_from(&dir) { ...; return 1; }`，实测**全绿**——
+    ///    跟上一段分析的原因一致：`owned_by_current_user()` 在已存在的
+    ///    目录上直接成功，执行流继续往下走进
+    ///    `rt.block_on(serve_until(...))`，`Server::bind` 内部的
+    ///    `Identity::load_from(&cfg.data)` 一样失败、一样把同一句"先运行
+    ///    init"的错误文本冒泡回 `cmd_serve` 的 `Err(e)` 分支——最终看到的
+    ///    `code`/`err` 跟没删这段代码时一模一样，这是一张假支票。
+    /// 2. 改用"目录本身不存在"的路径后，第一版把目录名字写成
+    ///    `"never-initialized"`——删掉早检查再跑，`assert!(err.contains(
+    ///    "init"))` 仍然**全绿**，用 `eprintln!` 打出 `err` 实际内容才
+    ///    发现：`err` 是裸 io 错误"检查数据目录失败：No such file or
+    ///    directory ... at path .../never-initialized/.tmpXXXX"，根本不含
+    ///    程序打印的"先运行 init"提示——但 `err.contains("init")` 照样
+    ///    为真，因为**目录名字自己**"never-**init**ialized"里字面包含
+    ///    子串 "init"！断言测的是路径字符串里偶然出现的四个字符，不是
+    ///    程序真的打印了那句提示。这是我自己出的一张假支票，改法是换一个
+    ///    不含 "init" 子串的目录名（`"brand-new"`），断言才是真的在测
+    ///    程序输出而不是测目录名拼字。
+    ///
+    /// 改红（用上面这个不含 "init" 子串的目录名重新验证过，确认真红）：
+    /// 把 `cmd_serve` 里 `if let Err(e) = Identity::load_from(&dir) {
+    /// ...; return 1; }` 那一段删掉——`serve` 会往下走到
+    /// `dir.owned_by_current_user()`，对一个不存在的目录探针建临时文件会
+    /// 失败，落进 `Err(e) => "检查数据目录失败：{e}"` 那一支，错误文本里
+    /// 不会再出现 "init" 这个词，`assert!(err.contains("init"))` 红。
+    #[test]
+    fn serve_before_init_says_run_init_first() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("brand-new");
+        let (code, _, err) = run_in(&dir, &["serve"]);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains("init"), "{err}");
+    }
+
+    /// **修复轮 1/5，评审 Blocking，新增**：`service print` 原来直接把
+    /// 路径拼进 `ExecStart=`/`ReadWritePaths=`，一个字符都不转义。数据
+    /// 目录带空格时 systemd 会把它从空格处切成两个 token——服务能起来，
+    /// 但指向的是错的半截路径，而且不报错。
+    ///
+    /// 改红：把 `quote_systemd_arg` 在拼 `args`（`--data-dir` 那一句）与
+    /// `read_write_paths` 处的调用都换成不加引号的裸 `dir_display`——
+    /// 两句 `contains(&quoted)` 断言都会红：输出里出现的是没加引号、
+    /// 从空格处能被 systemd 切开的裸路径，不是整段被双引号包住的路径。
+    #[test]
+    fn service_print_quotes_a_data_dir_containing_whitespace_for_systemd() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("dir with space");
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = vec![
+            "service".to_string(),
+            "print".to_string(),
+            "--data-dir".to_string(),
+            dir.display().to_string(),
+        ];
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        let code = run(&args, &mut o, &mut e);
+        assert_eq!(code, 0);
+        let out = String::from_utf8(o).unwrap();
+        let quoted = format!("\"{}\"", dir.display());
+        assert!(
+            out.contains(&format!("--data-dir {quoted}")),
+            "带空格的数据目录要被双引号包住，不能被 systemd 从空格处切开：\n{out}"
+        );
+        assert!(
+            out.contains(&format!("ReadWritePaths={quoted}")),
+            "ReadWritePaths 同样要被引起来：\n{out}"
+        );
     }
 }
