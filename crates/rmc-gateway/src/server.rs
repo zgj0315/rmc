@@ -17,7 +17,7 @@ use crate::{Error, Result};
 use rmc_core::code::{AccountName, ServerFingerprint};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -317,6 +317,36 @@ impl Server {
     }
 }
 
+/// 等到 `authed` 变成 `true` 为止。**不要**直接在 `select!` 分支里写
+/// `authed_rx.wait_for(|v| *v)`——`Receiver::wait_for` 返回的
+/// `Result<watch::Ref<'_, bool>, RecvError>` 内部握着一把锁的读守卫
+/// （`RwLockReadGuard`），即使那一支的输出被 `_` 丢弃，`tokio::select!`
+/// 展开出来的状态机仍然要把"所有分支各自的输出类型"揉进同一个枚举里
+/// 贯穿这整个 `async fn`（因为同一个分支的处理体后面还有别的 `.await`），
+/// 这把锁守卫就被要求 `Send`——实测编译直接报错（`handle_connection` 的
+/// future 因此不是 `Send`，装不进 `JoinSet::spawn`）。这里换成一个只
+/// 返回 `()` 的独立 `async fn`：`*rx.borrow()` 这一步把 `Ref` 这个临时值
+/// 在同一条语句里就地读完、丢弃，从不跨越任何 `.await`，`wait_authed`
+/// 整个函数的返回类型只有 `()`，天然 `Send`。
+async fn wait_authed(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            // 发送端（`ConnHandler.authed`）被丢弃：这条会话已经用别的
+            // 方式结束了（比如 SSH 握手失败），没有"认证成功"这件事会
+            // 再发生。不要把这当成"赢了"去 `return`——那会在本该走
+            // `deadline`/`running` 那两支的场景下抢到一个不该赢的胜利。
+            // `std::future::pending()` 是永远不 `resolve` 的 future，
+            // 交给 `select!` 意味着这一支从此陪跑，不会再被判定为赢家，
+            // 让另外两支（`running` 几乎同时也会完成、或 `deadline`）
+            // 去决定这条连接的命运。
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// 一条连接的全程：TLS 握手 + SSH 认证必须在 `handshake` 内完成，否则直接关掉。
 async fn handle_connection(shared: Arc<Shared>, sock: tokio::net::TcpStream, peer: SocketAddr) {
     let started = tokio::time::Instant::now();
@@ -330,11 +360,33 @@ async fn handle_connection(shared: Arc<Shared>, sock: tokio::net::TcpStream, pee
         },
         _ = &mut deadline => { tracing::info!(%peer, "TLS 握手超时"); return; }
     };
-    let authed = Arc::new(AtomicBool::new(false));
+    // **修复轮 2/5，评审第 2 轮挖出来的 Critical**：这里原来是
+    // `Arc<AtomicBool>`，在下面的 `select!` 里当 `if !authed.load(...)`
+    // 这样一个「守卫」用。`tokio::select!` 的守卫只在**进入这次 `select!`
+    // 时**求值一次（读过 tokio 1.53.1 的 `src/macros/select.rs:627-636`：
+    // `if !$c { disabled |= mask; }` 在构造 `poll_fn` **之前**跑完，
+    // `poll_fn` 内部只看已经固定的 `disabled` 位图，不会再重新求值 `$c`），
+    // 之后永久生效——这个 `select!` 是 `run_stream` 刚返回、认证还完全
+    // 没发生的那一刻进入的，此刻 `authed` 必然是 `false`，于是 deadline
+    // 分支被**永久启用**：不管后来有没有认证成功，到期就断，跟
+    // "已认证会话应该活到心跳/隧道自己失联为止"这个产品目标直接冲突。
+    // 生产默认 `handshake` 是 20 秒，等于每条会话都会被无条件踢断。
+    //
+    // 改之前这个分支只打日志、没调用 `disconnect`，是死代码，这个陷阱
+    // 潜伏着没有杀伤力；修复轮 1/5 让它真的发 `disconnect` 之后，这个
+    // 陷阱才变得致命——「修复激活了既有缺陷」。
+    //
+    // 修法：把"认证成功"从"一个只读一次快照的标志位"改成"一个可以
+    // `await` 的事件"——`watch::channel<bool>`。下面 `select!` 直接拿
+    // `authed_rx.wait_for(|v| *v)` 当一个独立分支去跟 `deadline` 赛跑：
+    // 这是一个真正被反复 `poll` 的 future，不是进入 `select!` 时求值一次
+    // 就定型的静态条件，从根上消掉"守卫只求值一次"这整类陷阱，而不是
+    // 在某一个具体时刻绕过它一次。
+    let (authed_tx, mut authed_rx) = watch::channel(false);
     let handler = ConnHandler {
         shared: shared.clone(),
         peer,
-        authed: authed.clone(),
+        authed: authed_tx,
         account: None,
         tunnel: None,
     };
@@ -362,29 +414,59 @@ async fn handle_connection(shared: Arc<Shared>, sock: tokio::net::TcpStream, pee
     };
     tokio::pin!(running);
     // **偏离 brief 字面 Step 2**：brief 的伪代码在这里外面包了一层
-    // `loop { tokio::select! {...} }`。`cargo clippy -D warnings` 的
-    // `never_loop` 直接把它判红：两个分支都以 `return` 收尾，`select!`
-    // 选中任意一支都会跳出函数，`loop` 从来没有机会真正"再循环一次"
-    // ——是死代码，不是留着等下一轮再 select 的活代码。去掉这层 `loop`：
-    // `running`（整条会话，认证成功之后也在这个 future 里继续跑 keepalive
-    // 等消息处理）与 `deadline`（认证超时）两个 future 本来就是并发轮询，
-    // 谁先完成 `select!` 就返回谁那一支——一次 `select!` 已经等价于"一直
-    // 等到会话结束或认证超时二者谁先到"，不需要外层循环。
+    // `loop { tokio::select! {...} }`。这份实现继续不用外层 `loop`——不是
+    // 因为 `clippy::never_loop`（三个分支现在没有一个会 `continue`，那条
+    // lint 的顾虑不再适用），而是因为不需要：三个分支（`running` 自己
+    // 结束、认证成功、认证超时）本来就应该并发轮询到"三者谁先发生就按
+    // 谁处理"，`select!` 一次就是这个语义，不需要重新进入。**关键是**
+    // "认证成功"这一支现在是 `authed_rx.wait_for(|v| *v)`——一个真正被
+    // 反复 `poll` 的 future（下面 `ConnHandler` 上的长注释解释了为什么
+    // 不能再用 `if !authed.load(...)` 这种"进入 `select!` 时求值一次"的
+    // 守卫）。三个分支里任何一个先完成，`select!` 就返回那一支：
+    // - `running` 先完成：会话自己正常收尾（或出错），直接结束。
+    // - 认证先完成（`authed_rx.wait_for` 赢）：deadline 从这一刻起不再
+    //   适用——这条会话已经过了"必须在 handshake 内完成握手+认证"这道
+    //   关卡，后面该活多久由心跳/隧道状态决定，不该再被 `handshake`
+    //   这个一次性窗口约束。所以这支的处理体就是"不再跟 deadline 比赛，
+    //   直接无限期等 `running` 自己结束"。
+    // - deadline 先完成（这一支现在**没有守卫**，永远参与比赛，但只有
+    //   在认证还没发生时才可能赢——一旦认证赢了，`select!` 已经返回，
+    //   deadline 这一支不会再被考虑）：认证超时，断开。
+    //
+    // **`biased;`（修复轮 2/5 追加，全量并行跑测试时实测抓到过 flake，
+    // 已定位并修）**：`tokio::select!` 默认在多个分支同时 ready 时**随机**
+    // 挑一个（tokio 1.53.1 的文档就是这么写的）。这台机器上单独跑这条
+    // 新测试从没红过，但拿全部 46 个测试一起并行跑（CPU/调度都在抢）时
+    // 抓到过：`wait_authed` 和 `deadline` 在同一次 `poll` 里**双双** ready
+    // ——不是"deadline 抢先"，是"这个任务被调度器晾了足够久，久到两个
+    // 时间点都已经过去"，这时候不加 `biased;` 就有真实概率随机选中
+    // `deadline`，把一条已经认证成功的会话断开。`biased;` 让 `select!`
+    // 按写的顺序（不是随机顺序）挑第一个 ready 的分支，所以只要把
+    // `wait_authed` 写在 `deadline` 前面，"认证已经发生"这件事在两者都
+    // ready 时**必定**赢——不再是概率问题。`r = &mut running` 放最前面：
+    // 会话已经自然结束的话，优先报告"会话结束"而不是再画蛇添足发一次
+    // `disconnect`（发了也无害，只是没必要）。
     tokio::select! {
+        biased;
         r = &mut running => {
             if let Err(e) = r {
                 tracing::debug!(%peer, error = %e, "会话结束");
             }
         }
-        _ = &mut deadline, if !authed.load(Ordering::SeqCst) => {
+        _ = wait_authed(&mut authed_rx) => {
+            tracing::debug!(%peer, "认证已完成，handshake 的 deadline 从此不再适用");
+            if let Err(e) = running.await {
+                tracing::debug!(%peer, error = %e, "会话结束");
+            }
+        }
+        _ = &mut deadline => {
             tracing::info!(%peer, "认证超时，断开");
-            // 这个分支只是让 `handle_connection` 自己的 `select!` 提前
-            // 返回——真正跑消息循环的内部任务不受这层 `select!` 影响，
-            // 还在裸跑。必须主动发 `disconnect` 让它自己走
-            // `dispatch_msg` → `disconnected = true` → 循环退出这条路，
-            // 否则这条连接根本没有真的关闭：Task 6「全局最多 64 条、
-            // 每 IP 最多 8 条未认证连接」那个上限就是靠这份名额算的，
-            // 名额被这个函数返回而释放、连接却没死，上限就是错的。
+            // 真正跑消息循环的内部任务不受这层 `select!` 影响，还在
+            // 裸跑。必须主动发 `disconnect` 让它自己走 `dispatch_msg`
+            // → `disconnected = true` → 循环退出这条路，否则这条连接
+            // 根本没有真的关闭：Task 6「全局最多 64 条、每 IP 最多 8 条
+            // 未认证连接」那个上限就是靠这份名额算的，名额被这个函数
+            // 返回而释放、连接却没死，上限就是错的。
             let _ = handle
                 .disconnect(russh::Disconnect::ByApplication, String::new(), String::new())
                 .await;
@@ -428,7 +510,11 @@ fn reject_but_let_client_retry_password() -> russh::server::Auth {
 pub(crate) struct ConnHandler {
     pub shared: Arc<Shared>,
     pub peer: SocketAddr,
-    pub authed: Arc<AtomicBool>,
+    /// 认证成功那一刻发一次 `true`。**不要**把这个换回
+    /// `Arc<AtomicBool>` 配 `select!` 的 `if` 守卫——`handle_connection`
+    /// 上那段长注释记录了为什么那条路是错的（守卫只在进入 `select!`
+    /// 时求值一次，认证发生在那之后就再也不会被看到）。
+    pub authed: watch::Sender<bool>,
     pub account: Option<(AccountName, u16)>,
     /// `Some` 一旦这条会话开成了一条反向隧道。`Drop` 落在 `TunnelGuard`
     /// 上：会话结束（无论哪条路）时，`ConnHandler` 被丢弃，这个字段随之
@@ -459,7 +545,7 @@ impl russh::server::Handler for ConnHandler {
                 .unwrap_or(Verify::Rejected);
         match verdict {
             Verify::Ok { port } => {
-                self.authed.store(true, Ordering::SeqCst);
+                let _ = self.authed.send(true);
                 self.account = Some((name.clone(), port));
                 tracing::info!(peer = %self.peer, account = %name, "口令认证成功");
                 Ok(russh::server::Auth::Accept)
@@ -1240,5 +1326,97 @@ mod tests {
         assert_eq!(n, 0);
         assert_eq!(srv.tunnels_snapshot()[0].3, 2);
         srv.shutdown().await;
+    }
+
+    /// **修复轮 2/5，评审第 2 轮挖出来的 Critical，已实测确认并修**：
+    /// 已认证的会话必须活过 `handshake` 那个窗口——`handshake` 只约束
+    /// "握手 + 认证要在这个时间内完成"，不是"整条会话的寿命上限"。
+    ///
+    /// 根因：`handle_connection` 第二个 `select!` 原来用
+    /// `if !authed.load(Ordering::SeqCst)` 当 `deadline` 分支的守卫。
+    /// `tokio::select!` 的守卫只在**进入这次 `select!` 时**求值一次
+    /// （tokio 1.53.1 `src/macros/select.rs:627-636`：`disabled` 位图在
+    /// 构造 `poll_fn` 之前就定型，之后不会重新求值 `$c`）——这个
+    /// `select!` 是 `run_stream` 刚返回、认证还完全没发生的那一刻进入
+    /// 的，`authed` 必然是 `false`，于是 deadline 分支被**永久启用**：
+    /// 不管后来认证有没有成功，到期就 `disconnect`。生产默认
+    /// `handshake` 是 20 秒，等于每条会话都会在连接后 20 秒被无条件踢断
+    /// ——跟"给远程维护开长连接隧道"这个产品目标直接冲突。
+    ///
+    /// 之所以 44 条已有测试都没暴露这个：所有已认证的测试场景全部在各自
+    /// `handshake` 窗口内就跑完了（`fast()` 是 10s，自定义的几条最多
+    /// 500ms），没有一条测试让"已认证会话活过 handshake 时长"。这条就是
+    /// 那条缺的测试。
+    ///
+    /// 修法见 `ConnHandler.authed` 与 `handle_connection` 上的长注释：把
+    /// "认证成功"从"进 `select!` 时读一次的 `AtomicBool` 快照"改成
+    /// "`watch::channel<bool>` 驱动的一个真正的 `select!` 分支
+    /// （`wait_authed`）"，从根上消掉"守卫只求值一次"这整类陷阱。
+    ///
+    /// 改红：把 `wait_authed` 这一支从 `select!` 里删掉、认证分支挪回
+    /// `if !authed_snapshot` 这种一次性快照写法——这条测试在
+    /// `!s.is_closed()` 那一步红（见 task-5-report.md「修复轮 2/5」，
+    /// 贴了改之前的真实报错）。
+    #[tokio::test]
+    async fn an_authenticated_session_outlives_the_handshake_deadline() {
+        let (srv, pw, _tmp) = server_with_account_and_timings(
+            "zhang",
+            Timings {
+                handshake: Duration::from_millis(300),
+                // keepalive 故意设得极长：这条测试要孤立地验证"deadline
+                // 分支的守卫是不是只求值一次"，不该被另一条完全无关的
+                // 机制（服务端自己的心跳）掺进来干扰。**实测记录**：不设
+                // 这个的时候，在全量并行跑 `cargo test -p rmc-gateway`
+                // （46 个测试同时抢 CPU/调度）时抓到过一次 flake——
+                // `keepalive_max`（3 次）在高负载下的调度延迟里被吃满，
+                // 服务端因为心跳超时断开了这条连接，跟 deadline 分支本身
+                // 对不对完全无关，却会让这条断言假红。加长 keepalive
+                // 之后连跑验证过不再复现（见 task-5-report.md「修复轮
+                // 2/5」）。
+                keepalive: Duration::from_secs(3600),
+                keepalive_max: 1000,
+                ..Timings::fast()
+            },
+        )
+        .await;
+        let mut s = within("connect", ssh_connect(srv.local_addr())).await;
+        assert!(s
+            .authenticate_password("zhang", pw.as_str())
+            .await
+            .unwrap()
+            .success());
+        // 远超 300ms 的 handshake：如果 deadline 分支的守卫是"进 select!
+        // 时的快照"，这里必然会被断开——即便已经认证成功。
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !s.is_closed(),
+            "已认证的会话不该被 handshake 的 deadline 断开"
+        );
+        assert_eq!(
+            srv.connections_count(),
+            1,
+            "服务端这一侧也该认为这条会话还活着"
+        );
+        srv.shutdown().await;
+    }
+
+    /// 认证失败或一直不认证的连接，仍然会在 deadline 被断开——跟上面
+    /// 那条"已认证会话活过 deadline"互补，确认修法没有把 deadline 整个
+    /// 废掉，只是让它对"已认证"的会话失效。
+    #[tokio::test]
+    async fn an_unauthenticated_connection_is_still_closed_at_the_deadline_after_the_fix() {
+        let (srv, _pw, _tmp) = server_with_account_and_timings(
+            "zhang",
+            Timings {
+                handshake: Duration::from_millis(300),
+                ..Timings::fast()
+            },
+        )
+        .await;
+        let s = within("connect", ssh_connect(srv.local_addr())).await;
+        // 什么都不认证，直接等。
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(s.is_closed(), "一直没认证，300ms 后服务端该断开");
+        assert_eq!(srv.connections_count(), 0);
     }
 }
