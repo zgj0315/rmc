@@ -142,7 +142,7 @@ impl AppPaths {
         self.root.join("secrets")
     }
 
-    /// 上一次记住密码的那条连接码（W200）。
+    /// 上一次连过的运维服务器的连接码（W200）。
     ///
     /// **不含任何秘密**：连接码本身没有秘密（账号、地址、指纹都是公开
     /// 信息，见 `rmc_core::code` 模块文档），一行纯文本。为什么需要它见
@@ -150,15 +150,41 @@ impl AppPaths {
     /// 启动那一刻表单是空的，不记下来就拼不出 key。
     ///
     /// Task 8：文件名从 `last-account.txt` 改成 `connection-code.txt`，
-    /// 内容从「账号 + 主机 + 端口」三行纯文本改成一条连接码——两者都是
-    /// 「记住密码」的密文定位键（`remember::Account::key()`）的原始输入，
-    /// key 的形态本身没有变（见 `remember.rs` 上的说明）。
+    /// 内容从「账号 + 主机 + 端口」三行纯文本改成一条连接码。
+    ///
+    /// **Task 11 起，这份记录跟「记住密码」那个勾完全无关**：
+    /// [`crate::remember::persist_code`] 每次连接成功都写它，不看勾选。
+    /// 「盘上那份密文到底属于哪个 key」这件事**不**由这份记录回答——
+    /// 那是 [`Self::remembered_key`] 的职责，两者故意拆成两个文件（见
+    /// R11-2 修复轮）：`persist_code` 这一路写坏了、或者写的时机跟
+    /// `save` 不同步，都不该连带影响「上一次记住的密文是谁」这个答案。
     ///
     /// 放根目录下，不放 `secrets/`：那个目录里只该有密文，混进一个明文
     /// 文件迟早让人看错。也不放 `logs/`：`diag::bundle` 会把 `log_dir`
     /// 下的东西整个收进诊断包。
     pub fn connection_code(&self) -> PathBuf {
         self.root.join("connection-code.txt")
+    }
+
+    /// **盘上那份密文（如果有）属于哪个 key**——`remember::save` 唯一的
+    /// 写方（只在 `SecretStore::save` 真的成功之后才写），
+    /// `remember::clear` 负责删。
+    ///
+    /// R11-2 修复轮新增：Task 11 之前，「上一次记住的是谁」跟
+    /// [`Self::connection_code`] 是同一份记录，两者共用一个写方
+    /// （`remember::save`）。Task 11 给 `connection_code` 加了第二个写方
+    /// （`persist_code`，不看 `save` 成没成功），于是「哪个 key 有密文」
+    /// 这个问题的答案会被一个跟密文毫无关系的写方悄悄改掉——`save`
+    /// 失败时 `persist_code` 照样把 `connection_code` 改成新账号，下次
+    /// 取消勾选就会把旧账号的密文错当成「已经不是上一次了」，放它一条
+    /// 生路，永久留成孤儿（复审的 W202 回归 PoC，[`crate::remember`]
+    /// 模块测试 `persist_code_failing_a_save_does_not_orphan_the_
+    /// previous_secret` 钉着）。
+    ///
+    /// 拆成独立文件之后，这个答案只可能被 `save` 的成功路径改动，
+    /// `persist_code` 写它自己的 `connection_code` 完全碰不到这里。
+    pub fn remembered_key(&self) -> PathBuf {
+        self.root.join("remembered-key.txt")
     }
 
     /// 诊断包写到哪儿。放根目录下，不跟日志混在一起——包本身不是日志，
@@ -646,24 +672,32 @@ mod tests {
         );
 
         // Task 10：known_hosts 那一处随 SSH host key 校验一起删掉了
-        // （见 `AppPaths` 上的说明）。剩下的三处：审计日志、记住的密码、
-        // W200 那条上一次记住密码的连接码。
-        let spots = [p.log_dir(), p.secrets_dir(), p.connection_code()];
+        // （见 `AppPaths` 上的说明）。R11-2 修复轮又加了一处：`remembered_
+        // key`——「盘上那份密文属于哪个 key」，跟 `connection_code`
+        // （「上一次连的是哪台」）拆成了两份独立记录。
+        let spots = [
+            p.log_dir(),
+            p.secrets_dir(),
+            p.connection_code(),
+            p.remembered_key(),
+        ];
         for spot in &spots {
             assert!(
                 spot.starts_with(p.root()),
                 "{spot:?} 没落在应用目录里，它会跟着进程的工作目录跑"
             );
         }
-        // 三处互不重叠——诊断包会把 log_dir 下的东西整个收走。
+        // 四处互不重叠——诊断包会把 log_dir 下的东西整个收走。
         let mut distinct = std::collections::BTreeSet::new();
         for spot in &spots {
             assert!(distinct.insert(spot.clone()), "两处落点撞在一起：{spot:?}");
         }
-        // 账号记录尤其不许落进日志目录（会被诊断包收走）或密文目录
-        // （那里只该有密文）。
+        // 账号记录、密文定位键都不许落进日志目录（会被诊断包收走）或
+        // 密文目录（那里只该有密文本身）。
         assert!(!p.connection_code().starts_with(p.log_dir()));
         assert!(!p.connection_code().starts_with(p.secrets_dir()));
+        assert!(!p.remembered_key().starts_with(p.log_dir()));
+        assert!(!p.remembered_key().starts_with(p.secrets_dir()));
         // 配置真的用上了这一处，不是算出来放着不用。
         let cfg = p.config();
         assert_eq!(cfg.log_dir, p.log_dir());

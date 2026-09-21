@@ -49,6 +49,25 @@
 //! [`the_key_is_the_account_at_the_server`] 与
 //! [`the_key_format_matches_the_old_three_part_shape_byte_for_byte`]
 //! 两条测试钉住。
+//!
+//! # Task 11 + R11-2：`connection-code.txt` 与 `remembered-key.txt`
+//! 是两个问题的答案，不能共用一份记录
+//!
+//! Task 11 给「上一次连的是哪台」（`connection-code.txt`）加了第二个
+//! 写方——[`persist_code`]，每次连接成功都写，跟「记住密码」的勾、跟
+//! [`save`] 成不成功都无关。而 [`save`] 自己一直靠**同一份**记录回答
+//! 另一个完全不同的问题：「盘上那份密文属于哪个 key」（W202 的孤儿
+//! 密文清理靠它，见 [`previous_key`]）。
+//!
+//! 两个问题共用一份答案，一旦 `persist_code` 在 [`save`] 失败之后把
+//! 记录改成了别的账号，「上一次记住的是谁」这个答案就会被误导——密文
+//! 真的在盘上，却再也没有路径找得到它，永久孤儿。这是复审在 R11-2
+//! 抓到的真实回归，PoC 见
+//! [`persist_code_failing_a_save_does_not_orphan_the_previous_secret`]。
+//!
+//! 修法：拆成两份独立记录，[`AppPaths::remembered_key`] 只由
+//! [`save`] 自己的成功路径写、[`clear`] 删——[`persist_code`] 永远
+//! 碰不到它。
 
 use crate::form::Form;
 use crate::wiring::AppPaths;
@@ -138,25 +157,31 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
 
     // # W202：上一次记的是谁，**必须在这里读**
     //
-    // `connection-code.txt` 只记得住**一个**账号，所以任何一个不等于它
-    // 的 key 都是**谁也找不回来的孤儿**：`recall` 只会按记录里那一个去
-    // 取。
+    // R11-2 修复轮：这个问题的答案来自 [`AppPaths::remembered_key`]，
+    // **不是** `connection-code.txt`——两者故意拆开（见 `AppPaths` 上的
+    // 说明）。`remembered_key` 只有 [`save`] 自己的成功路径会写，
+    // [`persist_code`] 摸不到它，于是「哪个 key 有密文」这件事不会被
+    // 一次跟密文毫不相干的写方悄悄改掉。
     //
-    // 修的是这样一条真实路径（评审写了 PoC）：用户记住 `A@运维服务器`
-    // → 把连接码换成 `B` → 取消勾选「记住密码」。上一版按**当前表单**
-    // 拼出的 `B@运维服务器` 去清（本来就不存在），账号记录被删掉，而
-    // `A@运维服务器` 的密文**永久留在盘上，而且再也没有任何路径指得到
-    // 它**——用户明确说了「不再记住」。
+    // 修的是这样一条真实路径（评审写了 PoC，见
+    // `persist_code_failing_a_save_does_not_orphan_the_previous_secret`）：
+    // 用户记住 `A@运维服务器` → 把连接码换成 `B`，这次密文写不进去
+    // → 取消勾选「记住密码」。如果「上一次是谁」跟 `connection-code.txt`
+    // 共用一份记录，`persist_code` 会在密文写失败之后照样把它改成 `B`，
+    // 于是 `previous` 被错当成 `B`（等于 `key`，被
+    // `previous.filter(|p| *p != key)` 过滤掉），`A@运维服务器` 的密文
+    // **永久留在盘上，而且再也没有任何路径指得到它**。
     //
-    // 读必须在 [`write_account`] **之前**：那一步会把它覆盖掉。
+    // 读必须在 [`write_remembered_key`] **之前**：那一步会把它覆盖掉。
     let previous = previous_key(paths);
 
     if !form.remember {
         // 取消勾选（或者从来没勾）：当前 key、上一次那个 key 两份密文都
-        // 清掉。**不再删连接码**（Task 11）：那份记录现在由
-        // [`persist_code`] 独立维护，跟「记住密码」这个勾无关——用户
-        // 「不再记住密码」不等于「不想让软件记得上次连的是哪台」。
-        return match clear(store, &key, previous.as_deref()) {
+        // 清掉，`remembered_key` 记录也删掉——盘上不该再有任何一个 key
+        // 被当成「记住着」。**不碰连接码文件**（Task 11）：那份记录
+        // 现在由 [`persist_code`] 独立维护，跟「记住密码」这个勾无关
+        // ——用户「不再记住密码」不等于「不想让软件记得上次连的是哪台」。
+        return match clear(paths, store, &key, previous.as_deref()) {
             Ok(()) => SaveOutcome::Cleared,
             Err(e) => SaveOutcome::Failed(e.to_string()),
         };
@@ -169,9 +194,10 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
     if let Err(e) = store.save(&key, &form.password) {
         return SaveOutcome::Failed(e.to_string());
     }
-    // 账号记录**后写**：密文没存成就不该留下一条指向它的账号记录，
-    // 否则下次启动会取到 `NotRemembered` 并在密码框旁边说一句
-    // 「这台机器上没有记住过密码」，而用户明明勾了。
+    // 账号记录（`connection-code.txt`）：跟密文定位键是两份独立记录
+    // （R11-2），这里继续写它只是为了不破坏「`save` 成功时账号记录也
+    // 跟着更新」这条既有行为——生产路径上 `App::persist_connection_code`
+    // 已经无条件写过一次了，这里重复写是无害的幂等操作。
     if let Err(e) = write_account(paths, &account) {
         // 密文已经写进去了，但账号记录写不成——把密文也清掉，不留一份
         // 谁也找不回来的孤儿密文。
@@ -179,6 +205,13 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
         // W203：这一支上一轮是**零覆盖**的（评审两枪双绿）。它跟 W202
         // 是同一个危害面，夹具见
         // `a_failed_account_record_rolls_the_ciphertext_back`。
+        let _ = store.clear(&key);
+        return SaveOutcome::Failed(e.to_string());
+    }
+    // R11-2：密文定位键**后写**，理由跟上面账号记录那一支一样——写不
+    // 成就不该留下一份指向它的记录，那正是 W202 要防的「孤儿」本身：
+    // 密文真的存在，但没有任何路径能找到它。
+    if let Err(e) = write_remembered_key(paths, &key) {
         let _ = store.clear(&key);
         return SaveOutcome::Failed(e.to_string());
     }
@@ -195,25 +228,52 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
     SaveOutcome::Saved { key }
 }
 
-/// 上一次记住的那个账号的 key。没有记录、或者记录坏了就是 `None`。
+/// 盘上那份密文（如果有）属于哪个 key。没有记录就是 `None`。
+///
+/// R11-2：读的是 [`AppPaths::remembered_key`]，**不是**
+/// `connection-code.txt`——后者从 Task 11 起还会被 [`persist_code`] 写，
+/// 那个写方跟「盘上有没有密文」毫无关系，混在一起读就是 W202 那条
+/// 回归的根源。
 fn previous_key(paths: &AppPaths) -> Option<String> {
-    let text = std::fs::read_to_string(paths.connection_code()).ok()?;
-    Account::decode(&text).map(|a| a.key())
+    let key = std::fs::read_to_string(paths.remembered_key()).ok()?;
+    let key = key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
 }
 
-/// 把密文清掉。**不碰连接码文件**（Task 11）：那份记录不是秘密，也不是
-/// 「记住密码」的一部分，删不删密文跟它无关——见 [`persist_code`]。
+fn write_remembered_key(paths: &AppPaths, key: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(paths.root())?;
+    std::fs::write(paths.remembered_key(), key)
+}
+
+/// 把密文清掉，`remembered_key` 记录也删掉。**不碰连接码文件**
+/// （Task 11）：那份记录不是秘密，也不是「记住密码」的一部分，删不删
+/// 密文跟它无关——见 [`persist_code`]。
 ///
 /// `previous` 是上一次记住的那个 key（W202）：账号改过之后它跟 `key`
 /// 不是一回事，而它才是盘上真正躺着密文的那一个。
-fn clear(store: &dyn SecretStore, key: &str, previous: Option<&str>) -> std::io::Result<()> {
+fn clear(
+    paths: &AppPaths,
+    store: &dyn SecretStore,
+    key: &str,
+    previous: Option<&str>,
+) -> std::io::Result<()> {
     // 每一步都走完再报第一个错——半路 return 会留下另外几样（同 Task 4
     // 的 `SecretStore::clear` 自己那条 W25）。
     let mut result = store.clear(key);
     if let Some(old) = previous.filter(|p| *p != key) {
         result = result.and(store.clear(old));
     }
-    result
+    // 清完密文，`remembered_key` 也该删掉——清完之后盘上没有任何一个
+    // key 还「记住着」，这份记录留着就是撒谎。
+    let record = match std::fs::remove_file(paths.remembered_key()) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    };
+    result.and(record)
 }
 
 fn write_account(paths: &AppPaths, account: &Account) -> std::io::Result<()> {
@@ -230,6 +290,15 @@ fn write_account(paths: &AppPaths, account: &Account) -> std::io::Result<()> {
 /// 连接码解析不出来（表单还没填完）时什么都不做，返回 `Ok(())`：
 /// 调用方（`App::apply`）已经用 `Form::parsed_code` 先挡过一轮，这里
 /// 再挡一次只是防跳过那道门直接调用。
+///
+/// **R11-4：已知与 brief 的偏离**——brief 明写这里要「原子写：临时文件
+/// 加 rename」，这里用的是裸 `std::fs::write`（走 [`write_account`]）。
+/// brief 同一句话又说「沿用本文件既有写法」，而本文件既有的
+/// `write_account` 从 Task 8 起就是非原子的裸写——两句话字面上矛盾，
+/// 选了后半句：保持跟 [`save`] 里那份账号记录写法一致，不为这一个
+/// 函数单开一套原子写。降级路径是安全的：半截文件读回来
+/// `Account::decode` 直接判 `None`（见 [`read_account`]），最坏情况是
+/// 「这次没预填上」，不是脏读或崩溃。
 pub fn persist_code(paths: &AppPaths, form: &Form) -> std::io::Result<()> {
     let Some(account) = Account::from_form(form) else {
         return Ok(());
@@ -301,9 +370,21 @@ impl Recall {
         // 连接码无论口令取没取回来都填上——用户下次还得粘它，而且密码
         // 框旁边那句话说的正是「这台运维服务器」。
         form.code = account.code().to_string();
-        // 勾上：用户上次确实勾了。取回失败时也勾着，这样他重新输入之后
-        // 连上，会按同一个 key 再记一次。
-        form.remember = true;
+        // R11-3 修复轮：`Recall::Remembered` 现在**不再**意味着「用户上次
+        // 确实勾了记住密码」——`connection-code.txt` 从 Task 11 起由
+        // [`persist_code`] 无条件写，跟这个勾完全无关。`NotRemembered`
+        // 就是「压根没有密文」，勾不该自己跳出来，否则用户没勾过、连了
+        // 一次，下次启动却发现「记住密码」被自己点亮，再连一次口令就
+        // 真的进了 DPAPI——这是一次真实的 opt-in 变 opt-out 的回归。
+        //
+        // 其余四格（`Unreadable`/`UnsealFailed`/`NotUtf8`/`Loaded`）都是
+        // 「盘上真有一份密文记录」，只是读的结局不同——这四格下「用户上次
+        // 确实勾了」这条注释仍然成立：`load_outcome` 只有在
+        // `SecretStore::clear`/从未 `save` 过时才会给 `NotRemembered`
+        // （`FileSecretStore` 的行为，见 rmc-win 的 105 条测试），别的
+        // 四种结局都要求密文文件真的存在过。取回失败时也勾着，这样他
+        // 重新输入之后连上，会按同一个 key 再记一次。
+        form.remember = !matches!(outcome, LoadOutcome::NotRemembered);
 
         let (_, note) = outcome.diagnostic();
         if let Some(secret) = outcome.into_secret() {
@@ -369,6 +450,31 @@ mod tests {
 
     fn store_at<S: Sealer + 'static>(paths: &AppPaths, sealer: S) -> Arc<dyn SecretStore> {
         Arc::new(FileSecretStore::new(paths.secrets_dir(), Box::new(sealer)))
+    }
+
+    /// 包一层**真实**存储，只在指定的 key 上让 `save` 失败——其余方法
+    /// 原样转发。R11-2 的 W202 回归 PoC 要的是「A 的密文真的躺在盘上」
+    /// 这个事实（不是假存储里的空气），同时要让「换成 B 的这次
+    /// `save`」真的失败，`RecordingStore::failing_to_save()` 那种「全部
+    /// 失败」的假货做不到这个组合。
+    struct FailSaveOn<'a> {
+        inner: &'a dyn SecretStore,
+        fail_key: &'a str,
+    }
+
+    impl SecretStore for FailSaveOn<'_> {
+        fn save(&self, key: &str, secret: &str) -> std::io::Result<()> {
+            if key == self.fail_key {
+                return Err(std::io::Error::other("模拟：这个 key 写不进去"));
+            }
+            self.inner.save(key, secret)
+        }
+        fn load_outcome(&self, key: &str) -> LoadOutcome {
+            self.inner.load_outcome(key)
+        }
+        fn clear(&self, key: &str) -> std::io::Result<()> {
+            self.inner.clear(key)
+        }
     }
 
     fn filled_form() -> Form {
@@ -525,11 +631,10 @@ mod tests {
     /// 改红：把 `save` 里 `if !form.remember` 那一支删掉——取消勾选
     /// 之后密文还躺在盘上，而用户以为不再记住了（第一组断言红）；或者
     /// 把 `clear` 里的 `store.clear(key)` 删掉（同一组断言红）；或者在
-    /// `save` 的 `if !form.remember {` 分支开头加回一句
-    /// `std::fs::remove_file(paths.connection_code())`——这是 Task 11
-    /// 之前 `clear` 真正做过的那一步，签名变了（`clear` 不再收
-    /// `paths`）没法原地照抄，实测过在这里补一句照样能把连接码那条
-    /// 断言（第二组）打红。
+    /// `clear` 末尾加回一句 `std::fs::remove_file(paths.connection_
+    /// code())`——R11-2 修复轮把 `paths` 参数还给了 `clear`（它现在要
+    /// 靠 `paths` 去删 `remembered_key` 记录），这条注入实测过真的能把
+    /// 连接码那条断言（第二组）打红。
     #[test]
     fn unchecking_remember_clears_the_secret_but_keeps_the_code() {
         let dir = tempfile::tempdir().expect("建临时目录");
@@ -564,11 +669,9 @@ mod tests {
     /// 留着，密文目录清空。跟上面那条覆盖的是同一处 `clear`，但夹具
     /// 造法不同，任何一条测不到这条能测到。
     ///
-    /// 改红：`clear` 自己已经不收 `paths` 了（Task 11 把它从签名里
-    /// 摘掉），没法原地把 `remove_file(connection_code)` 加回 `clear`
-    /// 里——实测过的真实注入点是 `save` 的 `if !form.remember {` 分支
-    /// 开头补一句 `std::fs::remove_file(paths.connection_code())`（那是
-    /// 这一步以前真正住的地方）。
+    /// 改红：`clear` 末尾加回一句 `std::fs::remove_file(paths.
+    /// connection_code())`——R11-2 把 `paths` 参数还给了 `clear`
+    /// （删 `remembered_key` 记录要用它），这条注入实测过真的能打红。
     #[test]
     fn clearing_the_password_keeps_the_code() {
         let dir = tempfile::tempdir().expect("建临时目录");
@@ -612,9 +715,11 @@ mod tests {
     /// 密文是 DPAPI 绑定的、不是明文泄露，但用户明确说了「不再记住」
     /// 而东西还在、还删不掉。
     ///
-    /// 改红：把 `save` 里 `clear(..)` 的第三个参数（`previous.as_deref()`，
-    /// Task 11 把 `clear` 的 `paths` 参数摘掉之后它从第四个挪到了第三个）
+    /// 改红：把 `save` 里 `clear(..)` 的第四个参数（`previous.as_deref()`）
     /// 换成 `None`（也就是退回只清当前 key），第二组断言当场红。
+    /// （R11-2 修复轮把 `paths` 参数还给了 `clear`——它现在要靠 `paths`
+    /// 去删 `remembered_key` 记录，`previous` 因此又是第四个参数，跟
+    /// Task 11 之前的位置一样，只是这次 `paths` 用来删的文件不同了。）
     #[test]
     fn changing_the_account_then_unchecking_leaves_no_orphan_ciphertext() {
         const KEY_A: &str = "tunnel-zhang@203.0.113.10:22000";
@@ -657,6 +762,91 @@ mod tests {
             "密文目录里还剩：{:?}",
             sealed_files(&paths)
         );
+    }
+
+    /// **R11-2 修复轮：W202 回归 PoC，收成正式测试。**
+    ///
+    /// Task 11 给 `connection-code.txt` 加了第二个写方
+    /// （[`persist_code`]），它既不看「记住密码」的勾，也不管
+    /// `save` 成没成功——生产路径上 `App::apply` 每次连接成功都会调它，
+    /// 跟 `remember_password`（也就是这里的 [`save`]）的成败完全无关。
+    ///
+    /// 如果「盘上那份密文属于哪个 key」（[`previous_key`]）还读
+    /// `connection-code.txt`，就会撞上这条真实路径：
+    ///
+    /// 1. 记住 `A@运维服务器` 成功；
+    /// 2. 换成 `B@同一台运维服务器`，这次 `store.save` 失败（磁盘满、
+    ///    权限变化……）；
+    /// 3. `persist_code` 照样把 `connection-code.txt` 改成 `B`——它不
+    ///    知道、也不该知道第 2 步失败了；
+    /// 4. 用户取消勾选「记住密码」→ `previous_key` 读到 `B`（错的，
+    ///    `B` 从来没有真的存进密文）→ `clear` 里
+    ///    `previous.filter(|p| *p != key)` 把它当成「跟当前 key 一样」
+    ///    过滤掉 → **只清了 `B`（本来就不存在），`A` 的密文一次都没被
+    ///    碰过，而且从此没有任何路径指得到它**——永久孤儿。
+    ///
+    /// 修法（本轮）：`previous_key` 改读 [`AppPaths::remembered_key`]，
+    /// 一份只由 [`save`] 自己的成功路径写的独立记录，`persist_code`
+    /// 摸不到它。
+    ///
+    /// 改红：把 `previous_key` 里的 `std::fs::read_to_string(paths.
+    /// remembered_key())` 换成 `std::fs::read_to_string(paths.
+    /// connection_code()).ok().and_then(|t| Account::decode(&t)).map(|a|
+    /// a.key())`（也就是退回读 `connection-code.txt`）——主断言当场红。
+    #[test]
+    fn persist_code_failing_a_save_does_not_orphan_the_previous_secret() {
+        const KEY_A: &str = "tunnel-zhang@203.0.113.10:22000";
+        const KEY_B: &str = "tunnel-li@203.0.113.10:22000";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+        let store = store_at(&paths, FlipSealer);
+
+        // 1. 记住 A 成功。
+        assert_eq!(
+            save(&paths, store.as_ref(), &filled_form()),
+            SaveOutcome::Saved { key: KEY_A.into() }
+        );
+        // 反向自证：A 的密文真的躺在盘上。
+        assert!(store.load(KEY_A).is_some(), "夹具没能先记住 A");
+
+        // 2. 换成 B，这次 `store.save` 失败。
+        let mut form_b = filled_form();
+        form_b.code = code_for("tunnel-li");
+        let failing = FailSaveOn {
+            inner: store.as_ref(),
+            fail_key: KEY_B,
+        };
+        let outcome = save(&paths, &failing, &form_b);
+        assert!(
+            matches!(outcome, SaveOutcome::Failed(_)),
+            "夹具没能让这次 save 失败：{outcome:?}"
+        );
+
+        // 3. `App::apply` 里 `persist_connection_code` 跟 `remember_
+        // password` 的成败无关，一样会跑——这是 Task 11 的立意，这条
+        // 测试故意原样保留这一步，不能因为它「看起来是罪魁」就删掉它。
+        persist_code(&paths, &form_b).expect("落盘连接码不该失败");
+        assert_eq!(
+            std::fs::read_to_string(paths.connection_code())
+                .expect("connection-code.txt 应该在")
+                .trim(),
+            code_for("tunnel-li").trim(),
+            "connection-code.txt 该被 persist_code 改成 B 了——这正是本测试的前提"
+        );
+
+        // 4. 用户取消勾选。
+        let mut f = form_b;
+        f.remember = false;
+        assert_eq!(save(&paths, store.as_ref(), &f), SaveOutcome::Cleared);
+
+        // 主断言：A 的密文没有变成孤儿——`previous_key` 没有被第 3 步
+        // 误导，正确识别出 A 是「上一次记住的那个」并清掉了它。
+        assert!(
+            store.load(KEY_A).is_none(),
+            "A 的密文成了孤儿：没有被清掉，也没有任何路径指得到它"
+        );
+        assert_eq!(sealed_files(&paths).len(), 0, "{:?}", sealed_files(&paths));
     }
 
     /// W202 的另一半：换一个账号继续记住，**上一份密文也不该留成孤儿**。
@@ -707,17 +897,16 @@ mod tests {
     /// 改红：把 `save` 里的 `store.clear(&old)` 挪到 `store.save(..)` 之前。
     #[test]
     fn a_failed_save_leaves_the_previous_secret_alone() {
+        const KEY_A: &str = "tunnel-zhang@203.0.113.10:22000";
+
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
-        // 上一次记的是 A，账号记录也指着它。写的是原始连接码文本，不经
-        // `Account`——这条测试只关心磁盘上那份记录长什么样，不关心怎么
-        // 构造出来的。
+        // 上一次记的是 A——R11-2 之后这个前提由 `remembered_key` 记录，
+        // 不是 `connection-code.txt`（那份记录跟密文毫无关系）。写的是
+        // 裸 key 字符串，不经 `Account`——这条测试只关心磁盘上那份记录
+        // 长什么样，不关心怎么构造出来的。
         std::fs::create_dir_all(paths.root()).expect("建目录");
-        std::fs::write(
-            paths.connection_code(),
-            format!("{}\n", code_for("tunnel-zhang")),
-        )
-        .expect("写账号记录");
+        std::fs::write(paths.remembered_key(), KEY_A).expect("写密文定位键");
 
         // 这一次换成别的账号，而存储写不进去。
         let store = RecordingStore::failing_to_save();
@@ -735,10 +924,10 @@ mod tests {
             "新密文没写成，却已经把上一份清掉了：{:?}",
             store.cleared()
         );
-        // 反向自证：夹具真的走到了「有 previous」那条路——账号记录还在，
-        // 也就是说 `previous_key` 读得出东西来。
+        // 反向自证：夹具真的走到了「有 previous」那条路——`remembered_
+        // key` 记录还在，也就是说 `previous_key` 读得出东西来。
         assert!(
-            paths.connection_code().exists(),
+            paths.remembered_key().exists(),
             "夹具没造出「上一次记过别的账号」这个前提"
         );
     }
@@ -784,15 +973,17 @@ mod tests {
         assert_eq!(*form.password, CANARY);
     }
 
-    /// **`clear` 里第一步失败也要把第二步走完。**
+    /// **`clear` 里第一步失败，后面几步也要走完。**
     ///
     /// 同 Task 4 的 `SecretStore::clear` 自己那条 W25：半路 `return` 会
-    /// 把另外一份密文留在盘上，而用户点的是「不再记住密码」。
+    /// 把另外几样留在盘上，而用户点的是「不再记住密码」。
     ///
-    /// Task 11 之前 `clear` 还有第三步（删账号记录），这条测试当时也
-    /// 顺带守着它；现在 `clear` 只剩两步——账号记录已经不归它管
-    /// （见 [`persist_code`]），这里改成确认那份记录**原样留着**，
-    /// 不受 `clear` 的成败影响。
+    /// `clear` 现在三步：清当前 key、清上一个 key、删
+    /// `remembered_key` 记录（R11-2；跟 Task 11 之前的第三步不是同一个
+    /// 文件——那时候第三步删的是账号记录 `connection-code.txt`，现在
+    /// 那份记录已经不归 `clear` 管，见 [`persist_code`]；这里的第三步
+    /// 删的是 `remembered_key`，「盘上那份密文属于哪个 key」这个答案，
+    /// 清完密文这份记录也该跟着消失）。
     ///
     /// 改红：把 `clear` 里的 `let mut result = store.clear(key);` 换成
     /// `store.clear(key)?;`。
@@ -803,8 +994,12 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
-        // 上一次记的是 A。
+        // 上一次记的是 A——`remembered_key` 才是 `previous_key` 读的
+        // 那份记录（R11-2）。账号记录（`connection-code.txt`）也顺手写
+        // 一份，代表「用户确实连过 A」这个更完整的现实场景，也用来验证
+        // 它不受这次 `clear` 影响。
         std::fs::create_dir_all(paths.root()).expect("建目录");
+        std::fs::write(paths.remembered_key(), KEY_A).expect("写密文定位键");
         std::fs::write(
             paths.connection_code(),
             format!("{}\n", code_for("tunnel-zhang")),
@@ -819,19 +1014,24 @@ mod tests {
 
         let out = save(&paths, &store, &f);
 
-        // 夹具自证：确实失败了，下面两条因此不是空转。
+        // 夹具自证：确实失败了，下面几条因此不是空转。
         assert!(matches!(out, SaveOutcome::Failed(_)), "{out:?}");
 
         let cleared = store.cleared();
         // 第一步（当前 key）走了。
         assert!(cleared.contains(&KEY_B.to_string()), "{cleared:?}");
-        // **主断言**：第一步失败了，第二步（上一个 key）照样走。
+        // 第一步失败了，第二步（上一个 key）照样走。
         assert!(
             cleared.contains(&KEY_A.to_string()),
             "第一步失败就不走了，上一个账号的密文留在了盘上：{cleared:?}"
         );
-        // Task 11：账号记录不归 `clear` 管了，`save` 的 `!form.remember`
-        // 分支也不再碰它——它原样留着。
+        // **主断言之一**：第三步（删 `remembered_key`）也走了，尽管
+        // 第一步失败了。
+        assert!(
+            !paths.remembered_key().exists(),
+            "第一步失败就不走了，remembered_key 记录留在了盘上"
+        );
+        // 账号记录不归 `clear` 管，原样留着。
         assert!(
             paths.connection_code().exists(),
             "账号记录不该被 clear 删掉"
@@ -933,6 +1133,12 @@ mod tests {
     ///
     /// 改红：给 `persist_code` 加一句 `if !form.remember { return
     /// Ok(()); }`。
+    ///
+    /// R11-3 修复轮补的一条：`recall(...).fill(...)` 现在**不能**把
+    /// 「记住密码」的勾自己点亮——这里从没调用过 `save`，盘上没有任何
+    /// 密文，`load_outcome` 该是 `NotRemembered`，勾该保持不勾。改红：
+    /// 把 `Recall::fill` 里的 `!matches!(outcome, LoadOutcome::
+    /// NotRemembered)` 换回 `true`——这条断言当场红。
     #[test]
     fn the_code_is_persisted_regardless_of_remember() {
         let dir = tempfile::tempdir().expect("建临时目录");
@@ -945,14 +1151,19 @@ mod tests {
         let text =
             std::fs::read_to_string(paths.connection_code()).expect("连接码文件应当写出来了");
         assert_eq!(text.trim(), good_code().trim());
-        assert!(!text.contains(CANARY), "连接码文件里不能有口令");
 
-        // 没有任何密文：recall 只填连接码，口令留空。
+        // 没有任何密文：recall 只填连接码，口令留空，勾也不该自己亮起来
+        // ——用户从没勾过「记住密码」，`persist_code` 只是记了「上次连的
+        // 是哪台」，两件事不能混在一起。
         let store = store_at(&paths, FlipSealer);
         let mut form = Form::default();
         let note = recall(&paths, store.as_ref()).fill(&mut form);
         assert_eq!(form.code, good_code());
         assert!(form.password.is_empty(), "没有密文却填了口令");
+        assert!(
+            !form.remember,
+            "从没记过密码，「记住密码」这个勾却自己跳出来了"
+        );
         assert!(note.is_some(), "记过账号就该有一句说明");
     }
 
@@ -1033,6 +1244,11 @@ mod tests {
         for (outcome, want) in cases {
             let variant = outcome.variant_name();
             let loaded = matches!(outcome, LoadOutcome::Loaded(_));
+            // R11-3：只有 `NotRemembered` 这一格该让「记住密码」的勾
+            // 保持不勾——它是「压根没有密文」，另外四格都意味着盘上真有
+            // 一份密文记录（哪怕读不出来/解不开/坏了），「用户上次确实
+            // 勾了」这条推断只对这四格成立。
+            let not_remembered = matches!(outcome, LoadOutcome::NotRemembered);
             let recall = Recall::Remembered {
                 account: Account::decode(&good_code()).expect("夹具连接码必须合法"),
                 outcome,
@@ -1052,7 +1268,12 @@ mod tests {
             );
             // 连接码无论成败都填上了。
             assert_eq!(form.code, good_code(), "{variant}：连接码没填回来");
-            assert!(form.remember, "{variant}：勾没有跟着回来");
+            // R11-3：`NotRemembered` 那一格勾**不该**跟着回来（没有密文，
+            // 不是「用户上次勾了」的证据）；另外四格才该。
+            assert_eq!(
+                form.remember, !not_remembered,
+                "{variant}：「记住密码」这个勾该不该跟着回来，判反了"
+            );
             // 只有 Loaded 那一格会填口令。
             assert_eq!(
                 !form.password.is_empty(),

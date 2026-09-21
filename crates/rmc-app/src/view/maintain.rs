@@ -558,10 +558,12 @@ mod tests {
         .is_ok()
     }
 
-    /// 已连接且拿到端口才画这一行；未连接、还没拿到端口、或者端口是
-    /// 「上一轮」留下的陈旧值（重连期间）都不画（Task 11）。
+    /// 已连接且拿到端口且连接码解析得出，三样都有才画这一行；未连接、
+    /// 还没拿到端口、端口是「上一轮」留下的陈旧值（重连期间）、或者
+    /// 连接码解析不出来，都不画（Task 11 + R11-6）。
     ///
-    /// 三枪各打在不同的判断上，都**真的验过**（见 task-11-report.md）：
+    /// 四枪各打在不同的判断上，都**真的验过**（见 task-11-report.md、
+    /// task-11-fix-1-report.md）：
     ///
     /// 1. 把 `Some(port)` 换成 `_`、端口写死成 `0`——第二组断言（应当
     ///    画出「…端口 22003」）会红，因为画出来的是「…端口 0」；
@@ -570,7 +572,10 @@ mod tests {
     ///    「未连接」与「无端口」总是同时出现，状态判断从未被单独考验
     ///    过。第三组（Backoff + 陈旧端口）就是补这个洞的：`Backoff`
     ///    期间 `forward_port` 不清（Task 10 的语义），单独去掉状态判断
-    ///    会让这一组红。
+    ///    会让这一组红；
+    /// 3. 把 `Some(code)` 换成 `_`（`ConnectionCode::server()`/
+    ///    `account()` 换成写死的占位字符串）——第四组（连接码解析不出来
+    ///    却画出了这一行）会红。
     #[test]
     fn the_hint_line_appears_only_when_connected_with_a_port() {
         let mut m = Model::default();
@@ -611,6 +616,22 @@ mod tests {
                 "远程工程师请连接"
             ),
             "重连中（forward_port 还留着上一轮的值）却画出了这一行"
+        );
+
+        // R11-6：第三个必要条件——`form.parsed_code()`——单独验一次。
+        // 回到 `Connected`（`forward_port` 还是 22003），但连接码这次
+        // 解析不出来（用户粘贴坏了、或者手滑清空了）。
+        m.apply(rmc_core::TunnelEvent::State(State::Connected {
+            degraded: false,
+        }));
+        let mut broken = f.clone();
+        broken.code = "不是连接码".into();
+        assert!(
+            !contains_text(
+                &mut iced_test::simulator(view(&m, &broken, None, None)),
+                "远程工程师请连接"
+            ),
+            "连接码解析不出来却画出了这一行"
         );
     }
 

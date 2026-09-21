@@ -674,12 +674,12 @@ impl App {
         // W200 第 1 条：**连上了**才谈得上记住密码——口令没被运维服务器
         // 验过就存下来，等于把一个打错的口令记一年。
         if !matches!(before, State::Connected { .. }) && matches!(after, State::Connected { .. }) {
-            // 顺序要紧：`remember_password` 里的 `previous_key` 读的是
-            // 「上一次」那份连接码记录（W202 的孤儿密文清理靠它）——
-            // 必须在 `persist_connection_code` 把它覆盖成**这一次**的
-            // 连接码之前读到。
-            self.remember_password();
+            // `persist_connection_code`（写 connection-code.txt）与
+            // `remember_password`（读写 remembered-key.txt/密文，R11-2）
+            // 各管各的文件，互不相干——顺序哪个先都一样，实测对调过
+            // （767 → 768 条全绿，含 W202 回归 PoC）。
             self.persist_connection_code();
+            self.remember_password();
         }
 
         // W192：托盘跟着走。通知在前、重画在后——两者互不影响，但先算
