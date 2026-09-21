@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rmc-app", "crates/rmc-core", "crates/rmc-win"]
+members = ["crates/rmc-app", "crates/rmc-core", "crates/rmc-gateway", "crates/rmc-win"]
 
 [workspace.package]
 edition = "2021"
