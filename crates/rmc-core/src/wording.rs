@@ -83,8 +83,10 @@ pub struct SourceLiteral {
 /// `theme.rs`、`form.rs` 三条都过了，红的恰好是**第一条带分隔符的**
 /// `view/maintain.rs`。根因是这里原先用 `Path::display()`——Windows 上它
 /// 渲染成 `view\maintain.rs`，而锚点表写的是 `/`。豁免表（`ALLOWED`）按
-/// 同一个字段比对，今天唯一一条是不带目录的 `config.rs`，所以没撞上；
-/// 哪天豁免一个子目录里的文件，就会是同一个坑。
+/// 同一个字段比对，当时唯一一条是不带目录的 `config.rs`，所以没撞上。
+/// （R13-5：那张豁免表已经整个删掉了，见 `mod tests` 里的说明；这里留着
+/// 是因为 `skip_files` 仍然按同一个字段比对——哪天跳过一个子目录里的
+/// 文件，就会是同一个坑。）
 ///
 /// 这个 bug 在 macOS / Linux 上**结构上不可见**（两种写法渲染出来一样），
 /// 只有 Windows job 验得到——那条锚点测试就是它的回归测试。
@@ -364,18 +366,22 @@ mod tests {
         }
     }
 
-    /// 明确豁免的字面量：`(文件名, 字面量, 理由)`。
-    ///
-    /// 只有一条，而且它**确实会上屏**——所以写在这里而不是悄悄放过：
-    /// `gateway.company.com` 是方案设计.md §3.10 界面示意图里原样给出的
-    /// 地址框占位值（`地址 [ gateway.company.com ] : [ 443 ]`），是一个
-    /// 域名、不是对这台机器的称呼。改它等于改方案文档里的示意图，超出
-    /// 本任务范围；已记进 task-7-report.md 的「后续完善」交给产品定夺。
-    const ALLOWED: [(&str, &str, &str); 1] = [(
-        "config.rs",
-        "gateway.company.com",
-        "方案设计.md §3.10 的地址框占位域名，是数据不是称呼",
-    )];
+    // R13-5（修复轮 1/5）：**这道扫描现在没有任何豁免。**
+    //
+    // 原来有一条 `ALLOWED` 表，唯一的条目是 `config.rs` 里的
+    // `gateway.company.com`，理由写着三条：「它确实会上屏」「取自方案设计
+    // §3.10 界面示意图的地址框占位值」「改它超出本任务范围」。**三条今天
+    // 全部不成立**——界面上早就没有地址框（只有一个连接码框），那张示意图
+    // 也已重画，而那个字面量所在的 `Config::gateway` 是个没有生产读取方的
+    // 死字段。字面量在本轮改成了 `203.0.113.10`，被禁词随之消失，豁免表与
+    // 守它的 `every_allowlist_entry_is_still_there_and_still_needs_the_
+    // exemption` 一起删掉。
+    //
+    // **不要把豁免机制加回来。** 它原本存在的理由是「有一条会上屏的文案
+    // 确实需要那个词」，而本项目的答案一直是「那就改文案」。一张空表 +
+    // 一条遍历空表的测试，比没有表更糟：测试恒绿，而下一个人会以为
+    // 「往表里加一条」是受支持的做法。真出现无法回避的情形时，让扫描直接
+    // 红，然后在这里重新讨论。
 
     /// 扫 rmc-core **生产代码**里的全部字符串字面量。
     ///
@@ -494,13 +500,10 @@ mod tests {
             "扫描结果里找不到一条已知的生产文案，截断规则或切词坏了"
         );
 
+        // R13-5：这里原来还有一层 `.filter(|l| !ALLOWED.contains(...))`。
+        // 豁免表已删（理由见上面那段注释），**现在一条字面量都不放过**。
         let hits: Vec<String> = lits
             .iter()
-            .filter(|l| {
-                !ALLOWED
-                    .iter()
-                    .any(|(af, al, _)| *af == l.file && *al == l.text)
-            })
             .filter_map(|l| {
                 banned_word_in(&strip_placeholders(&l.text))
                     .map(|w| format!("{}:{} 的「{}」里含有 {w}", l.file, l.line, l.text))
@@ -514,21 +517,9 @@ mod tests {
         );
     }
 
-    /// 豁免表不许有过期条目：某条被豁免的字面量一旦从源码里消失（或被
-    /// 改掉），这条测试会红，逼着把豁免一起删掉。否则豁免表会越攒越长，
-    /// 最后把扫描器掏空。
-    #[test]
-    fn every_allowlist_entry_is_still_there_and_still_needs_the_exemption() {
-        let lits = production_string_literals();
-        for (file, lit, why) in ALLOWED {
-            assert!(
-                banned_word_in(lit).is_some(),
-                "{file} 的「{lit}」已经不含禁用词了，这条豁免没有存在的理由（{why}）"
-            );
-            assert!(
-                lits.iter().any(|l| l.file == file && l.text == lit),
-                "豁免表里的 {file} 「{lit}」在源码里找不到了，删掉这条豁免"
-            );
-        }
-    }
+    // R13-5：`every_allowlist_entry_is_still_there_and_still_needs_the_
+    // exemption` 在这里删掉了。它遍历 `ALLOWED`，表空了它就是一个恒绿的
+    // 空转循环——正是本仓库抓过二十多次的那种「测试通过但没验证名字声称
+    // 的事」。豁免表本身的删除理由见上面 `production_string_literals`
+    // 前面那段。
 }

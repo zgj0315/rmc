@@ -667,10 +667,18 @@ fn cmd_service_print(p: &Parsed, out: &mut dyn Write, _err: &mut dyn Write) -> i
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "rmc-gateway".into());
     let (user, user_was_sanitized) = sanitize_unit_user(&user_env);
+    // R13-11：回退发生时 `User=` 与 `ReadWritePaths=` 就**不是同一个人**
+    // 了——后者仍然指向打印这份单元的那个用户的 home（`DataDir::
+    // default_path`），而 `User=` 已经换成 `rmc-gateway`。服务能起来、但
+    // 进到一个它读不了的数据目录，所以提醒必须把这两行一起点出来，
+    // 只说 `User=` 会让人改完一行就以为好了。
     let user_warning = if user_was_sanitized {
         "# 警告：USER/LOGNAME 环境变量的值不像一个合法用户名（出于安全考虑，\n\
          # 原始值不会打印在这里），已回退成 rmc-gateway；请自行确认下面这一行\n\
-         # User= 是不是你想要的账户，必要时手工改掉。\n"
+         # User= 是不是你想要的账户，必要时手工改掉。\n\
+         # **下面的 --data-dir 与 ReadWritePaths= 也要跟着一起确认**：它们指向的\n\
+         # 是打印这份单元的那个用户的目录，跟回退后的 User= 已经不是同一个人，\n\
+         # 不改的话服务起得来、却读不了自己的数据目录。\n"
     } else {
         ""
     };
@@ -685,11 +693,36 @@ fn cmd_service_print(p: &Parsed, out: &mut dyn Write, _err: &mut dyn Write) -> i
     if let Some(l) = p.opt("listen") {
         args.push_str(&format!(" --listen {}", quote_systemd_arg(l)));
     }
+    let mut any_engineer_allow = false;
     for (k, v) in &p.opts {
         if k == "engineer-allow" {
             args.push_str(&format!(" --engineer-allow {}", quote_systemd_arg(v)));
+            any_engineer_allow = true;
         }
     }
+    // R13-3（修复轮 1/5，复审 must-fix）：**这个函数只把它自己这一次收到的
+    // 选项拼进 `ExecStart=`。** 一个照手册走的管理员会先前台
+    // `serve --engineer-allow 203.0.113.0/24` 验通，再跑一条裸的
+    // `service print` 去生成单元——装出来的单元里没有那一行，开机自启之后
+    // 反向端口**重新对全互联网开放，而且不报任何错**。
+    //
+    // 这正是本方案里唯一那条「部分落地」的加固措施（方案 7.1/7.3），
+    // 它的失败形态是**静默地把端口开给所有人**：既不是崩溃，也不是一条
+    // 错误日志，甚至连一次失败的连接都不会有——只是本该被拒的来源现在
+    // 能连上了。这种东西写在手册里不够，得让工具自己说出来。
+    //
+    // 只在**一条都没给**时提醒，不在给了的时候啰嗦；提醒印在注释区，
+    // 不影响这份单元文本本身可以直接 `> rmc-gateway.service`。
+    let allow_warning = if any_engineer_allow {
+        ""
+    } else {
+        "# 提醒：这次没有收到任何 --engineer-allow，所以下面的 ExecStart= 里也没有。\n\
+         # 反向端口（22001-22999）将对**所有来源**开放——这是默认行为，不是故障。\n\
+         # 如果你刚才是带着 --engineer-allow 前台试跑通的，那些参数**不会**被记住：\n\
+         # 本命令只把它自己这一次收到的 --listen/--engineer-allow/--data-dir 写进单元。\n\
+         # 要收窄来源，请重新运行，把参数原样带上，例如：\n\
+         #   rmc-gateway service print --engineer-allow 203.0.113.0/24\n"
+    };
     let read_write_paths = quote_systemd_arg(&dir_display);
     // **只打印文本，不动系统**：本程序自己不建用户、不写 /etc、不调
     // systemctl。装不装这个单元、`useradd` 那个专用用户，都是管理员自己
@@ -703,7 +736,10 @@ fn cmd_service_print(p: &Parsed, out: &mut dyn Write, _err: &mut dyn Write) -> i
 #   sudo install -m 644 rmc-gateway.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now rmc-gateway
 # 本程序自己不做任何需要特权的事；装不装这个单元由管理员决定。
-{user_warning}[Unit]
+#
+# 装之前数据目录必须已经存在（先跑过 init）：ReadWritePaths= 指向一个不存在
+# 的路径时，systemd 建 mount namespace 就会失败，服务根本起不来。
+{allow_warning}{user_warning}[Unit]
 Description=Remote Maintenance Server (rmc-gateway)
 After=network-online.target
 Wants=network-online.target
@@ -882,6 +918,58 @@ mod tests {
         let (code, out, _) = run_in(tmp.path(), &["status"]);
         assert_eq!(code, 3);
         assert!(out.contains("没有在跑"), "{out}");
+    }
+
+    /// R13-3（Task 13 修复轮 1/5，复审 must-fix）：**没给
+    /// `--engineer-allow` 时，输出里必须有一行提醒说反向端口将对所有来源
+    /// 开放，并说清参数不会被记住。**
+    ///
+    /// 为什么值得一条测试：`cmd_service_print` 只把**它自己这一次收到的**
+    /// 选项拼进 `ExecStart=`。照部署手册走的管理员会先前台
+    /// `serve --engineer-allow <网段>` 验通，再跑一条裸的 `service print`
+    /// 去生成单元——装出来的单元没有那一行，反向端口重新对全互联网开放，
+    /// **不报任何错**。失败形态是「本该被拒的来源现在能连上了」，没有崩溃、
+    /// 没有日志、连一次失败连接都没有，所以只能靠工具自己在生成的那一刻说
+    /// 出来。
+    ///
+    /// 两个方向都钉：给了 `--engineer-allow` 就**不该**有这段提醒（否则
+    /// 它会退化成一段人人无视的常驻噪音）。
+    ///
+    /// 改红：把 `cmd_service_print` 里 `let allow_warning = if
+    /// any_engineer_allow { "" } else { ... }` 整个换成 `let allow_warning
+    /// = "";`——下面第一条 `assert!(out.contains("对**所有来源**开放"))` 红。
+    /// 反方向：把它换成恒返回那段提醒，最后一条 `assert!(!with.contains(...))`
+    /// 红。
+    #[test]
+    fn service_print_warns_when_no_engineer_allow_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (code, out, _) = run_in(tmp.path(), &["service", "print"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("反向端口（22001-22999）将对**所有来源**开放"),
+            "裸 service print 必须提醒反向端口对所有来源开放：\n{out}"
+        );
+        assert!(
+            out.contains("那些参数**不会**被记住"),
+            "必须说清前台试跑用过的参数不会被自动带进单元：\n{out}"
+        );
+        // 提醒印在注释区，不能破坏单元文本本身。
+        assert!(
+            out.contains("[Unit]") && out.contains("ExecStart="),
+            "{out}"
+        );
+
+        // 反方向：给了就不该再提醒。
+        let (code, with, _) = run_in(
+            tmp.path(),
+            &["service", "print", "--engineer-allow", "10.0.0.0/8"],
+        );
+        assert_eq!(code, 0);
+        assert!(with.contains("--engineer-allow 10.0.0.0/8"), "{with}");
+        assert!(
+            !with.contains("将对**所有来源**开放"),
+            "已经给了 --engineer-allow 还在提醒，这段话会变成没人看的噪音：\n{with}"
+        );
     }
 
     /// **修复轮 1/5，评审 Important，补的「改红」**：同上，brief 没配，

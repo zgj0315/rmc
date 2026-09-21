@@ -95,14 +95,22 @@ pub enum Error {
     #[error("IO 错误：{0}")]
     Io(std::io::Error),
 
-    /// R14：本地文件系统操作失败（如 known_hosts 读写——权限错误、磁盘
-    /// 满）。与 Io 分开是因为二者需要的处置完全相反：
+    /// R14：本地文件系统操作失败——权限错误、磁盘满、目录建不出来。
+    ///
+    /// **R13-7/R13-8（Task 13 修复轮 1/5）：分类不变，例子换了。** 原注释
+    /// 举的唯一例子是「known_hosts 读写」，而 `knownhosts.rs` 今天只剩
+    /// 指纹工具、**零文件读写**——一条现行的分类规则不该拿一个已经不存在
+    /// 的产出点当唯一例子。今天真正产出 `LocalIo` 的是审计日志那一路：
+    /// `audit.rs` 的 `AuditLog::open`（建日志目录、收紧权限）与
+    /// `sweep`（按保留期删旧文件的 `read_dir`/`metadata`/`remove_file`）。
+    ///
+    /// 与 Io 分开是因为二者需要的处置完全相反：
     /// - Io 归 Network 是安全默认（一次网络抖动不该杀死会话），但也因此
     ///   不能把 Io 整体改成 Fatal——那样会连带把偶发的 socket 错误也变成
     ///   永久性失败。
-    /// - 而 known_hosts 权限错误、磁盘满这类本地文件系统错误，退避重连
-    ///   解决不了；如果和 Io 共用 Network 分类，Supervisor（Task 10）会
-    ///   把隧道拆了重建、拆了重建，永远重连，工程师永远看不到需要处理
+    /// - 而「日志目录建不出来」「磁盘满」「权限不对」这类本地文件系统
+    ///   错误，退避重连解决不了；如果和 Io 共用 Network 分类，Supervisor
+    ///   会把隧道拆了重建、拆了重建，永远重连，工程师永远看不到需要处理
     ///   的原因。所以单列 Fatal，立刻停下来醒目提示。
     ///
     /// R15：同样故意不挂 `#[from]`（哪怕它没被 Io 占用，也不该挂）——
@@ -252,10 +260,12 @@ mod tests {
 
     #[test]
     fn local_io_error_is_fatal_not_network() {
-        // R14：known_hosts 权限错误、磁盘满这类本地文件系统错误，重连解决
-        // 不了。如果和 Io 共用 Network 分类，Supervisor 会把隧道拆了重建、
-        // 拆了重建，永远重连，工程师永远看不到需要处理的原因。单列 LocalIo
-        // 为 Fatal，让它立刻停下来醒目提示。
+        // R14：本地文件系统错误（今天的真实产出点是 `audit.rs` 的
+        // `AuditLog::open` 与 `sweep`——建日志目录、按保留期删旧文件），
+        // 权限不对或磁盘满时重连解决不了。如果和 Io 共用 Network 分类，
+        // Supervisor 会把隧道拆了重建、拆了重建，永远重连，工程师永远看不
+        // 到需要处理的原因。单列 LocalIo 为 Fatal，让它立刻停下来醒目提示。
+        // （R13-8：原注释举的是 known_hosts，那条路已经没有文件读写了。）
         let io_err = std::io::Error::other("permission denied");
         assert_eq!(Error::LocalIo(io_err).class(), ErrorClass::Fatal);
     }

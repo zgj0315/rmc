@@ -99,13 +99,22 @@ jobs:
       - name: clippy
         run: cargo clippy -p rmc-win -p rmc-app --all-targets -- -D warnings
 
-      # Task 12 加了 `-p rmc-gateway`：**这一行就是"端到端在 Windows 上
-      # 真的跑过"的全部实物**。现场客户端跑在 Windows 上，而
+      # Task 12 加了 `-p rmc-gateway`：**这一行是"端到端会在 Windows 上
+      # 跑"的全部实物——注意是「会跑」，不是「跑过」。**
+      #
+      # R13-12（Task 13 修复轮 1/5）：这句话原来写的是"真的跑过"，那是一张
+      # 未兑现的过去时支票。`app.yml` 至今只在 `main` 上真跑过一次
+      # （2026-09-21），而那时命令里还没有 `-p rmc-gateway`——**这个参数
+      # 从未在任何一次 Windows runner 上执行过**。在这个仓库的语境里
+      # "真的跑过"会被读成"跑过并且绿过"，所以降档成配置事实。
+      # 第一次把本分支推上去时要盯住这个 job。
+      #
+      # 现场客户端跑在 Windows 上，而
       # `crates/rmc-gateway/tests/e2e.rs` 里被端到端驱动的那一半
       # （rmc-core 的 Transport/TLS/SSH/pump/supervisor）在 Windows 的
       # socket 与文件系统语义下才是真正要交付的那份。原来的 docker 集成
-      # 测试只在 Linux 容器里跑过，这条链路在 Windows 上从来没有被端到端
-      # 验证过一次。
+      # 测试只在 Linux 容器里跑过，这条链路在 Windows 上**到今天为止仍然
+      # 没有被端到端验证过一次**——这一行是为了让下一次推送把它验掉。
       - name: 界面与平台层测试
         run: cargo test -p rmc-win -p rmc-app -p rmc-gateway --no-fail-fast
 
