@@ -107,6 +107,24 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      # **这一步才是 musl target 真正装上的地方，上一步的 `targets:` 只是兜底。**
+      #
+      # 2026-09-22 第一次真跑这个 job 时它红在：
+      #   error[E0463]: can't find crate for `core`
+      #   = note: the `x86_64-unknown-linux-musl` target may not be installed
+      # 根因（本机实测出来的）：`rust-toolchain.toml` 是**目录级 override**，
+      # 优先级高于上一步的 `rustup default`（见本文件开头那段说明）——也就是说
+      # cargo 实际用的是 `rust-toolchain.toml` 里 `channel` 那个工具链，不是上一步
+      # 设成 default 的那个。而 **rustup 是按「拼写」区分工具链的**：`1.89` 与
+      # `1.89.0` 是两个独立的 sysroot（实测 `~/.rustup/toolchains/` 下只有
+      # `1.89-*`，一查 `1.89.0` 就当场开始 `downloading 6 components`）。
+      # 于是上一步装进「它那个」工具链的 target，在 cargo 真正用的那个里并不存在。
+      #
+      # 这一步在仓库目录里跑，rustup 会按 override 解析，装的就是 cargo 要用的
+      # 那一个；已经装过时是个几毫秒的空操作，所以留着上一步的 `targets:` 不冲突。
+      - name: 确保 musl target 装在 override 选中的工具链上
+        run: rustup target add x86_64-unknown-linux-musl
+
       - name: 缓存 cargo
         uses: Swatinem/rust-cache@v2
 

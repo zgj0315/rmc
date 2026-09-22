@@ -100,6 +100,7 @@ const STEP_INSTALL_TOOLCHAIN: &str = "安装 Rust 工具链";
 const STEP_FMT: &str = "格式检查";
 const STEP_CLIPPY: &str = "clippy";
 const STEP_UNIT_TESTS: &str = "单元与端到端测试";
+const STEP_ENSURE_MUSL_TARGET: &str = "确保 musl target 装在 override 选中的工具链上";
 const STEP_MUSL_TOOLS: &str = "安装 musl 工具链";
 const STEP_MUSL_BUILD: &str = "构建 musl 静态二进制";
 const STEP_STATIC_CHECK: &str = "确认是静态链接";
@@ -404,6 +405,19 @@ fn gateway_release_job_builds_a_static_musl_binary_and_uploads_it() {
     let doc = doc();
     let steps = steps(job(&doc, GATEWAY_RELEASE_JOB));
 
+    // 2026-09-22 第一次真跑这个 job 红在「target 没装上」。根因是
+    // `rust-toolchain.toml` 的目录级 override 让 cargo 用的不是上一步设成
+    // default 的那个工具链，而 rustup **按拼写**区分工具链（`1.89` 与
+    // `1.89.0` 是两个 sysroot）。所以真正管用的是这一步显式的
+    // `rustup target add`——它在仓库目录里跑，按 override 解析。
+    //
+    // 改红：把这一步从 `core.yml` 里删掉，或者把它的 `run` 换成别的命令。
+    let ensure = run_code(step_by_name(steps, STEP_ENSURE_MUSL_TARGET));
+    assert!(
+        ensure.contains("rustup target add") && ensure.contains(MUSL_TARGET),
+        "这一步必须显式把 musl target 装到 override 选中的工具链上，实际 {ensure:?}"
+    );
+
     let musl = run_code(step_by_name(steps, STEP_MUSL_TOOLS));
     assert!(
         musl.contains("musl-tools"),
@@ -467,12 +481,21 @@ fn gateway_release_steps_run_in_the_documented_order() {
     let doc = doc();
     let steps = steps(job(&doc, GATEWAY_RELEASE_JOB));
     let toolchain = step_index_by_name(steps, STEP_INSTALL_TOOLCHAIN);
+    let ensure_target = step_index_by_name(steps, STEP_ENSURE_MUSL_TARGET);
     let musl = step_index_by_name(steps, STEP_MUSL_TOOLS);
     let build = step_index_by_name(steps, STEP_MUSL_BUILD);
     let check = step_index_by_name(steps, STEP_STATIC_CHECK);
     let upload = step_index_by_name(steps, STEP_UPLOAD_GATEWAY);
     assert!(toolchain < musl, "Rust 工具链要先装");
+    assert!(
+        toolchain < ensure_target,
+        "要先有工具链，才谈得上往它上面加 target"
+    );
     assert!(musl < build, "musl-gcc 必须在 cargo build 之前就位");
+    assert!(
+        ensure_target < build,
+        "target 必须在 cargo build 之前装好——这一步就是 2026-09-22 那次红的修复"
+    );
     assert!(build < check, "先构建才有东西可核对");
     assert!(check < upload, "核对过静态性才能上传");
 }
@@ -482,9 +505,12 @@ fn gateway_release_steps_run_in_the_documented_order() {
 // 做法：直接读 `rust-toolchain.toml` 的 `channel` 做交叉校验，不把同一个
 // 版本号硬编码第三份。
 //
-// `targets:` 那个输入同样要钉：少了它，`dtolnay/rust-toolchain` 不会装
-// musl 的 std，`cargo build --target x86_64-unknown-linux-musl` 会失败
-// ——这一条不是防静默退化，是防一次"看起来无关的清理"把它删掉。
+// `targets:` 那个输入同样要钉，但**订正一句原来写错的话**：原文说「少了它
+// `cargo build --target ...` 会失败」——2026-09-22 第一次真跑这个 job 证明
+// 那不成立，**带着它照样失败**。真正管用的是 `STEP_ENSURE_MUSL_TARGET` 那一步
+// 显式的 `rustup target add`（理由见那条断言上面的注释）。`targets:` 留着是
+// 兜底（万一哪天 `rust-toolchain.toml` 没了，它就重新成为有效的那条路），
+// 仍然钉住，防的是一次"看起来无关的清理"把它删掉。
 //
 // 会让这条测试变红的实现改法：把版本号改成跟 `rust-toolchain.toml` 的
 // `channel` 不一致的任何值，或者删掉 `with.targets`。
