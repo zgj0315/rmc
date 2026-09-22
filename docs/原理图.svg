@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 218" width="1000" height="218" role="img" aria-label="现场工程师笔记本主动向外拨出一条隧道到运维服务器；远程工程师连到运维服务器，他的 SSH 沿这条隧道进入客户内网，经笔记本直达一体机。客户内网不开放入站端口。">
+  <!-- 自包含：不依赖外部字体与样式，GitHub 的 img 渲染下也能正确显示。 -->
+  <style>
+    text { font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", sans-serif; fill: #17202A; }
+    .zone-c { fill: none; stroke: #5A6570; stroke-width: 1.25; stroke-dasharray: 6 5; }
+    .zl { font-size: 13px; font-weight: 700; fill: #5A6570; }
+    .zs { font-size: 12px; fill: #5A6570; }
+    .box { fill: #FFFFFF; stroke: #8E99A3; stroke-width: 1.25; }
+    .box-hub { stroke: #17202A; stroke-width: 1.5; }
+    .nt { font-size: 16px; font-weight: 700; text-anchor: middle; }
+    .ns { font-size: 12px; fill: #5A6570; text-anchor: middle; }
+    .lb { font-size: 13.5px; font-weight: 700; }
+    .t-tun { fill: #9A5A0A; }
+    .t-ses { fill: #08756F; }
+    .s-tun { stroke: #9A5A0A; fill: none; }
+    .s-ses { stroke: #08756F; fill: none; }
+    .f-tun { fill: #9A5A0A; }
+    .f-ses { fill: #08756F; }
+    .pipe { fill: #F7E6CC; stroke: #9A5A0A; stroke-width: 1.5; }
+  </style>
+  <defs>
+    <marker id="mSes" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="f-ses" d="M0,0 L10,5 L0,10 Z"/>
+    </marker>
+    <marker id="mTun" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="f-tun" d="M0,0 L10,5 L0,10 Z"/>
+    </marker>
+  </defs>
+
+  <!-- 底色：让它在深色页面上也是一张完整的图 -->
+  <rect x="0" y="0" width="1000" height="218" fill="#FFFFFF"/>
+
+  <!-- 客户内网边界 -->
+  <rect class="zone-c" x="590" y="30" width="390" height="172" rx="14"/>
+  <text class="zl" x="606" y="56">客户内网</text>
+  <text class="zs" x="606" y="74">不开放入站端口</text>
+
+  <!-- 隧道（先画，两端被节点盖住） -->
+  <rect class="pipe" x="396" y="112" width="236" height="36" rx="18"/>
+
+  <!-- ② 工程师的 SSH：一路向右 -->
+  <line class="s-ses" x1="184" y1="130" x2="242" y2="130" stroke-width="2.5" marker-end="url(#mSes)"/>
+  <line class="s-ses" x1="404" y1="130" x2="622" y2="130" stroke-width="2.5" marker-end="url(#mSes)"/>
+  <line class="s-ses" x1="784" y1="130" x2="842" y2="130" stroke-width="2.5" marker-end="url(#mSes)"/>
+
+  <!-- ① 隧道由笔记本主动拨出：向左 -->
+  <line class="s-tun" x1="614" y1="98" x2="410" y2="98" stroke-width="2" marker-end="url(#mTun)"/>
+  <text class="lb t-tun" x="414" y="84">① 笔记本主动拨出隧道</text>
+  <text class="lb t-ses" x="414" y="176">② 工程师 SSH 沿隧道进入</text>
+
+  <!-- 节点 -->
+  <rect class="box" x="24" y="90" width="160" height="80" rx="10"/>
+  <text class="nt" x="104" y="126">远程工程师</text>
+  <text class="ns" x="104" y="148">任意网络</text>
+
+  <rect class="box box-hub" x="244" y="90" width="160" height="80" rx="10"/>
+  <text class="nt" x="324" y="126">运维服务器</text>
+  <text class="ns" x="324" y="148">公网</text>
+
+  <rect class="box" x="624" y="90" width="160" height="80" rx="10"/>
+  <text class="nt" x="704" y="126">现场工程师笔记本</text>
+  <text class="ns" x="704" y="148">rmc.exe</text>
+
+  <rect class="box" x="844" y="90" width="120" height="80" rx="10"/>
+  <text class="nt" x="904" y="126">待维护一体机</text>
+  <text class="ns" x="904" y="148">不能上网</text>
+</svg>
