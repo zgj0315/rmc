@@ -277,7 +277,6 @@ fn write_remembered_key(paths: &AppPaths, key: &str) -> std::io::Result<()> {
 ///
 /// `previous` 是上一次记住的那个 key（W202）：账号改过之后它跟 `key`
 /// 不是一回事，而它才是盘上真正躺着密文的那一个。
-/// 清掉「记住着」的那一切。
 ///
 /// 终审 FR-3：`key`（表单当前这一条）是 `Option`——连接码解析不出来时
 /// 它是 `None`，而**清理照样要做**，靠的是 `previous`（`remembered_key`
