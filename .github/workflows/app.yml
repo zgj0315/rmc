@@ -73,7 +73,7 @@ jobs:
       # 假绿形态是「不是绿，是永不结束」，卡死时要有一条清楚的「超时被杀」，
       # 而不是干等到 job 级超时、什么诊断都没有。
       - name: 界面与平台层测试
-        run: timeout 900 cargo test -p rmc-win -p rmc-app -p rmc-gateway --no-fail-fast
+        run: timeout 900 cargo test -p rmc-win -p rmc-app --no-fail-fast
 
   # 395 条 Windows 专属测试的唯一出口，也是唯一会产出便携包的地方。
   #
@@ -116,7 +116,7 @@ jobs:
       # 测试只在 Linux 容器里跑过，这条链路在 Windows 上**到今天为止仍然
       # 没有被端到端验证过一次**——这一行是为了让下一次推送把它验掉。
       - name: 界面与平台层测试
-        run: cargo test -p rmc-win -p rmc-app -p rmc-gateway --no-fail-fast
+        run: cargo test -p rmc-win -p rmc-app --no-fail-fast
 
       - name: 构建发布二进制
         run: cargo build --release -p rmc-app

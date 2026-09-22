@@ -61,13 +61,25 @@ const STEP_UPLOAD: &str = "上传便携包";
 // DPAPI、托盘、电源事件；它验的是同一批逻辑在 Windows 的 std 与文件系统
 // 语义下成不成立。）每暴露一个问题就是一轮 20 分钟。它不削弱任何东西：
 // 有失败时退出码仍然非零，只是把所有测试目标跑完、一次把失败报全。
-// Task 12：多了 `-p rmc-gateway`。**加它是为了让 Windows 真跑端到端。**
-// `crates/rmc-gateway/tests/e2e.rs` 那 15 条把真客户端内核（rmc-core 的
-// Transport / TLS 指纹钉扣 / russh / pump / Supervisor）与真运维服务器
-// 接在一起跑；被它驱动的那一半代码最终交付在 Windows 上，而原来那套
-// docker 集成测试只在 Linux 容器里跑过——这条链路在 Windows 的 socket
-// 与文件系统语义下从来没有被端到端验证过一次。**只有 `windows-build`
-// 那一侧是这个理由。**
+// **2026-09-22 撤回 Task 12 加的 `-p rmc-gateway`。** 当时的理由是"让
+// Windows 真跑端到端"——`tests/e2e.rs` 那 15 条确实把真客户端内核
+// （rmc-core 的 Transport / TLS 指纹钉扣 / russh / pump / Supervisor）与
+// 真运维服务器接在一起跑，而被它驱动的那一半代码最终交付在 Windows 上。
+// 理由本身不假，但**载体选错了**：
+//
+// 1. `rmc-gateway` 是运维服务器，方案设计 §6 写明部署在一台干净的
+//    x86_64 Linux 上，**它永远不会在 Windows 上运行**。它的 lib 测试覆盖
+//    的是 Unix 权限位 0600、uid 属主检查、flock、审计文件权限——在 Windows
+//    上跑这些验不了任何会交付的东西，只是逼着测试夹具去兼容一个产品不去的
+//    平台（`testing::non_loopback_self_ip` 就卡在"Winsock 不让 connect 到
+//    0.0.0.0"这种纯夹具问题上）。
+// 2. 想在 Windows 上验客户端内核，直接的办法是 **`-p rmc-core`**——而这个
+//    job 今天恰恰**没有**跑它。把一个 Linux 服务端的测试夹具拖到 Windows 上，
+//    是绕着走。这条缺口记在 `docs/交付前还剩什么.md`。
+//
+// `rmc-gateway` 在 Linux 上的覆盖一条没少：`core.yml` 的 `unit` job 跑的是
+// `cargo test -p rmc-core -p rmc-gateway`，那才是它的闸门。
+// app.yml 的 `linux-checks` 原来也带着它，那是与 `core.yml` 的纯重复，一并去掉。
 //
 // **修复轮 1/5（复审 R12-6）订正一句假话。** 上一版这里写的是"两边都跑
 // 不是重复：它们验的是两个不同的平台"——这句话对 `linux-checks` **不
@@ -81,7 +93,7 @@ const STEP_UPLOAD: &str = "上传便携包";
 // `linux-checks` 单开一条窄一点的命令，就多出一个会各自漂移的真相来源，
 // 而省下的只是一台便宜 runner 上的三秒钟。代价与收益不对等，所以保持
 // 冗余，但**不再把它说成"两个平台"**。
-const TEST_COMMAND: &str = "cargo test -p rmc-win -p rmc-app -p rmc-gateway --no-fail-fast";
+const TEST_COMMAND: &str = "cargo test -p rmc-win -p rmc-app --no-fail-fast";
 const CLIPPY_COMMAND: &str = "cargo clippy -p rmc-win -p rmc-app --all-targets -- -D warnings";
 
 // 会让这条测试变红的实现改法：删掉两个 job 里的任意一个、改名、或者再加
