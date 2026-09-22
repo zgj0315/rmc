@@ -388,7 +388,11 @@ fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
 // 分开各自断言挡不住"构建了 A、检查了 B、上传了 C"这种每一步单看都对、
 // 合起来毫无意义的退化——那正是这份文件通篇在防的形状。
 //
-// `file ... | grep -q 'statically linked'` 这一条尤其不能省：
+// `file ... | grep` 那一条尤其不能省（2026-09-22 订正：匹配式现在是
+// `-qE 'statically linked|static-pie linked'` 加一条 `! ... grep -q
+// 'dynamically linked'` 的反向检查——原来只认 `statically linked`，
+// 而真 musl-gcc 链出来的是 static-PIE，CI 上就是这么红的；本机
+// cargo-zigbuild 链的又恰好是非 PIE，所以本地验不出来）：
 // `--target x86_64-unknown-linux-musl` 构建成功**不等于**产物是静态的
 // （任何一条走 build.rs 链了系统库的依赖都会让它退化成动态链接），而
 // 那种退化不会让 `cargo build` 失败，只会在客户那台机器上表现成一句
@@ -396,8 +400,8 @@ fn unit_test_step_runs_the_complete_test_suite_not_a_narrowed_subset() {
 //
 // 会让这条测试变红的实现改法：从构建命令里删掉 `--target
 // x86_64-unknown-linux-musl`（产出就成了 glibc 动态链接的）；删掉
-// "确认是静态链接"这一步，或者把里面的 `grep -q 'statically linked'`
-// 换成只 `file` 一下不判断；把上传的 `path` 改成别的路径；改掉产物名；
+// "确认是静态链接"这一步，或者把里面的 `grep` 换成只 `file` 一下不判断、
+// 把两种静态说法砍掉一种、删掉那条反向检查；把上传的 `path` 改成别的路径；改掉产物名；
 // 或者删掉 `if-no-files-found: error`（二进制没产出时会上传一个空产物
 // 并让这一步变绿）。
 #[test]
@@ -444,8 +448,13 @@ fn gateway_release_job_builds_a_static_musl_binary_and_uploads_it() {
         "静态性检查必须针对构建出来的那一个产物，实际 {check:?}"
     );
     assert!(
-        check.contains("statically linked"),
-        "必须真的核对 file 的输出说了 statically linked，实际 {check:?}"
+        check.contains("statically linked") && check.contains("static-pie linked"),
+        "两种静态说法都要认：非 PIE 的产物 file 说 statically linked，\
+         static-PIE 说 static-pie linked，实际 {check:?}"
+    );
+    assert!(
+        check.contains("dynamically linked"),
+        "还要有一条反向检查挡住真的动态链接，实际 {check:?}"
     );
     assert!(
         check.contains("grep -q"),

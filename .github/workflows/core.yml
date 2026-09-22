@@ -141,7 +141,14 @@ jobs:
           bin=target/x86_64-unknown-linux-musl/release/rmc-gateway
           test -f "$bin"
           file "$bin"
-          file "$bin" | grep -q 'statically linked'
+          # 两种说法都算静态：`file` 对非 PIE 的静态产物说 "statically linked"，
+          # 对 static-PIE 说 "static-pie linked"。2026-09-22 这一步就是只认前者
+          # 而红的——本机用 cargo-zigbuild 链出来的是 "statically linked"，
+          # CI 用真 musl-gcc 链出来的是 "static-pie linked"，产物都是静态的。
+          # 再加一条反向检查：动态产物会写 "dynamically linked, interpreter ..."，
+          # 两条一起才既不误杀 static-pie、也不放过真的动态链接。
+          file "$bin" | grep -qE 'statically linked|static-pie linked'
+          ! file "$bin" | grep -q 'dynamically linked'
 
       # `if-no-files-found: error` 不能省：默认是 `warn`，二进制没产出时
       # 会上传一个空产物并让这一步变绿（同 app.yml 里那条便携包的说明）。
