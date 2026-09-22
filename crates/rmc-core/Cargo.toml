@@ -39,10 +39,22 @@ rustls-pki-types = { version = "1", default-features = false, features = ["std"]
 # `#[cfg(feature = "rsa")]` 门控——没开 `rsa` feature 时，客户端仍然会
 # 在 KEXINIT 里广播 `rsa-sha2-512`/`rsa-sha2-256`/`ssh-rsa`。如果对端
 # 真的选中其中一个并回一张 RSA host key，本 crate 到 `parse_public_
-# key` 那一步会因为缺 `rsa` feature 解析失败，这条失败经
-# `SshTransport` 归类到 `ErrorClass::Network`——对一台完全正常、只是
-# 恰好用 RSA host key 的运维服务器，客户端会无限退避重连，而不是报一条
-# "host key 类型不受支持"。**当前无害**：服务端是本仓库自己的
+# key` 那一步会因为缺 `rsa` feature 解析失败。
+#
+# **终审 FR-6，照代码订正这段注释**：这里原来写的是"这条失败经
+# `SshTransport` 归类到 `ErrorClass::Network`，客户端会无限退避重连"，
+# **与代码不符**。解析密钥失败在 russh 里是 `russh::Error::Keys(_)`，
+# 而 `src/error.rs` 的 `impl From<russh::Error> for Error` 第一条分支
+# 就是 `russh::Error::Keys(_) | russh::Error::NoAuthMethod =>
+# Error::AuthRejected`——它落的是 `ErrorClass::Auth`，不是 Network。
+# 订正注释而不是改代码：`Keys(_) → Auth` 是一条有意的分类（"这条连接
+# 压根没能力完成认证，重试同一条网络路径不会让这把密钥变得可用"，见
+# `error.rs` 那条 `From` 上的文档），改它是行为变更，不该顺手做。
+#
+# 归 Auth 的真实后果与原注释说的不同、但同样是误导：`ErrorClass::Auth`
+# 的处置是"停止并回到 Idle，提示重新输入，不自动重试"——对一台完全
+# 正常、只是恰好用 RSA host key 的运维服务器，现场看到的是**让他重输
+# 口令**，而口令根本没错，重输多少遍都一样。**当前无害**：服务端是本仓库自己的
 # `rmc-gateway`，`crates/rmc-gateway/src/identity.rs` 里身份密钥只有
 # ed25519 一种，host key 就是它，永远不会被协商选中 RSA。
 # （Task 13 之前这句话的依据是 `gateway/sshd_tunnel_config` 里的
@@ -51,7 +63,7 @@ rustls-pki-types = { version = "1", default-features = false, features = ["std"]
 # 耦合从"两个 repo 之间的口头约定"收紧成"`cargo test --workspace`
 # 覆盖得到的一处实现"。）但这仍然不是 rmc-core 自己能保证的性质：
 # 哪天把客户端指向另一台用别的 SSH 实现的服务器，这里会在完全不知情的
-# 情况下从"能连"变成"无限重连"。
+# 情况下从"能连"变成"报口令错、让现场一遍遍重输"。
 russh = { version = "0.63", default-features = false, features = ["ring"] }
 # 只开 local-offset：审计日志的时间戳想显示现场笔记本的本地时间，不是
 # UTC。不开 formatting/macros——本模块自己手写 format! 拼时间戳，不用

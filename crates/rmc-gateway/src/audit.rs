@@ -35,6 +35,16 @@ pub enum AuditEvent {
     Banned {
         peer: String,
     },
+    /// 未认证连接配额被打满，多出来的连接直接关掉。
+    ///
+    /// **终审 FR-4**：这一支原来只有一句 `tracing::info!`，不进审计。
+    /// 「未认证连接配额被打满」是这套东西最薄弱的一环——一个不需要任何
+    /// 账号、不需要任何口令的人就能把全局 64 个名额占满，让所有正常的
+    /// 现场连接连 TLS 都握不上；而审计是这件事发生过的唯一痕迹。日志
+    /// 会轮转、会被采集器丢，审计文件是按天留 180 天的那一份。
+    TooManyUnauth {
+        peer: String,
+    },
     TunnelUp {
         account: String,
         port: u16,
@@ -123,7 +133,7 @@ impl AuditLog {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
                 }
-                writeln!(f, "{line}")
+                append_line(&mut f, &line)
             });
         if let Err(e) = r {
             tracing::error!(error = %e, "审计日志写入失败");
@@ -158,6 +168,25 @@ impl AuditLog {
     }
 }
 
+/// 一行 JSON + 换行，**一次 `write_all`**。
+///
+/// **终审 FR-5**：原来这里是 `writeln!(f, "{line}")`。`writeln!` 走的是
+/// `io::Write::write_fmt`，它按格式串的片段逐段 `write_all`——对一个
+/// `File`（无缓冲）就是**两次 `write(2)`**：先内容，再换行。追加模式下
+/// 单次 `write(2)` 才是原子的，两次之间别的进程（`serve` 与 CLI 的
+/// `account` 子命令同时往同一天的文件里追加）可以插进来，结果是一行
+/// JSON 被截进另一行，两行都不再是合法 JSON——而审计日志的全部价值就
+/// 在于事后能被逐行解析。拼成一个缓冲区再一次写出去，把这个窗口关掉。
+///
+/// 它不保证「任意长度都原子」（PIPE_BUF 之类的限制仍在），但审计行是
+/// 几百字节量级，远在任何一个平台的原子写阈值之内。
+fn append_line(f: &mut impl Write, line: &str) -> std::io::Result<()> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    f.write_all(buf.as_bytes())
+}
+
 /// `YYYY-MM-DD` → 自 1970-01-01 的天数（Hinnant 的 `days_from_civil`，
 /// `civil_from_days` 的逆函数）。同样的取整陷阱、同样的绕开写法：
 /// `era` 那一行故意写成 `if y >= 0 { y } else { y - 399 } / 400`。
@@ -181,6 +210,57 @@ fn days_from_stamp(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一次 `write` 调用就把「内容 + 换行」写完。
+    ///
+    /// **终审 FR-5**：`serve` 与 CLI 的 `account` 子命令是两个进程，会
+    /// 同时往同一天的审计文件里追加。`O_APPEND` 只保证**单次** `write(2)`
+    /// 的原子性；`writeln!` 走 `write_fmt`，对无缓冲的 `File` 会拆成两次
+    /// 系统调用（内容、换行），两次之间另一个进程插进来，一行 JSON 就被
+    /// 截进另一行，两行都不再能被逐行解析——审计日志的全部价值就在这。
+    ///
+    /// 「两个进程真并发时会不会截断」在单元测试里**造不出稳定的复现**
+    /// （要靠调度撞窗口），所以这里钉的是那个可以确定性观察的性质本身：
+    /// **只发生一次 `write` 调用**。夹具是一个只实现 `write` 的计数
+    /// 写入器——`write_fmt` 的默认实现正是靠反复调用它来拼输出的。
+    ///
+    /// 改红（**实测过**）：把 `append_line` 的函数体换回
+    /// `writeln!(f, "{line}")`——`writes` 变成 2（内容一次、换行一次），
+    /// `assert_eq!(w.writes, 1, ...)` 红。
+    #[test]
+    fn one_line_goes_out_in_a_single_write_call() {
+        #[derive(Default)]
+        struct Counting {
+            writes: usize,
+            buf: Vec<u8>,
+        }
+        impl Write for Counting {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                // 空写不算数：`write_all(b"")` 根本不会走到这里，这一句
+                // 只是防止将来有人加了空片段把计数弄花。
+                if !b.is_empty() {
+                    self.writes += 1;
+                    self.buf.extend_from_slice(b);
+                }
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut w = Counting::default();
+        append_line(&mut w, r#"{"event":"auth_ok"}"#).unwrap();
+        assert_eq!(
+            w.writes, 1,
+            "一行审计要一次写完：分两次写的话，另一个进程的追加会插在中间，\
+             把这一行截断成两段谁也解析不了的东西"
+        );
+        assert_eq!(
+            String::from_utf8(w.buf).unwrap(),
+            "{\"event\":\"auth_ok\"}\n"
+        );
+    }
 
     /// 改红：`Line` 上去掉 `#[serde(flatten)]`——第二格红（事件字段被包在
     /// "ev" 里）。

@@ -269,15 +269,43 @@ impl AccountReader {
                 return list.clone();
             }
         }
-        let list = std::sync::Arc::new(
-            read_file(&self.path)
-                .map(|f| f.accounts)
-                .unwrap_or_default(),
-        );
-        if let Some(stamp) = stamp {
-            *cache = Some((stamp, list.clone()));
+        match read_file(&self.path) {
+            Ok(f) => {
+                let list = std::sync::Arc::new(f.accounts);
+                // **只在读成功时才写缓存**（终审 FR-1b）。原来这里不分成没成
+                // 功：读失败时 `unwrap_or_default()` 给出的**空表**会连同当时
+                // 的 `stamp` 一起被写进缓存，而事后 `chown`/`chmod` 修回属主与
+                // 权限**不改 mtime 也不改 len**——`stamp` 一个字节都没变，下一
+                // 个 tick 直接命中缓存，那张空表就此永久生效，非得重写一次
+                // `accounts.toml` 或重启 `serve` 才能解开。空表意味着所有认证
+                // 被拒、所有在线隧道在一个扫描周期内被断开，代价太大。
+                // 读成功才更新缓存，读失败就什么都不记，下一次调用自然重试。
+                if let Some(stamp) = stamp {
+                    *cache = Some((stamp, list.clone()));
+                }
+                list
+            }
+            Err(e) => {
+                // **出声**（终审 FR-1a）。原来这一支是 `unwrap_or_default()`，
+                // 一条日志都不打：运维在审计与日志里看不到任何痕迹，看到的只有
+                // 「全部隧道在五秒内断光、所有新认证被拒」。
+                //
+                // 文案刻意不提「账号变更」这类词：这条日志出现时，账号表**压根
+                // 没被读到**，服务端并不知道里面写着什么，更没有任何账号被停用。
+                // 把原因直接指向最常见的那条真实路径（用 `sudo` 跑过 `account`
+                // 子命令，`accounts.toml` 成了 root 所有），让运维知道该去查什么。
+                tracing::error!(
+                    error = %e,
+                    path = %self.path.display(),
+                    "读不到账号表，本次按空表处理：所有认证都会被拒绝、在线隧道会在一个扫描周期内被断开。\
+                     这不是运维侧对任何账号做过变更的结果——服务端根本没读到这个文件。\
+                     最常见的原因是它的属主或权限不对（比如用 sudo 跑过 account 子命令，文件成了 root 所有的 0600，\
+                     而 serve 以普通用户在跑）：检查 accounts.toml 与数据目录的属主和权限，\
+                     改回 serve 所用的那个用户即可；修好之后下一次读取就会自动恢复，不必重启 serve"
+                );
+                std::sync::Arc::new(Vec::new())
+            }
         }
-        list
     }
 
     pub fn verify(&self, name: &str, password: &str) -> Verify {
@@ -473,6 +501,148 @@ mod tests {
             r.verify("zhang", pw2.as_str()),
             Verify::Ok { port: 22001 },
             "新口令该生效"
+        );
+    }
+
+    /// 把 `tracing` 的输出收进一个 `Vec<u8>`，只在当前线程上生效
+    /// （`with_default`），不碰全局订阅者，跟并行跑的别的测试互不干扰。
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[cfg(unix)]
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let sink = CapturedLogs::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let out = tracing::subscriber::with_default(sub, f);
+        let text =
+            String::from_utf8(sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap();
+        (out, text)
+    }
+
+    /// 终审 FR-1a：**读不到 `accounts.toml` 时必须出声**。
+    ///
+    /// 复现的是这条真实路径：`serve` 以普通用户在跑，运维用
+    /// `sudo rmc-gateway account add li` 开了个账号，新的 `accounts.toml`
+    /// 成了 root 所有的 0600。`std::fs::metadata` 只要目录可遍历就成功
+    /// （stat 不需要读权限），所以服务端拿得到 `(mtime, len)`，只有真正
+    /// 的 `read_to_string` 会 EACCES——原来这一支是 `unwrap_or_default()`，
+    /// 空表、零日志：五秒内全部在线隧道被断、所有新认证被拒，而运维手上
+    /// 没有任何线索。
+    ///
+    /// 这条测试钉三件事：出声了、说清了该查什么（属主/权限）、**没有**
+    /// 把它说成账号被吊销/停用（那是一句会把运维带去查账号表内容的假话，
+    /// 而账号表这一刻压根没被读到）。
+    ///
+    /// 改红（**实测过**）：在 `snapshot` 的 `Err(e)` 分支那句
+    /// `tracing::error!(` 上方加一行 `#[cfg(any())]`（等价于把这条日志
+    /// 整个删掉，只留 `std::sync::Arc::new(Vec::new())`）——实际输出
+    /// `一条日志都没打：""`，`assert!(logs.contains("读不到账号表"))` 红。
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_to_read_the_account_table_is_logged_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let (_, pw) = s.add(&name("zhang"), None, "").unwrap();
+        let path = tmp.path().join("accounts.toml");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = AccountReader::new(&DataDir::at(tmp.path().to_path_buf()));
+        let (verdict, logs) = capture_logs(|| r.verify("zhang", pw.as_str()));
+        // 不管断言过不过，先把权限还原，免得 `tempdir` 清理时遇上麻烦。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            verdict,
+            Verify::Rejected,
+            "读不到账号表就必须拒（fail-closed）"
+        );
+        assert!(logs.contains("读不到账号表"), "一条日志都没打：{logs:?}");
+        assert!(
+            logs.contains("属主") && logs.contains("权限"),
+            "文案要让运维知道去查属主/权限：{logs}"
+        );
+        // 夹具里的账号名 `zhang`、目录名（tempdir 随机名）都不含下面这两个
+        // 词，这条否定断言因此不会被夹具自己弄假（GLOBAL.md 那条通用教训）。
+        assert!(
+            !logs.contains("吊销") && !logs.contains("停用"),
+            "读文件失败不是账号被吊销/停用，不能这么写：{logs}"
+        );
+    }
+
+    /// 终审 FR-1b：**读失败不许把缓存写坏**——权限修回来之后下一次读就该
+    /// 自愈，不用重写文件、更不用重启 `serve`。
+    ///
+    /// 原来的写法 `if let Some(stamp) = stamp { *cache = Some((stamp,
+    /// list.clone())); }` 不分读成没成功：EACCES 那一次的**空表**连同当时
+    /// 的 `stamp` 被写进缓存。而 `chmod`/`chown` 修回权限**不动 mtime 也
+    /// 不动 len**，`stamp` 一字不变 → 下一次调用命中缓存 → 继续吐那张空表，
+    /// 永久。这条测试刻意用一个**冷缓存**的 `AccountReader`（建好就直接撞
+    /// 权限错误，从没缓存过好的快照）——热缓存那条路会在 `stamp` 没变时
+    /// 提前命中旧的好快照，测不出这件事。
+    ///
+    /// 改红（**实测过**，下面这一枪真的打红了）：把 `Err` 分支最后那句
+    /// `std::sync::Arc::new(Vec::new())` 换成
+    /// `let list = std::sync::Arc::new(Vec::new()); if let Some(stamp) =
+    /// stamp { *cache = Some((stamp, list.clone())); } list`
+    /// ——也就是让读失败这一支也写缓存，等价于修复前的老行为。实际输出：
+    /// `assertion left == right failed: 权限修好之后下一次读就该自愈，
+    /// 不该被上一次失败的空表锁死 / left: Rejected / right: Ok { port: 22001 }`。
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_read_does_not_poison_the_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let (_, pw) = s.add(&name("zhang"), None, "").unwrap();
+        let path = tmp.path().join("accounts.toml");
+        let before = std::fs::metadata(&path).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = AccountReader::new(&DataDir::at(tmp.path().to_path_buf()));
+        assert_eq!(
+            r.verify("zhang", pw.as_str()),
+            Verify::Rejected,
+            "读不到账号表时必须 fail-closed"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // 反向自证：`chmod` 确实没改 mtime/len，也就是说缓存键一个字节都
+        // 没变——如果上面那次失败把空表写进了缓存，下面这句就必然命中缓存
+        // 里的空表，这条断言因此真的带载。
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            r.verify("zhang", pw.as_str()),
+            Verify::Ok { port: 22001 },
+            "权限修好之后下一次读就该自愈，不该被上一次失败的空表锁死"
         );
     }
 

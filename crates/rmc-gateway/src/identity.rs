@@ -72,6 +72,29 @@ impl Identity {
         Ok(id)
     }
 
+    /// 读身份文件失败时的分诊。**终审 FR-2**：原来这里对**任何** io 错误
+    /// 都统一套一句「先运行 init」——而 `init` 在身份文件已存在时是会
+    /// 拒绝覆盖的（`already_exists_err`），所以那句话在「文件存在、只是
+    /// 读不了」的场景下**建议了一个必定被拒绝的动作**，用户从提示里得不到
+    /// 任何能解决问题的信息。真实场景有三类：`chmod 000` 过的密钥文件、
+    /// 数据目录由用户 A 建而用户 B 拿去跑（EACCES）、以及 `identity.key`
+    /// 本身是个**目录**（EISDIR，比如有人手滑 `mkdir` 了它）。
+    ///
+    /// 只有 `NotFound` 才是「从来没 init 过」，才该建议 init；其余如实
+    /// 说是什么错，并把矛头指向属主/权限。`cmd_serve`、`cmd_fingerprint`
+    /// 与 `account` 那几个子命令的 `load()` 都经这一条路径，分诊一处生效。
+    fn read_error(path: &Path, e: io::Error) -> Error {
+        if e.kind() == io::ErrorKind::NotFound {
+            Error::Identity(format!("读不到 {}：{e}；先运行 init", path.display()))
+        } else {
+            Error::Identity(format!(
+                "读不到 {}：{e}（不是「文件不存在」，检查这份文件与所在目录的属主/权限，\
+                 不要再跑 init——身份文件已经存在，init 会拒绝覆盖它）",
+                path.display()
+            ))
+        }
+    }
+
     fn already_exists_err(path: &Path) -> Error {
         Error::Identity(format!(
             "{} 已存在，拒绝覆盖——换密钥等于换身份，所有连接码都会作废；确实要换请先手工移走它",
@@ -84,9 +107,7 @@ impl Identity {
         // R——评审 Critical 1：整份身份文件（含 base64 编码的种子）读进来之后
         // 立刻包进 `Zeroizing`，不留一份裸 `String`。
         let text: Zeroizing<String> =
-            Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| {
-                Error::Identity(format!("读不到 {}：{e}；先运行 init", path.display()))
-            })?);
+            Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| Self::read_error(&path, e))?);
         let rest = text
             .trim()
             .strip_prefix(FILE_TAG)
@@ -253,6 +274,47 @@ mod tests {
         assert_eq!(
             rmc_core::code::ServerFingerprint::of_ed25519_public(&pk),
             fp
+        );
+    }
+
+    /// **终审 FR-2**：`load_from` 对读失败按 `io::ErrorKind` 分诊——只有
+    /// 「文件真的不存在」才该建议「先运行 init」。
+    ///
+    /// 夹具用「`identity.key` 是个目录」这一种：它在 Unix 上让
+    /// `read_to_string` 报 EISDIR，而**不需要** `chmod`、也不依赖测试
+    /// 进程不是 root（`chmod 000` 对 root 无效）。这一种同时也正是那道
+    /// 被删掉的 `serve` 早检查看不出来的形态——`std::fs::File::open`
+    /// 打开一个目录在 Unix 上返回 `Ok`，探针会放行，最后还是在真正读取
+    /// 时撞上同一句误导。
+    ///
+    /// 两个方向都钉：不存在 → 说 init；存在但读不了 → 不许说 init，
+    /// 要指向属主/权限。少了后半句，删掉分诊也不会红。
+    ///
+    /// 改红：把 `read_error` 里 `if e.kind() == io::ErrorKind::NotFound`
+    /// 的判断改成 `if true`（退回不分诊、一律建议 init 的老行为）——
+    /// `assert!(!e.contains("先运行 init"))` 红。
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_identity_key_is_not_blamed_on_a_missing_setup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = crate::datadir::DataDir::at(tmp.path().to_path_buf());
+        d.create().unwrap();
+        // 方向一：文件真的不存在——这句提示是对的，必须留着。
+        let missing = Identity::load_from(&d).unwrap_err().to_string();
+        assert!(
+            missing.contains("先运行 init"),
+            "从来没建过身份文件时，这句提示是对的：{missing}"
+        );
+        // 方向二：文件在（是个目录），读不了。
+        std::fs::create_dir(d.identity_key()).unwrap();
+        let e = Identity::load_from(&d).unwrap_err().to_string();
+        assert!(
+            !e.contains("先运行 init"),
+            "读不了不等于没 init——init 在文件已存在时会拒绝覆盖，这句建议必定被拒：{e}"
+        );
+        assert!(
+            e.contains("属主") || e.contains("权限"),
+            "要指向属主/权限这个真实方向：{e}"
         );
     }
 

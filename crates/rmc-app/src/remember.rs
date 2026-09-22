@@ -150,12 +150,47 @@ pub enum SaveOutcome {
 /// **只在连接成功之后调**：口令没被运维服务器验过就存下来，等于把一个
 /// 打错的口令记一年。
 pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutcome {
+    // # 终审 FR-3：**「不再记住」这条路不许依赖表单能不能解析**
+    //
+    // 这三行原来在函数最前面，`remember = false` 那一支排在它后面——于是
+    // 「取消勾选时连接码恰好是坏的」这种再普通不过的组合（用户一边改连接码
+    // 一边把勾去掉、粘贴粘了半条、把框清空重填）会在这里就 `Incomplete`
+    // 返回，**一个字节都不清**：上一个账号的 DPAPI 密文与
+    // `remembered-key.txt` 原样留在盘上，下次启动照样把口令自动填回密码
+    // 框。用户明确说了
+    // 「不再记住」，而软件什么都没做，也没告诉他。
+    //
+    // 「要清掉哪一份密文」这个问题的答案本来也不在表单里——它在
+    // `remembered_key` 记录里（W202/R11-2，见下面 `previous` 那一段）。
+    // 表单只是**附加**了一份「当前这个 key 也一并清掉」的保险，缺了它不
+    // 影响正确性。所以把解析挪到「确实要存」那一支的开头去。
+    let previous = previous_key(paths);
+
+    if !form.remember {
+        // 取消勾选（或者从来没勾）：`remembered_key` 指着的那份密文清掉，
+        // 记录本身也删掉——盘上不该再有任何一个 key 被当成「记住着」。
+        // 表单能解析的话，顺手把它拼出来的 key 也清一遍（多一层保险：
+        // 万一是从没有 `remembered_key` 记录的老版本升上来的）；解析不出
+        // 来就只按 `previous` 清，**不再因此整支跳过**。
+        // **不碰连接码文件**（Task 11）：那份记录现在由 `persist_code`
+        // 独立维护，跟「记住密码」这个勾无关——用户「不再记住密码」不等于
+        // 「不想让软件记得上次连的是哪台」。
+        let current = Account::from_form(form).map(|a| a.key());
+        return match clear(paths, store, current.as_deref(), previous.as_deref()) {
+            Ok(()) => SaveOutcome::Cleared,
+            Err(e) => SaveOutcome::Failed(e.to_string()),
+        };
+    }
+
     let Some(account) = Account::from_form(form) else {
         return SaveOutcome::Incomplete;
     };
     let key = account.key();
 
-    // # W202：上一次记的是谁，**必须在这里读**
+    // # W202：上一次记的是谁，读的是哪一份记录
+    //
+    // （读本身在函数开头，终审 FR-3 把它连同「不再记住」那一支一起提到了
+    // `Account::from_form` 前面；下面这段说的是**为什么读那一份**。）
     //
     // R11-2 修复轮：这个问题的答案来自 [`AppPaths::remembered_key`]，
     // **不是** `connection-code.txt`——两者故意拆开（见 `AppPaths` 上的
@@ -172,21 +207,8 @@ pub fn save(paths: &AppPaths, store: &dyn SecretStore, form: &Form) -> SaveOutco
     // `previous.filter(|p| *p != key)` 过滤掉），`A@运维服务器` 的密文
     // **永久留在盘上，而且再也没有任何路径指得到它**。
     //
-    // 读必须在 [`write_remembered_key`] **之前**：那一步会把它覆盖掉。
-    let previous = previous_key(paths);
-
-    if !form.remember {
-        // 取消勾选（或者从来没勾）：当前 key、上一次那个 key 两份密文都
-        // 清掉，`remembered_key` 记录也删掉——盘上不该再有任何一个 key
-        // 被当成「记住着」。**不碰连接码文件**（Task 11）：那份记录
-        // 现在由 [`persist_code`] 独立维护，跟「记住密码」这个勾无关
-        // ——用户「不再记住密码」不等于「不想让软件记得上次连的是哪台」。
-        return match clear(paths, store, &key, previous.as_deref()) {
-            Ok(()) => SaveOutcome::Cleared,
-            Err(e) => SaveOutcome::Failed(e.to_string()),
-        };
-    }
-
+    // 读必须在 [`write_remembered_key`] **之前**：那一步会把它覆盖掉，
+    // 所以 `previous` 在函数开头就读好了（见上）。
     if form.password.is_empty() {
         return SaveOutcome::Incomplete;
     }
@@ -255,16 +277,25 @@ fn write_remembered_key(paths: &AppPaths, key: &str) -> std::io::Result<()> {
 ///
 /// `previous` 是上一次记住的那个 key（W202）：账号改过之后它跟 `key`
 /// 不是一回事，而它才是盘上真正躺着密文的那一个。
+/// 清掉「记住着」的那一切。
+///
+/// 终审 FR-3：`key`（表单当前这一条）是 `Option`——连接码解析不出来时
+/// 它是 `None`，而**清理照样要做**，靠的是 `previous`（`remembered_key`
+/// 记录，见 [`previous_key`]）。真正回答「盘上那份密文属于谁」的从来
+/// 就是 `previous`，`key` 只是一层附加保险。
 fn clear(
     paths: &AppPaths,
     store: &dyn SecretStore,
-    key: &str,
+    key: Option<&str>,
     previous: Option<&str>,
 ) -> std::io::Result<()> {
     // 每一步都走完再报第一个错——半路 return 会留下另外几样（同 Task 4
     // 的 `SecretStore::clear` 自己那条 W25）。
-    let mut result = store.clear(key);
-    if let Some(old) = previous.filter(|p| *p != key) {
+    let mut result = Ok(());
+    if let Some(key) = key {
+        result = result.and(store.clear(key));
+    }
+    if let Some(old) = previous.filter(|p| Some(*p) != key) {
         result = result.and(store.clear(old));
     }
     // 清完密文，`remembered_key` 也该删掉——清完之后盘上没有任何一个
@@ -1096,20 +1127,95 @@ mod tests {
     }
 
     /// 表单不完整、或者口令是空的，什么都不做。
+    ///
+    /// **终审 FR-3 调整了第一句的夹具**：`Form::default()` 的
+    /// `remember` 是 `false`，而「不再记住」这条路现在**不依赖表单能否
+    /// 解析**（见 [`save`] 开头那段），空表单 + 没勾 = 一次「清掉」
+    /// （没东西可清，但结局是 `Cleared` 而不是 `Incomplete`）。
+    /// `Incomplete` 现在专指「确实要存、但表单还拼不出 key 或口令是空
+    /// 的」——这里就按那个意思重新造夹具：勾着、但连接码是空的。
     #[test]
     fn an_incomplete_form_saves_nothing() {
         let dir = tempfile::tempdir().expect("建临时目录");
         let paths = AppPaths::at(dir.path().to_path_buf());
         let store = store_at(&paths, FlipSealer);
 
+        let empty = Form {
+            remember: true,
+            ..Form::default()
+        };
         assert_eq!(
-            save(&paths, store.as_ref(), &Form::default()),
+            save(&paths, store.as_ref(), &empty),
             SaveOutcome::Incomplete
         );
         let mut f = filled_form();
         f.password = Zeroizing::new(String::new());
         assert_eq!(save(&paths, store.as_ref(), &f), SaveOutcome::Incomplete);
         assert!(!paths.connection_code().exists(), "什么都不该落盘");
+    }
+
+    /// **终审 FR-3：取消勾选时连接码恰好不可解析，旧密文照样要清掉。**
+    ///
+    /// 原来 [`save`] 第一句就是 `Account::from_form(form)?`，解析不出来
+    /// 直接 `Incomplete` 返回——**一个字节都不清**。于是「一边改连接码
+    /// 一边把勾去掉」「粘贴只粘了半条」「把框清空重填」这类再普通不过的
+    /// 操作，结局是：用户明确选了「不再记住」，而上一个账号的密文与
+    /// `remembered-key.txt` 原样留在盘上，下次启动照样把口令自动填回
+    /// 密码框，还什么都不说。
+    ///
+    /// 夹具里那条坏连接码是 `"rmc1:这不是连接码"`——它不含任何一个被
+    /// 断言的关键词，也解析不出账号，`Account::from_form` 必定 `None`
+    /// （下面第一句反向自证直接钉住这一点，不靠推断）。
+    ///
+    /// 改红（**实测过**，用等价、更小的一处注入）：在 [`save`] 里
+    /// `if !form.remember {` 上面加一行
+    /// `let Some(_probe) = Account::from_form(form) else { return
+    /// SaveOutcome::Incomplete; };`——这就是「不再记住」那一支重新依赖
+    /// 表单能否解析的老行为。实际输出：
+    /// `assertion left == right failed: 用户说了不再记住，不能因为表单
+    /// 拼不出 key 就整支跳过 / left: Incomplete / right: Cleared`。
+    #[test]
+    fn unchecking_remember_clears_even_when_the_code_no_longer_parses() {
+        const KEY: &str = "tunnel-zhang@203.0.113.10:22000";
+
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let paths = AppPaths::at(dir.path().to_path_buf());
+        let store = store_at(&paths, FlipSealer);
+
+        // 1. 先真的记住一份。
+        assert_eq!(
+            save(&paths, store.as_ref(), &filled_form()),
+            SaveOutcome::Saved { key: KEY.into() }
+        );
+        // 反向自证：密文与「记住的是谁」两样都在盘上，下面的断言因此带载。
+        assert!(store.load(KEY).is_some());
+        assert!(paths.remembered_key().exists());
+
+        // 2. 用户把连接码改坏了（还没改完、粘了半条……），同时把勾去掉。
+        let mut f = filled_form();
+        f.code = "rmc1:这不是连接码".into();
+        f.remember = false;
+        // 反向自证：这条连接码确实解析不出账号——否则这条测试测的就不是
+        // 「解析不出来时也要清」。
+        assert!(
+            Account::from_form(&f).is_none(),
+            "夹具的连接码必须是真的解析不出来的"
+        );
+
+        assert_eq!(
+            save(&paths, store.as_ref(), &f),
+            SaveOutcome::Cleared,
+            "用户说了不再记住，不能因为表单拼不出 key 就整支跳过"
+        );
+        assert!(
+            store.load(KEY).is_none(),
+            "取消勾选时连接码恰好坏掉，旧账号的密文就永久留在盘上了"
+        );
+        assert!(
+            !paths.remembered_key().exists(),
+            "「记住的是谁」这份记录也该没了，留着就是撒谎"
+        );
+        assert_eq!(sealed_files(&paths).len(), 0, "{:?}", sealed_files(&paths));
     }
 
     // ================= Task 11：连接码独立落盘 =================

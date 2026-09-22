@@ -432,7 +432,13 @@ impl Server {
                                     drop(sock);
                                 }
                                 Admit::TooMany => {
-                                    tracing::info!(%peer, "未认证连接过多，拒绝");
+                                    // 终审 FR-4：进审计，不只是一句 info 日志。
+                                    // 未认证连接配额被打满是这套东西最薄弱的
+                                    // 一环——不需要账号、不需要口令就能把名额
+                                    // 占满，让现场连 TLS 都握不上；而这条记录
+                                    // 是它被打时唯一的痕迹，得落在按天留 180
+                                    // 天的审计文件里，不能只写进会轮转的日志。
+                                    shared.audit.record(AuditEvent::TooManyUnauth { peer: peer.to_string() });
                                     drop(sock);
                                 }
                             }
@@ -1934,6 +1940,16 @@ mod tests {
     }
 
     /// 未认证连接上限：多出来的 TCP 连接被立刻关掉，认证过的不占名额。
+    ///
+    /// **终审 FR-4 追加的第二组断言**：被挡掉的那一条要**进审计**。
+    /// 终审把「未认证连接配额被打满」判成这套东西最薄弱的一环——不需要
+    /// 账号、不需要口令就能把名额占满，把现场挡在门外；而审计是它发生过
+    /// 的唯一痕迹（`tracing` 那边会轮转，审计文件按天留 180 天）。
+    ///
+    /// 改红（**实测过**）：把 `Admit::TooMany` 那一支里
+    /// `shared.audit.record(AuditEvent::TooManyUnauth { .. })` 换回原来的
+    /// `tracing::info!(%peer, "未认证连接过多，拒绝");`——审计文件里不会
+    /// 出现 `"event":"too_many_unauth"`，最后那句 `assert!` 红。
     #[tokio::test]
     async fn unauthenticated_connections_are_capped_and_authenticated_ones_do_not_count() {
         use tokio::io::AsyncReadExt;
@@ -1959,6 +1975,12 @@ mod tests {
             .expect("应当被关掉")
             .unwrap_or(0);
         assert_eq!(n, 0);
+        let text = std::fs::read_to_string(srv.audit_path_today()).unwrap();
+        assert!(
+            text.contains("\"event\":\"too_many_unauth\""),
+            "未认证连接配额被打满是唯一不需要任何凭证就能造成的拒绝服务，\
+             审计里必须留下痕迹：{text}"
+        );
         srv.shutdown().await;
     }
 

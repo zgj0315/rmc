@@ -221,6 +221,12 @@ fn load(p: &Parsed, err: &mut dyn Write) -> Option<Loaded> {
             return None;
         }
     };
+    // 终审 FR-1c：属主检查放在 config/identity 读完**之后**——数据目录
+    // 压根不存在这种最常见的场景，上面两步给出的「先运行 init」比这里的
+    // 探针错误更贴切，顺序反过来会把那句好提示挤掉。
+    if check_data_dir_owner(&dir, err).is_some() {
+        return None;
+    }
     Some(Loaded { dir, cfg, id })
 }
 
@@ -407,32 +413,37 @@ pub fn refuse_root(is_root: bool, allow_root: bool) -> Option<String> {
     }
 }
 
-/// `serve` 早检查专用：身份密钥文件本身能不能打开，按 `io::ErrorKind`
-/// 分诊出准确的提示。返回 `Some(退出码)` 表示已经写好错误、调用方直接
-/// `return`；`None` 表示这一步没发现问题，继续往下走。
+/// `serve` 与 `account *` 共用的数据目录属主检查。返回 `Some(退出码)`
+/// 表示已经写好错误、调用方直接 `return`。
 ///
-/// **修复轮 2/5，评审 Blocking，新增**：见 `cmd_serve` 里这次调用点上方
-/// 那段长注释——不能复用 `Identity::load_from` 的错误文案，它对任何
-/// io 错误都无差别地建议「先运行 init」，权限损坏时这条建议是错的、
-/// 而且会被拒绝。
-fn check_identity_key_present(dir: &DataDir, err: &mut dyn Write) -> Option<i32> {
-    match std::fs::File::open(dir.identity_key()) {
-        Ok(_) => None,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+/// **终审 FR-1c**：这道检查原来只有 `serve` 有，`account` 那几个子命令
+/// 没有——而真实事故正是从没有检查的那一侧进来的：`serve` 以普通用户在
+/// 跑，运维顺手 `sudo rmc-gateway account add li`，`account add` 照做，
+/// 新的 `accounts.toml` 成了 root 所有的 0600，从那一刻起 `serve` 再也
+/// 读不到账号表。两边用同一个判定、同一句话，从源头掐掉这条路径。
+///
+/// `Err` 分支里的 `NotFound` 单独分出来：`owned_by_current_user` 的探针
+/// 是「往目录里建一个临时文件」，数据目录压根不存在时它会报 ENOENT——
+/// 那是「从来没 init 过」，该说 init，不该把一条裸 io 错误甩给用户
+/// （这也是原来那道身份密钥早检查在兜的场景之一）。
+fn check_data_dir_owner(dir: &DataDir, err: &mut dyn Write) -> Option<i32> {
+    match dir.owned_by_current_user() {
+        Ok(true) => None,
+        Ok(false) => {
             let _ = writeln!(
                 err,
-                "数据目录 {} 下没有身份密钥；先运行 init",
+                "数据目录 {} 的属主不是当前用户；serve 与 account 子命令要用同一个用户运行\
+                 （用 sudo 跑 account 会把 accounts.toml 写成 root 所有，随后 serve 就再也读不到它）",
                 dir.root().display()
             );
             Some(1)
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = writeln!(err, "数据目录 {} 不存在；先运行 init", dir.root().display());
+            Some(1)
+        }
         Err(e) => {
-            let _ = writeln!(
-                err,
-                "打不开身份密钥 {}：{e}（不是「文件不存在」，检查这份文件与所在目录的属主/权限，\
-                 不要再跑 init——身份文件已经存在，init 会拒绝覆盖它）",
-                dir.identity_key().display()
-            );
+            let _ = writeln!(err, "检查数据目录失败：{e}（检查它的属主与权限）");
             Some(1)
         }
     }
@@ -447,51 +458,17 @@ fn cmd_serve(p: &Parsed, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         return 1;
     }
     let dir = p.data_dir();
-    // **修复轮 1/5，评审 Important，已修，随后被修复轮 2/5 的复审发现回归、
-    // 已重做**：`serve` 是第一个用户真会敲的命令。数据目录从来没被 `init`
-    // 建过时，下面 `owned_by_current_user` 的探针（往目录里建一个临时
-    // 文件）会因为目录不存在而失败，原来直接把那条裸 io 错误
-    // （"No such file or directory (os error 2)" 这种）甩给用户——第一次
-    // 用就撞上一条读不懂的系统错误，体验很差。
-    //
-    // 修复轮 1/5当时的做法是先调 `Identity::load_from(&dir)`，复用它自己
-    // 已经带了「先运行 init」这句提示的错误文案（`identity.rs::load_from`）。
-    // **这一步引入了一条回归，复审实测复现过**：`identity.rs::load_from`
-    // 对**任何** io 错误（不只是"文件不存在"）都无差别地套上「先运行
-    // init」——`init` 明明跑过、只是事后 `chmod 000 identity.key`（权限
-    // 损坏），或者数据目录由用户 A 建、用户 B 拿去跑 `serve`（属主不对，
-    // 连穿透目录都做不到），这两种场景下 `Identity::load_from` 一样会说
-    // 「读不到 .../identity.key：Permission denied (os error 13)；先运行
-    // init」——这不只是不够准确，是**建议了一个会被拒绝的错误动作**：
-    // 再跑一次 `init` 会因为身份文件已存在被「拒绝覆盖」挡回，用户没有
-    // 从这句提示里得到任何能真正解决问题的信息。
-    //
-    // 改法：**不复用 `Identity::load_from` 的错误文案**，改成这里自己先
-    // 探一下身份密钥文件本身「能不能打开」，按 `io::ErrorKind` 分诊：
-    // `NotFound`（目录或文件真的不存在）才是「从未 init」，说「先运行
-    // init」；别的任何 io 错误（权限损坏是最常见的一种）都不建议这个
-    // 动作，转而指向属主/权限——这正是 `owned_by_current_user()` 下面
-    // 那支 `Err` 分支本来就在做的诊断，两者的措辞刻意保持一致。
-    // `std::fs::File::open` 只探测这一个文件能不能读，不做完整的身份
-    // 校验（种子格式、指纹计算等）——那些校验仍然只在真正需要用到身份
-    // 密钥的地方（`Server::bind` 内部）做一次，这里不重复。
-    if let Some(code) = check_identity_key_present(&dir, err) {
+    // **终审 FR-2**：这里曾经有一段 `std::fs::File::open(identity.key)`
+    // 的早检查（修复轮 2/5 加的），已经删掉。它的语义跟「真正的读取」
+    // 对不上：`identity.key` 如果是个**目录**，`File::open` 在 Unix 上
+    // 返回 `Ok`（打开目录本身是允许的，只有 `read` 才 EISDIR），探针
+    // 放行，最后还是在 `Server::bind` 里重现那句「先运行 init」——它
+    // 本来就是为了消灭这句误导才加的。分诊现在下沉到
+    // `Identity::load_from` 自己（`identity.rs::read_error`，按
+    // `io::ErrorKind::NotFound` 分），`serve`/`fingerprint`/`account`
+    // 三条路径一并受益，不需要任何一个调用点再各自探一次。
+    if let Some(code) = check_data_dir_owner(&dir, err) {
         return code;
-    }
-    match dir.owned_by_current_user() {
-        Ok(true) => {}
-        Ok(false) => {
-            let _ = writeln!(
-                err,
-                "数据目录 {} 的属主不是当前用户；serve 与 account 子命令要用同一个用户运行",
-                dir.root().display()
-            );
-            return 1;
-        }
-        Err(e) => {
-            let _ = writeln!(err, "检查数据目录失败：{e}");
-            return 1;
-        }
     }
     let listen: SocketAddr = match p.opt("listen").unwrap_or("0.0.0.0:22000").parse() {
         Ok(a) => a,
@@ -1099,53 +1076,38 @@ mod tests {
         assert!(err.contains('='), "{err}");
     }
 
-    /// **修复轮 1/5，评审 Important，新增**：`serve` 是第一个用户真会敲的
-    /// 命令，从没 `init` 过的数据目录不该甩给用户一条读不懂的裸 io 错误。
+    /// **修复轮 1/5，评审 Important，新增；终审 FR-2 改写了它的「改红」**：
+    /// `serve` 是第一个用户真会敲的命令，从没 `init` 过的数据目录不该甩给
+    /// 用户一条读不懂的裸 io 错误。
     ///
     /// **这条测试专门用一个连目录本身都没建过的路径**（`base.path().join(
     /// "brand-new")`，只拼路径字符串，从不 `create_dir`），不是随手
     /// `tempfile::tempdir()` 给的那种"目录已经存在，只是没跑 init"的路径
-    /// ——这个区分是实测出来的，不是随便选的：如果目录已经存在，
-    /// `dir.owned_by_current_user()` 的探针（往目录里建一个临时文件）
-    /// 本身就会成功，不管有没有加 `Identity::load_from` 那道早检查，
-    /// 执行都会往下走到 `Server::bind` 内部才因为读不到 `identity.key`
-    /// 失败——错误文本里同样带"先运行 init"，两条路径殊途同归，那种
-    /// 写法测不出「加了早检查以后到底改变了什么」。**只有目录本身就不
-    /// 存在**这种场景才能分开两条路径：不加早检查会先撞上
-    /// `owned_by_current_user` 的裸 io 错误（"检查数据目录失败：{e}"，
-    /// 不含 "init"）。
+    /// ——那种路径下 `owned_by_current_user()` 的探针本身就会成功，执行会
+    /// 一路走到 `Server::bind` 内部才因为读不到 `identity.key` 失败，错误
+    /// 文本里同样带"先运行 init"，测不出这道早检查改变了什么。
     ///
-    /// **「改红」实测记录，如实写下走过的两次弯路**（第二次是我自己的
-    /// 测试写错，不是"照 brief 字面注入"那种假支票，但同样是"字面上像
-    /// 改红、实测却全绿"，按同一条纪律处理）：
+    /// **历史上走过的两次弯路，留着当教训**：
     ///
-    /// 1. 最初这条测试用的是 `tempfile::tempdir().unwrap()` 给的、已经
-    ///    存在的目录，字面删掉 `cmd_serve` 里那段 `if let Err(e) =
-    ///    Identity::load_from(&dir) { ...; return 1; }`，实测**全绿**——
-    ///    跟上一段分析的原因一致：`owned_by_current_user()` 在已存在的
-    ///    目录上直接成功，执行流继续往下走进
-    ///    `rt.block_on(serve_until(...))`，`Server::bind` 内部的
-    ///    `Identity::load_from(&cfg.data)` 一样失败、一样把同一句"先运行
-    ///    init"的错误文本冒泡回 `cmd_serve` 的 `Err(e)` 分支——最终看到的
-    ///    `code`/`err` 跟没删这段代码时一模一样，这是一张假支票。
-    /// 2. 改用"目录本身不存在"的路径后，第一版把目录名字写成
-    ///    `"never-initialized"`——删掉早检查再跑，`assert!(err.contains(
-    ///    "init"))` 仍然**全绿**，用 `eprintln!` 打出 `err` 实际内容才
-    ///    发现：`err` 是裸 io 错误"检查数据目录失败：No such file or
-    ///    directory ... at path .../never-initialized/.tmpXXXX"，根本不含
-    ///    程序打印的"先运行 init"提示——但 `err.contains("init")` 照样
-    ///    为真，因为**目录名字自己**"never-**init**ialized"里字面包含
-    ///    子串 "init"！断言测的是路径字符串里偶然出现的四个字符，不是
-    ///    程序真的打印了那句提示。这是我自己出的一张假支票，改法是换一个
-    ///    不含 "init" 子串的目录名（`"brand-new"`），断言才是真的在测
-    ///    程序输出而不是测目录名拼字。
+    /// 1. 最初这条测试用已经存在的目录，删掉早检查实测**全绿**——两条
+    ///    路径殊途同归，是一张假支票。
+    /// 2. 改用"目录不存在"的路径后，第一版目录名叫 `"never-initialized"`
+    ///    ——`assert!(err.contains("init"))` 仍然全绿，因为**目录名字自己**
+    ///    "never-**init**ialized"就含子串 "init"，断言测的是路径拼字，不是
+    ///    程序输出。改成不含该子串的 `"brand-new"` 才真的带载。
     ///
-    /// 改红（用上面这个不含 "init" 子串的目录名重新验证过，确认真红）：
-    /// 把 `cmd_serve` 里 `if let Err(e) = Identity::load_from(&dir) {
-    /// ...; return 1; }` 那一段删掉——`serve` 会往下走到
-    /// `dir.owned_by_current_user()`，对一个不存在的目录探针建临时文件会
-    /// 失败，落进 `Err(e) => "检查数据目录失败：{e}"` 那一支，错误文本里
-    /// 不会再出现 "init" 这个词，`assert!(err.contains("init"))` 红。
+    /// **终审 FR-2 之后这条测试盯的是谁**：`cmd_serve` 里那道
+    /// `std::fs::File::open(identity.key)` 早检查已经删掉（它对
+    /// 「`identity.key` 是目录」这种形态会误放行），这句「先运行 init」
+    /// 现在由 `check_data_dir_owner` 的 `NotFound` 分支给出——数据目录
+    /// 压根不存在时，`owned_by_current_user` 的探针（往目录里建临时文件）
+    /// 报 ENOENT。
+    ///
+    /// 改红（**实测过**）：把 `check_data_dir_owner` 里
+    /// `Err(e) if e.kind() == std::io::ErrorKind::NotFound` 那一支删掉
+    /// ——错误退化成兜底那支的「检查数据目录失败：No such file or
+    /// directory (os error 2) ...」，不含 "init"，`assert!(err.contains(
+    /// "init"))` 红。
     #[test]
     fn serve_before_init_says_run_init_first() {
         let base = tempfile::tempdir().unwrap();
@@ -1197,11 +1159,15 @@ mod tests {
     /// 信息）。这条测试就是复审给的复现步骤本身：`init` 成功之后把
     /// `identity.key` 权限拿掉再 `serve`。
     ///
-    /// 改红：把 `check_identity_key_present` 里
-    /// `Err(e) if e.kind() == std::io::ErrorKind::NotFound` 这个分诊
-    /// 条件删掉（退回到不分诊、直接把任何 io 错误都导向同一句提示的
-    /// 行为）——错误文本会变回「...；先运行 init」，
-    /// `assert!(!err.contains("先运行 init"))` 红。
+    /// **终审 FR-2 改写**：分诊已经从 `cmd_serve` 里那道早检查
+    /// （`check_identity_key_present`，已删）下沉到
+    /// `identity.rs::read_error`——`serve`/`fingerprint`/`account` 三条
+    /// 路径共用同一份判定，这条测试盯的还是同一件事，只是注入点换了。
+    ///
+    /// 改红（**实测过**）：把 `identity.rs::read_error` 里
+    /// `if e.kind() == io::ErrorKind::NotFound` 改成 `if true`（退回
+    /// 不分诊、任何 io 错误都建议 init 的老行为）——错误文本变回
+    /// 「读不到 ...；先运行 init」，`assert!(!err.contains("先运行 init"))` 红。
     #[cfg(unix)]
     #[test]
     fn serve_with_a_permission_broken_identity_key_does_not_suggest_running_init_again() {
@@ -1287,5 +1253,46 @@ mod tests {
             out.contains(&format!("ReadWritePaths={expected_escaped}")),
             "ReadWritePaths 同样要转义：\n{out}"
         );
+    }
+    /// **终审 FR-1c，新增**：`account` 那几个子命令要和 `serve` 用同一道
+    /// 数据目录属主检查。
+    ///
+    /// 源头是这条真实事故路径：`serve` 以普通用户在跑，运维顺手
+    /// `sudo rmc-gateway account add li`——`account` 这一侧从来不检查属主，
+    /// 于是照做，新的 `accounts.toml` 落成 root 所有的 0600。此后 `serve`
+    /// 读这个文件 EACCES，账号表按空表处理，五秒内全部在线隧道被断、所有
+    /// 新认证被拒（`accounts.rs` 那两条测试守的是「断了之后要出声、要能
+    /// 自愈」，这条守的是「一开始就别让它发生」）。
+    ///
+    /// **夹具为什么是「只读目录」而不是「属主不符」**：造一个属主真的不是
+    /// 当前用户的目录需要 root，测试不以 root 跑（`datadir.rs` 里
+    /// `the_test_process_is_not_root_and_owns_its_tempdir` 反向自证过）。
+    /// `owned_by_current_user` 的实现是「往目录里建一个临时文件，比两者的
+    /// uid」，目录只读时这个探针直接失败——走的是同一个 `match` 的 `Err`
+    /// 兜底支，同样证明这道检查确实接在了 `account` 这条路径上。
+    /// 「uid 真的不符」那一支**验不了**，如实记在终审报告里。
+    ///
+    /// 改红（**实测过**）：把 `load()` 末尾那三行
+    /// `if check_data_dir_owner(&dir, err).is_some() { return None; }`
+    /// 删掉——执行会往下走进 `AccountStore::add`，在只读目录里建
+    /// `accounts.lock` 失败，错误变成一条裸 io 错误，
+    /// `assert!(err.contains("检查数据目录失败"))` 红。
+    #[cfg(unix)]
+    #[test]
+    fn account_subcommands_check_the_data_dir_the_same_way_serve_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (code, _, err) = run_in(tmp.path(), &["init", "--public-addr", "203.0.113.10:22000"]);
+        assert_eq!(code, 0, "{err}");
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (code, _, err) = run_in(tmp.path(), &["account", "add", "zhang"]);
+        // 先还原权限，免得 `tempdir` 在 `Drop` 时清理不掉。
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(code, 1, "{err}");
+        assert!(
+            err.contains("检查数据目录失败"),
+            "account 也要先过这道检查，不能一头扎进去写文件：{err}"
+        );
+        assert!(err.contains("属主"), "要指向属主/权限这个真实方向：{err}");
     }
 }
